@@ -1,0 +1,429 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Season {
+  SPRING
+  SUMMER
+  AUTUMN
+  WINTER
+  ALL_YEAR
+}
+enum ItemStatus {
+  AVAILABLE
+  DIRTY
+  UNAVAILABLE
+}
+enum Category {
+  TSHIRT
+  SHIRT
+  HOODIE
+  SWEATER
+  JACKET
+  COAT
+  TROUSERS
+  JEANS
+  SHORTS
+  DRESS
+  SKIRT
+  SHOES
+  SNEAKERS
+  BOOTS
+  ACCESSORY
+  BAG
+  OTHER
+}
+enum GenerationStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+enum FeedbackType {
+  LIKE
+  DISLIKE
+  WORN
+  SAVED
+  DISCARDED
+}
+enum AiTask {
+  ITEM_ANALYSIS
+  OUTFIT_GENERATION
+  SHOPPING_GAPS
+  SHOPPING_RANKING
+  TRY_ON
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  profile       UserProfile?
+  preferences   UserPreference[]
+  items         WardrobeItem[]
+  outfits       Outfit[]
+  favorites     FavoriteItem[]
+  generated     GeneratedImage[]
+  shopping      ShoppingRecommendation[]
+  history       OutfitHistory[]
+  aiLogs        AiUsageLog[]
+  feedback      OutfitFeedback[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+  kind       String   @default("VERIFY_EMAIL")
+
+  @@unique([identifier, token])
+}
+
+model UserProfile {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  age               Int?
+  heightCm          Int?
+  presentation      String?
+  usualStyles       String[] @default([])
+  exploreStyles     String[] @default([])
+  favoriteColors    String[] @default([])
+  avoidedColors     String[] @default([])
+  favoriteBrands    String[] @default([])
+  budgetMin         Int?
+  budgetMax         Int?
+  homeCity          String?
+  homeLat           Float?
+  homeLon           Float?
+  sizes             Json?
+  fitPreference     String?
+  favoriteGarments  String[] @default([])
+  onboardingDone    Boolean  @default(false)
+  aiPhotoConsent    Boolean  @default(false)
+  consentAt         DateTime?
+  photoPublicIds    String[] @default([])
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ClothingCategory {
+  id    String   @id @default(cuid())
+  key   Category @unique
+  label String
+  items WardrobeItem[]
+}
+
+model WardrobeItem {
+  id               String      @id @default(cuid())
+  userId           String
+  categoryId       String?
+  category         Category    @default(OTHER)
+  subcategory      String?
+  name             String
+  description      String?
+  primaryColor     String?
+  secondaryColors  String[] @default([])
+  pattern          String?
+  material         String?
+  style            String[] @default([])
+  seasons          Season[] @default([])
+  formality        Int?
+  occasions        String[] @default([])
+  visualTraits     String[] @default([])
+  imagePublicId    String?
+  imageUrl         String?
+  thumbUrl         String?
+  needsReview      Boolean     @default(false)
+  aiConfidence     Float?
+  isFavorite       Boolean     @default(false)
+  status           ItemStatus  @default(AVAILABLE)
+  wearCount        Int         @default(0)
+  lastWornAt       DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  categoryRef ClothingCategory? @relation(fields: [categoryId], references: [id])
+  outfitItems OutfitItem[]
+
+  @@index([userId, category])
+  @@index([userId, status])
+  @@index([userId, isFavorite])
+}
+
+model Outfit {
+  id            String   @id @default(cuid())
+  userId        String
+  name          String
+  description   String
+  occasion      String?
+  reasoning     String?
+  colorNotes    String?
+  weatherNotes  String?
+  styleFit      String?
+  location      String?
+  forDate       DateTime?
+  requestId     String?
+  isFavorite    Boolean  @default(false)
+  discarded     Boolean  @default(false)
+  rating        Int?
+  createdAt     DateTime @default(now())
+
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     OutfitItem[]
+  feedback  OutfitFeedback[]
+  history   OutfitHistory[]
+  images    GeneratedImage[]
+
+  @@index([userId, createdAt])
+  @@index([userId, requestId])
+}
+
+model OutfitItem {
+  id         String  @id @default(cuid())
+  outfitId   String
+  itemId     String
+  role       String?
+  alternatives String[] @default([])
+  outfit     Outfit       @relation(fields: [outfitId], references: [id], onDelete: Cascade)
+  item       WardrobeItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([outfitId, itemId])
+  @@index([itemId])
+}
+
+model OutfitFeedback {
+  id        String       @id @default(cuid())
+  userId    String
+  outfitId  String
+  type      FeedbackType
+  rating    Int?
+  note      String?
+  createdAt DateTime     @default(now())
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  outfit    Outfit       @relation(fields: [outfitId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([outfitId])
+}
+
+model FavoriteItem {
+  id        String   @id @default(cuid())
+  userId    String
+  kind      String
+  refId     String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, kind, refId])
+}
+
+model GeneratedImage {
+  id            String           @id @default(cuid())
+  userId        String
+  outfitId      String?
+  status        GenerationStatus @default(PENDING)
+  scenario      String
+  pose          String
+  prompt        String?
+  sourcePhotoId String?
+  publicId      String?
+  imageUrl      String?
+  errorMessage  String?
+  attempts      Int              @default(0)
+  isFavorite    Boolean          @default(false)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  outfit        Outfit?          @relation(fields: [outfitId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model ShoppingRecommendation {
+  id           String   @id @default(cuid())
+  userId       String
+  batchId      String
+  wardrobeHash String?
+  gapLabel     String
+  gapReason    String
+  gapCategory  Category?
+  gapColor     String?
+  combinesWith String[] @default([])
+  searchQuery  String
+  aiRanked     Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  products    ShoppingProduct[]
+
+  @@index([userId, createdAt])
+  @@index([userId, batchId])
+}
+
+model ShoppingProduct {
+  id               String   @id @default(cuid())
+  recommendationId String
+  provider         String
+  externalId       String
+  name             String
+  brand            String?
+  store            String
+  priceCents       Int?
+  currency         String   @default("EUR")
+  color            String?
+  imageUrl         String?
+  url              String
+  matchReason      String?
+  matchesItemIds   String[] @default([])
+  score            Float?
+  createdAt        DateTime @default(now())
+  recommendation   ShoppingRecommendation @relation(fields: [recommendationId], references: [id], onDelete: Cascade)
+
+  @@unique([recommendationId, provider, externalId])
+}
+
+model UserPreference {
+  id        String   @id @default(cuid())
+  userId    String
+  dimension String
+  key       String
+  score     Float    @default(0)
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dimension, key])
+}
+
+model OutfitHistory {
+  id        String   @id @default(cuid())
+  userId    String
+  outfitId  String
+  wornAt    DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  outfit    Outfit   @relation(fields: [outfitId], references: [id], onDelete: Cascade)
+
+  @@index([userId, wornAt])
+}
+
+model WeatherCache {
+  id         String   @id @default(cuid())
+  cacheKey   String   @unique
+  latitude   Float
+  longitude  Float
+  forDate    String
+  payload    Json
+  fetchedAt  DateTime @default(now())
+  expiresAt  DateTime
+
+  @@index([expiresAt])
+}
+
+model AiUsageLog {
+  id           String   @id @default(cuid())
+  userId       String
+  task         AiTask
+  provider     String
+  model        String
+  inputTokens  Int?
+  outputTokens Int?
+  success      Boolean  @default(true)
+  latencyMs    Int?
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, task, createdAt])
+}
+
+model RateLimit {
+  key         String   @id
+  count       Int      @default(0)
+  windowStart DateTime @default(now())
+
+  @@index([windowStart])
+}
+
+/// Catálogo importado de feeds de afiliación autorizados (p. ej. Awin). Se consulta aquí, nunca con scraping.
+model CatalogProduct {
+  id         String   @id
+  provider   String
+  feedId     String
+  externalId String
+  store      String
+  brand      String?
+  name       String
+  description String?
+  category   Category
+  colorKey   String?
+  colorText  String?
+  priceCents Int
+  currency   String   @default("EUR")
+  imageUrl   String
+  url        String
+  syncedAt   DateTime @default(now())
+
+  @@unique([provider, feedId, externalId])
+  @@index([category, colorKey])
+  @@index([store])
+  @@index([feedId, syncedAt])
+}
+
+model CatalogSync {
+  id         String    @id @default(cuid())
+  provider   String
+  feedId     String
+  store      String
+  status     String
+  rows       Int       @default(0)
+  imported   Int       @default(0)
+  error      String?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  @@index([provider, feedId, startedAt])
+}
+

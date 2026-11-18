@@ -1,0 +1,30 @@
+@import "@fontsource/instrument-serif/latin-400.css";
+@import "@fontsource/instrument-serif/latin-400-italic.css";
+@import "@fontsource-variable/hanken-grotesk/wght.css";
+@import "tailwindcss";
+
+@theme {
+  --color-paper: #f6f3ee;
+  --color-linen: #efe9e0;
+  --color-sand: #e3d9ca;
+  --color-stone: #b8ad9e;
+  --color-taupe: #6d655b;
+  --color-ink: #161514;
+  --color-danger: #9b3a2e;
+  --color-ok: #4d6a4f;
+  --font-display: "Instrument Serif", Georgia, serif;
+  --font-sans: "Hanken Grotesk Variable", system-ui, sans-serif;
+  --radius-card: 1.25rem;
+  --radius-field: 0.875rem;
+  --shadow-soft: 0 1px 2px rgb(22 21 20 / 0.04), 0 8px 24px -12px rgb(22 21 20 / 0.12);
+}
+
+html { background: var(--color-paper); color: var(--color-ink); }
+body { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; min-height: 100dvh; }
+:focus-visible { outline: 2px solid var(--color-ink); outline-offset: 2px; }
+::selection { background: var(--color-sand); }
+
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
