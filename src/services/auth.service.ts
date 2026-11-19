@@ -3,7 +3,9 @@ import bcrypt from "bcryptjs";
 import { env } from "@/lib/env";
 import { AppError } from "@/lib/errors";
 import { sendMail } from "@/lib/mail";
+import { prisma } from "@/lib/prisma";
 import { userRepository } from "@/repositories/user.repository";
+import { sessionRepository } from "@/repositories/session.repository";
 import { tokenRepository, type TokenKind } from "@/repositories/token.repository";
 
 const sha256 = (v: string) => createHash("sha256").update(v).digest("hex");
@@ -69,8 +71,13 @@ export const authService = {
 
   async resetPassword(rawToken: string, password: string) {
     const email = await consumeToken(rawToken, "RESET_PASSWORD");
-    await userRepository.setPassword(email, await bcrypt.hash(password, 12));
-    await userRepository.markVerified(email); // recibir el enlace demuestra control del email
+    const passwordHash = await bcrypt.hash(password, 12);
+    // Una sola transacción: si la contraseña cambia, ninguna sesión anterior (de quien la conociera) sigue activa.
+    await prisma.$transaction([
+      userRepository.setPassword(email, passwordHash),
+      userRepository.markVerified(email), // recibir el enlace demuestra control del email
+      sessionRepository.deleteAllForEmail(email),
+    ]);
   },
 
   async verifyCredentials(email: string, password: string) {

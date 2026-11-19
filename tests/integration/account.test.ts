@@ -6,8 +6,12 @@ import { prismaProxy, setTestEnv } from "../helpers/mock-prisma";
 
 const holder = vi.hoisted(() => ({ prisma: null as PrismaClient | null }));
 const cloud = vi.hoisted(() => ({ deleted: [] as string[], fail: false }));
-const sess = vi.hoisted(() => ({ userId: null as string | null }));
-vi.mock("@/lib/auth/index", () => ({ auth: async () => (sess.userId ? { user: { id: sess.userId } } : null) }));
+const sess = vi.hoisted(() => ({ claims: null as { sub: string; sid: string } | null }));
+// auth() simulado con la misma regla que el callback jwt real: el JWT solo vale si su sesión sigue viva en la base de datos.
+vi.mock("@/lib/auth/index", async () => {
+  const { sessionService } = await import("@/services/session.service");
+  return { auth: async () => (sess.claims && (await sessionService.validate(sess.claims)) ? { user: { id: sess.claims.sub } } : null) };
+});
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
 vi.mock("@/lib/cloudinary", () => ({
   deleteAllUserAssets: vi.fn(async (userId: string) => { if (cloud.fail) throw new Error("Cloudinary caído"); cloud.deleted.push(userId); }),
@@ -112,12 +116,14 @@ describe("sesiones de cuentas eliminadas", () => {
   it("un JWT anterior a la eliminación deja de dar acceso (401)", async () => {
     const { requireUserId } = await import("@/lib/auth/session");
     const { accountService } = await import("@/services/account.service");
+    const { sessionService } = await import("@/services/session.service");
     const id = await seed("zombie@acct.com", "ClaveZ-12345");
-    sess.userId = id;
+    sess.claims = { sub: id, sid: await sessionService.start(id) };
     await expect(requireUserId()).resolves.toBe(id);
     await accountService.delete(id, "ClaveZ-12345");
-    await expect(requireUserId()).rejects.toMatchObject({ status: 401 }); // el token sigue firmado, pero la cuenta ya no existe
-    sess.userId = null;
+    await expect(requireUserId()).rejects.toMatchObject({ status: 401 }); // el token sigue firmado, pero la cuenta (y su sesión, en cascada) ya no existe
+    expect(await t.prisma.session.count({ where: { userId: id } })).toBe(0);
+    sess.claims = null;
     await expect(requireUserId()).rejects.toMatchObject({ status: 401 }); // sin sesión
   });
 });

@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { auth } from "@/lib/auth";
+import { currentSession } from "@/lib/auth/session";
 import { userRepository } from "@/repositories/user.repository";
 import { ProfileForm } from "@/features/profile/components/profile-form";
 import { toFormValues } from "@/features/profile/to-form-values";
@@ -7,7 +7,7 @@ import { toFormValues } from "@/features/profile/to-form-values";
 export const metadata = { title: "Cuéntanos cómo vistes" };
 
 export default async function OnboardingPage() {
-  const session = await auth();
+  const session = await currentSession();
   if (!session?.user?.id) redirect("/login");
   const user = await userRepository.findById(session.user.id);
   if (!user) redirect("/login");

@@ -1,7 +1,8 @@
 import Image from "next/image";
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { ArrowRight } from "lucide-react";
-import { auth } from "@/lib/auth";
+import { currentSession } from "@/lib/auth/session";
 import { Card } from "@/components/ui";
 import { WeatherCard } from "@/features/stylist/components/weather-card";
 import { CATEGORY_LABELS, COLOR_SWATCH, type CategoryKey, type ColorKey } from "@/features/wardrobe/constants";
@@ -26,8 +27,10 @@ function Thumbs({ outfit, size = "md" }: { outfit: Outfit; size?: "sm" | "md" })
 }
 
 export default async function DashboardPage() {
-  const session = await auth();
-  const d = await dashboardService.get(session!.user.id);
+  // Comprobación propia: el layout y la página se renderizan en paralelo, no se puede confiar en su redirección.
+  const userId = (await currentSession())?.user?.id;
+  if (!userId) redirect("/login");
+  const d = await dashboardService.get(userId);
   const first = d.name?.split(" ")[0];
   const w = d.wardrobe;
 
