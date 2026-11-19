@@ -1,21 +1,23 @@
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ENV_KEYS } from "@/lib/env";
 
 const ROOT = process.cwd();
-const SKIP_DIRS = new Set(["node_modules", ".next", ".git", "generated", "coverage"]);
 const TEXT_EXT = /\.(ts|tsx|js|mjs|json|md|css|sql|toml|yml|yaml|example|env|txt)$/;
+const git = (args: string) => execSync(`git ${args}`, { cwd: ROOT, encoding: "utf8" });
 
-function walk(dir: string, out: string[] = []): string[] {
-  for (const name of readdirSync(dir)) {
-    if (SKIP_DIRS.has(name)) continue;
-    const full = path.join(dir, name);
-    if (statSync(full).isDirectory()) walk(full, out);
-    else if (TEXT_EXT.test(name) || name.startsWith(".env")) out.push(full);
-  }
-  return out;
+/**
+ * Archivos que Git versiona o versionaría (seguidos + nuevos no ignorados). Lo que .gitignore excluye
+ * (.env local, node_modules, .next, src/generated…) no se sube al repositorio, así que no se inspecciona.
+ */
+function repoFiles(): string[] {
+  return git("ls-files -z --cached --others --exclude-standard")
+    .split("\0")
+    .filter((f) => f && existsSync(path.join(ROOT, f)))
+    .filter((f) => TEXT_EXT.test(f) || path.basename(f).startsWith(".env"))
+    .map((f) => path.join(ROOT, f));
 }
 
 describe(".env.example", () => {
@@ -47,19 +49,21 @@ describe("secretos en el repositorio", () => {
     ["token de GitHub", /\bgh[pousr]_[A-Za-z0-9]{30,}\b/],
     ["asignación de secreto literal", /(api[_-]?key|secret|password|token)["']?\s*[:=]\s*["'][A-Za-z0-9/+_=-]{24,}["']/i],
   ];
-  const files = walk(ROOT).filter((f) => !f.endsWith("package-lock.json"));
+  const files = repoFiles().filter((f) => !f.endsWith("package-lock.json"));
 
   it("recorre el proyecto", () => { expect(files.length).toBeGreaterThan(100); });
   it.each(PATTERNS)("no hay %s", (_name, re) => {
     const hits = files.filter((f) => !f.includes("repo-hygiene.test.ts") && re.test(readFileSync(f, "utf8"))).map((f) => path.relative(ROOT, f));
     expect(hits).toEqual([]);
   });
-  it("no hay ficheros .env con valores y están en .gitignore", () => {
-    const real = readdirSync(ROOT).filter((n) => /^\.env(\.|$)/.test(n) && n !== ".env.example");
-    expect(real).toEqual([]);
+  it("no hay ficheros .env con valores en el repositorio y están en .gitignore", () => {
+    const isEnv = (f: string) => /^\.env(\.|$)/.test(path.basename(f)) && path.basename(f) !== ".env.example";
+    expect(files.map((f) => path.relative(ROOT, f)).filter(isEnv)).toEqual([]);
     const ignore = readFileSync(path.join(ROOT, ".gitignore"), "utf8");
     expect(ignore).toMatch(/^\.env$/m);
-    expect(existsSync(path.join(ROOT, ".env.local"))).toBe(false);
+    expect(ignore).toMatch(/^\.env\.local$/m);
+    // Git debe ignorarlos de verdad (check-ignore lanza si el archivo NO está ignorado).
+    for (const f of [".env", ".env.local"]) expect(() => git(`check-ignore -q ${f}`), f).not.toThrow();
   });
 });
 

@@ -20,6 +20,14 @@ function lastToken(): string {
   return m[1]!;
 }
 
+/**
+ * Estos tests usan bcrypt con el coste real de producción (12), que el primero comprueba. bcryptjs es JavaScript puro:
+ * cada hash o comparación cuesta ~0,7 s de CPU y algunos tests hacen 4-5 (~3-4 s en aislado). Con la suite en paralelo
+ * compiten por CPU con otros archivos y superan los 5 s por defecto. Bajar el coste haría que el test dejara de verificar
+ * la configuración real, así que se da un margen explícito solo a estos tests.
+ */
+const BCRYPT_TIMEOUT = 30_000;
+
 describe("autenticación", () => {
   const pass = "Abcdefghi1";
   it("registra, no deja iniciar sesión sin verificar y sí después", async () => {
@@ -41,7 +49,7 @@ describe("autenticación", () => {
     expect(await authService.verifyCredentials("ana@test.com", pass)).toMatchObject({ email: "ana@test.com" });
     expect(await authService.verifyCredentials("ana@test.com", "otra-Contraseña1")).toBeNull();
     expect(await authService.verifyCredentials("nadie@test.com", pass)).toBeNull();
-  });
+  }, BCRYPT_TIMEOUT);
 
   it("el enlace de verificación es de un solo uso", async () => {
     const { authService } = await import("@/services/auth.service");
@@ -49,7 +57,7 @@ describe("autenticación", () => {
     const raw = lastToken();
     await authService.verifyEmail(raw);
     await expect(authService.verifyEmail(raw)).rejects.toMatchObject({ code: "INVALID_TOKEN" });
-  });
+  }, BCRYPT_TIMEOUT);
 
   it("registrar un email existente no revela nada ni duplica", async () => {
     const { authService } = await import("@/services/auth.service");
@@ -76,7 +84,7 @@ describe("autenticación", () => {
     const expired = lastToken();
     await t.prisma.verificationToken.updateMany({ where: { kind: "RESET_PASSWORD" }, data: { expires: new Date(Date.now() - 1000) } });
     await expect(authService.resetPassword(expired, "ClaveCaducada123")).rejects.toMatchObject({ code: "INVALID_TOKEN" });
-  });
+  }, BCRYPT_TIMEOUT);
 });
 
 describe("aislamiento entre usuarios (autorización a nivel de backend)", () => {

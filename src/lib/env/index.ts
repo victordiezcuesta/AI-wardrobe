@@ -55,16 +55,29 @@ const serverSchema = baseSchema.transform((e) => ({
 
 export type ServerEnv = z.output<typeof serverSchema>;
 
-let cached: ServerEnv | null = null;
+/**
+ * Una variable declarada sin valor (`CLAVE=` en .env) llega como "" y Zod no la trata como ausente:
+ * `.default()` no se aplica y `z.coerce.number()` la convierte en 0. Aquí, toda cadena vacía o solo con
+ * espacios pasa a `undefined` antes de validar, para que cada variable vacía se comporte como no definida.
+ */
+export function normalizeEnv(source: Record<string, string | undefined>): Record<string, string | undefined> {
+  return Object.fromEntries(Object.entries(source).map(([k, v]) => [k, v === undefined || v.trim() === "" ? undefined : v]));
+}
 
-/** Valida las variables de entorno la primera vez que se necesitan (no durante el build). */
-export function env(): ServerEnv {
-  if (cached) return cached;
-  const parsed = serverSchema.safeParse(process.env);
+/** Valida un conjunto de variables (por defecto, process.env). Lanza si falta alguna obligatoria o alguna es inválida. */
+export function parseEnv(source: Record<string, string | undefined> = process.env): ServerEnv {
+  const parsed = serverSchema.safeParse(normalizeEnv(source));
   if (!parsed.success) {
     const missing = parsed.error.issues.map((i) => i.path.join(".")).join(", ");
     throw new Error(`Variables de entorno inválidas o ausentes: ${missing}`);
   }
-  cached = parsed.data;
+  return parsed.data;
+}
+
+let cached: ServerEnv | null = null;
+
+/** Valida las variables de entorno la primera vez que se necesitan (no durante el build). */
+export function env(): ServerEnv {
+  cached ??= parseEnv();
   return cached;
 }

@@ -9,6 +9,14 @@ import { tokenRepository, type TokenKind } from "@/repositories/token.repository
 const sha256 = (v: string) => createHash("sha256").update(v).digest("hex");
 const TTL_MS: Record<TokenKind, number> = { VERIFY_EMAIL: 24 * 3600e3, RESET_PASSWORD: 3600e3 };
 
+/**
+ * Hash bcrypt válido (coste 12, mismo que las contraseñas reales) de un valor aleatorio descartado: ninguna contraseña
+ * coincide con él. Se compara contra él cuando el email no existe o no tiene contraseña, para que esa ruta tarde lo mismo
+ * que la de un usuario real y el tiempo de respuesta no revele qué emails están registrados. Debe ser un hash bien formado:
+ * con uno mal formado, bcrypt devuelve false al instante sin hacer el trabajo.
+ */
+export const DUMMY_PASSWORD_HASH = "$2b$12$MiDUStheqcaKWCq4MxhhlepysZF7zb5laoLv3kiCN3VMi0qfL/V4e";
+
 async function issueToken(email: string, kind: TokenKind): Promise<string> {
   const raw = randomBytes(32).toString("hex");
   await tokenRepository.replace(email, kind, sha256(raw), new Date(Date.now() + TTL_MS[kind]));
@@ -67,8 +75,8 @@ export const authService = {
 
   async verifyCredentials(email: string, password: string) {
     const user = await userRepository.findByEmail(email);
-    // Comparación siempre ejecutada para igualar tiempos de respuesta.
-    const hash = user?.passwordHash ?? "$2b$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvali";
+    // Comparación siempre ejecutada (con DUMMY_PASSWORD_HASH si no hay usuario) para igualar tiempos de respuesta.
+    const hash = user?.passwordHash ?? DUMMY_PASSWORD_HASH;
     const ok = await bcrypt.compare(password, hash);
     if (!user || !ok) return null;
     if (!user.emailVerified) return null;

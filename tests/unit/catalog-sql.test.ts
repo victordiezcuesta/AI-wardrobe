@@ -27,9 +27,12 @@ const FEED = `aw_product_id,product_name,aw_deep_link,merchant_image_url,search_
 `;
 
 describe("importación de catálogo contra PostgreSQL real (PGlite)", () => {
-  const db = new PGlite();
-  beforeAll(async () => { await db.exec(DDL); });
-  afterAll(async () => { await db.close(); });
+  // PGlite compila PostgreSQL en WASM al arrancar (~4 s en frío). Con la suite en paralelo varios archivos lo
+  // arrancan a la vez y compiten por CPU, así que el arranque va dentro del hook con el mismo margen que
+  // usan los demás tests sobre PGlite (helpers/db.ts), en vez de en la recogida del describe con el límite de 10 s.
+  let db: PGlite;
+  beforeAll(async () => { db = new PGlite(); await db.exec(DDL); }, 60_000);
+  afterAll(async () => { await db?.close(); });
 
   async function rows() {
     const out = [];
