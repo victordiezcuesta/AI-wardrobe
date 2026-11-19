@@ -67,3 +67,88 @@ describe("chat (OpenRouter)", () => {
     delete process.env.OPENROUTER_MODEL; delete process.env.OPENROUTER_MODEL_CHEAP;
   });
 });
+
+/** ¿Pudo facturarse alguna llamada? Lo usa el análisis de prendas para decidir si devuelve la unidad de cuota. */
+describe("chat: maybeBilled", () => {
+  const msgs = [{ role: "user" as const, content: "x" }];
+  /** Ejecuta chat con fetch simulado (temporizadores falsos para no esperar los reintentos) y devuelve el error. */
+  const run = async (fetchMock: ReturnType<typeof vi.fn>, opts: { schema?: boolean } = {}) => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("fetch", fetchMock);
+      const { chat, AiProviderError } = await import("@/lib/openrouter/client");
+      const p = chat({ model: "m", messages: msgs, ...(opts.schema && { schema }) }).then(() => null, (e: unknown) => e);
+      await vi.runAllTimersAsync();
+      const err = await p;
+      expect(err).toBeInstanceOf(AiProviderError);
+      return err as InstanceType<typeof AiProviderError>;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+  const status = (s: number, body = "x") => () => Promise.resolve(new Response(body, { status: s }));
+  const always = (s: number) => vi.fn(status(s));
+
+  it.each([400, 401, 402])("rechazo documentado como previo al procesamiento (%i) → no facturado, sin reintentos", async (s) => {
+    const f = always(s);
+    expect(await run(f)).toMatchObject({ status: 502, code: "AI_UPSTREAM", maybeBilled: false }); // mismo código y estado que antes
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it("400 por response_format y luego 401 → reintento sin schema, ambos rechazos previos: no facturado", async () => {
+    const f = vi.fn().mockImplementationOnce(status(400)).mockImplementationOnce(status(401));
+    expect(await run(f, { schema: true })).toMatchObject({ code: "AI_UPSTREAM", maybeBilled: false });
+    expect(f).toHaveBeenCalledTimes(2);
+  });
+
+  it("403 → dudoso (rechazos de distinto tipo, no todos garantizados como previos), sin reintentos", async () => {
+    const f = always(403);
+    expect(await run(f)).toMatchObject({ status: 502, code: "AI_UPSTREAM", maybeBilled: true });
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it("408 → dudoso (el proveedor no respondió a tiempo), sin reintentos", async () => {
+    const f = always(408);
+    expect(await run(f)).toMatchObject({ code: "AI_UPSTREAM", maybeBilled: true });
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([429, 500, 502, 503, 504])("%i en todos los intentos → dudoso (mismo código y número de reintentos que antes)", async (s) => {
+    const f = always(s);
+    expect(await run(f)).toMatchObject({ status: 502, code: "AI_UNAVAILABLE", maybeBilled: true });
+    expect(f).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([404, 409, 413, 418, 422, 499])("estado no clasificado como rechazo previo (%i) → dudoso", async (s) => {
+    expect(await run(always(s))).toMatchObject({ code: "AI_UPSTREAM", maybeBilled: true });
+  });
+
+  it("error de red → dudoso", async () => {
+    expect(await run(vi.fn().mockRejectedValue(new TypeError("fetch failed")))).toMatchObject({ code: "AI_UNAVAILABLE", maybeBilled: true });
+  });
+
+  it("timeout (AbortSignal.timeout) → dudoso", async () => {
+    expect(await run(vi.fn().mockRejectedValue(new DOMException("The operation was aborted due to timeout", "TimeoutError")))).toMatchObject({ maybeBilled: true });
+  });
+
+  it("200 sin contenido o con un error en el cuerpo → el proveedor aceptó la petición: dudoso", async () => {
+    expect(await run(vi.fn(() => Promise.resolve(new Response(JSON.stringify({ choices: [] }), { status: 200 }))))).toMatchObject({ maybeBilled: true });
+    expect(await run(vi.fn(() => Promise.resolve(new Response(JSON.stringify({ error: { message: "provider disconnect" } }), { status: 200 }))))).toMatchObject({ maybeBilled: true });
+  });
+
+  it("un intento dudoso seguido de un rechazo previo (401) → sigue dudoso", async () => {
+    for (const first of [status(500), status(503), status(429), () => Promise.reject(new TypeError("fetch failed"))]) {
+      const f = vi.fn().mockImplementationOnce(first).mockImplementationOnce(status(401));
+      expect(await run(f)).toMatchObject({ code: "AI_UPSTREAM", maybeBilled: true });
+      expect(f).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it("un intento dudoso seguido de un 403 → dudoso", async () => {
+    for (const first of [status(500), status(503), status(429), () => Promise.reject(new TypeError("fetch failed"))]) {
+      const f = vi.fn().mockImplementationOnce(first).mockImplementationOnce(status(403));
+      expect(await run(f)).toMatchObject({ code: "AI_UPSTREAM", maybeBilled: true });
+      expect(f).toHaveBeenCalledTimes(2);
+    }
+  });
+});

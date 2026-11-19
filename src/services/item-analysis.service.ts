@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { env } from "@/lib/env";
-import { logError } from "@/lib/errors";
-import { chat, parseJson } from "@/lib/openrouter/client";
+import { AppError, logError } from "@/lib/errors";
+import { AiProviderError, chat, parseJson } from "@/lib/openrouter/client";
 import { analysisSchema, type DetectedItem } from "@/lib/validations/wardrobe";
 import { CATEGORIES, COLORS, SEASONS } from "@/features/wardrobe/constants";
 import { aiUsageService } from "./ai-usage.service";
@@ -37,28 +37,61 @@ export function sanitizeBox(box: DetectedItem["box"]): DetectedItem["box"] {
   return { x, y, width: Math.min(width, 1 - x), height: Math.min(height, 1 - y) };
 }
 
+/**
+ * ¿Se puede afirmar con seguridad que no se completó nada facturable? Solo si el proveedor nunca llegó a devolver una
+ * respuesta completada: sin configurar (no se llamó) o todas las llamadas recibieron un error HTTP. Un timeout, un
+ * error de red sin respuesta, una respuesta inválida o cualquier error desconocido se consideran consumidos.
+ */
+function surelyNotBilled(err: unknown): boolean {
+  if (err instanceof AiProviderError) return !err.maybeBilled;
+  return err instanceof AppError && err.code === "AI_NOT_CONFIGURED";
+}
+
 export const itemAnalysisService = {
+  /**
+   * Un análisis = como mucho UNA unidad de cuota, reservada de forma atómica antes de llamar a la IA:
+   * - éxito (aunque haya hecho falta el reintento interno por salida inválida): la reserva queda como uso real;
+   * - fallo sin nada facturado (ver `surelyNotBilled`): la unidad se devuelve;
+   * - fallo dudoso o después de que el proveedor respondiera: la unidad queda consumida (opción segura).
+   */
   async analyze(userId: string, imageUrl: string, mode: AnalysisMode): Promise<DetectedItem[]> {
-    await aiUsageService.assertQuota(userId);
     const model = env().OPENROUTER_MODEL_VISION;
+    const reservation = await aiUsageService.reserve(userId, { task: "ITEM_ANALYSIS", provider: "openrouter", model });
     const messages = [
       { role: "system" as const, content: SYSTEM },
       { role: "user" as const, content: [{ type: "text" as const, text: userPrompt(mode) }, { type: "image_url" as const, image_url: { url: imageUrl, detail: "auto" as const } }] },
     ];
+    const started = Date.now();
+    const usage = { inputTokens: 0, outputTokens: 0 };
+    let responded = false; // el proveedor devolvió al menos una respuesta completada (facturada)
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const res = await chat({ model, messages, schema: analysisSchema, schemaName: "wardrobe_analysis", temperature: 0.2, maxTokens: 2500 });
-        const parsed = parseJson(res.text, analysisSchema);
-        await aiUsageService.log({ userId, task: "ITEM_ANALYSIS", provider: "openrouter", model, ...res.usage, success: true, latencyMs: res.latencyMs });
-        return parsed.items;
-      } catch (err) {
-        const retryable = err instanceof z.ZodError || err instanceof SyntaxError;
-        await aiUsageService.log({ userId, task: "ITEM_ANALYSIS", provider: "openrouter", model, success: false });
-        if (!retryable || attempt === 1) throw err;
-        logError("analysis.invalid_output", err);
+    let items: DetectedItem[];
+    try {
+      items = await (async () => {
+        for (let attempt = 0; ; attempt++) {
+          const res = await chat({ model, messages, schema: analysisSchema, schemaName: "wardrobe_analysis", temperature: 0.2, maxTokens: 2500 });
+          responded = true;
+          usage.inputTokens += res.usage.inputTokens ?? 0;
+          usage.outputTokens += res.usage.outputTokens ?? 0;
+          try {
+            return parseJson(res.text, analysisSchema).items;
+          } catch (err) {
+            const invalidOutput = err instanceof z.ZodError || err instanceof SyntaxError;
+            if (!invalidOutput || attempt === 1) throw err;
+            logError("analysis.invalid_output", err); // un reintento, dentro de la MISMA reserva
+          }
+        }
+      })();
+    } catch (err) {
+      const latencyMs = Date.now() - started;
+      if (!responded && surelyNotBilled(err)) {
+        await aiUsageService.release(reservation).catch((e) => logError("analysis.quota_release", e));
+      } else {
+        await aiUsageService.complete(reservation, { ...usage, success: false, latencyMs }).catch((e) => logError("analysis.quota_complete", e));
       }
+      throw err;
     }
-    return [];
+    await aiUsageService.complete(reservation, { ...usage, success: true, latencyMs: Date.now() - started });
+    return items;
   },
 };

@@ -1,4 +1,4 @@
-import { logError, notFound } from "@/lib/errors";
+import { AppError, logError, notFound } from "@/lib/errors";
 import { deleteImage, uploadBuffer, uploadCrop, type StoredImage } from "@/lib/cloudinary";
 import { wardrobeRepository } from "@/repositories/wardrobe.repository";
 import type { Prisma, WardrobeItem } from "@/generated/prisma/client";
@@ -31,6 +31,13 @@ function fromDetected(d: DetectedItem, img: StoredImage, extraReview: boolean): 
     imageUrl: img.url,
     thumbUrl: img.thumbUrl,
   };
+}
+
+/** Motivo para el cliente sin detalles internos (claves, proveedor, códigos HTTP): el detalle va solo al log. */
+export function analysisFailureReason(err: unknown): string {
+  if (err instanceof AppError && err.code === "RATE_LIMITED") return err.message; // cuota diaria agotada: útil y sin datos internos
+  if (err instanceof AppError && err.code === "AI_NOT_CONFIGURED") return "El análisis automático no está disponible en este momento.";
+  return "La IA no ha podido analizar la foto. Completa los datos a mano o inténtalo más tarde.";
 }
 
 export type UploadOutcome =
@@ -77,8 +84,7 @@ export const wardrobeService = {
         name: "Prenda sin analizar", category: "OTHER", needsReview: true,
         imagePublicId: source.publicId, imageUrl: source.url, thumbUrl: source.thumbUrl,
       });
-      const reason = err instanceof Error ? err.message : "Error de análisis";
-      return { status: "analysis_failed", items: [item], reason };
+      return { status: "analysis_failed", items: [item], reason: analysisFailureReason(err) };
     }
 
     if (detected.length === 0) {
