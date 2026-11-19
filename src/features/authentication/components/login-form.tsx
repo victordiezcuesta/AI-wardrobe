@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { signIn } from "next-auth/react";
 import { Button, Input } from "@/components/ui";
+import { loginErrorMessage } from "@/features/authentication/login-errors";
 
 export function LoginForm() {
   const router = useRouter();
@@ -15,9 +16,15 @@ export function LoginForm() {
     setLoading(true);
     setError(undefined);
     const fd = new FormData(e.currentTarget);
-    const res = await signIn("credentials", { email: String(fd.get("email")), password: String(fd.get("password")), redirect: false });
+    let message: string | null;
+    try {
+      const res = await signIn("credentials", { email: String(fd.get("email")), password: String(fd.get("password")), redirect: false });
+      message = loginErrorMessage(res);
+    } catch {
+      message = loginErrorMessage(null); // red caída o respuesta ilegible: error temporal, no de credenciales
+    }
     setLoading(false);
-    if (!res || res.error) return setError("Email o contraseña incorrectos, o el email aún no está confirmado.");
+    if (message) return setError(message);
     const next = params.get("callbackUrl");
     router.push(next && next.startsWith("/") ? next : "/dashboard");
     router.refresh();

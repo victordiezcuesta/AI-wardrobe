@@ -1,13 +1,19 @@
-import NextAuth, { type NextAuthConfig } from "next-auth";
+import NextAuth, { CredentialsSignin, type NextAuthConfig } from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import { prisma } from "@/lib/prisma";
-import { logError } from "@/lib/errors";
+import { AppError, logError } from "@/lib/errors";
+import { LOGIN_RATE_LIMITED_CODE } from "@/features/authentication/login-errors";
 import { authConfig } from "./config";
 import { loginSchema } from "@/lib/validations/auth";
 import { authService } from "@/services/auth.service";
 import { sessionService } from "@/services/session.service";
 import { rateLimit } from "@/lib/rate-limit";
+
+/** Límite de intentos de login superado. Llega al cliente como `error=CredentialsSignin&code=rate_limited`. */
+export class LoginRateLimited extends CredentialsSignin {
+  code = LOGIN_RATE_LIMITED_CODE;
+}
 
 /**
  * Configuración completa (solo Node: usa Prisma). El proxy usa `authConfig` (edge, sin base de datos) y solo comprueba
@@ -22,7 +28,15 @@ export const authOptions = {
       async authorize(raw) {
         const parsed = loginSchema.safeParse(raw);
         if (!parsed.success) return null;
-        await rateLimit(`login:${parsed.data.email}`, 10, 15 * 60);
+        try {
+          await rateLimit(`login:${parsed.data.email}`, 10, 15 * 60);
+        } catch (e) {
+          // Auth.js convierte cualquier error que no sea suyo en `error=Configuration`; el límite superado debe llegar
+          // al cliente como CredentialsSignin con su propio código. Se comprueba por email ANTES que las credenciales,
+          // así que la respuesta es la misma exista o no la cuenta. Otros errores siguen siendo internos.
+          if (e instanceof AppError && e.code === "RATE_LIMITED") throw new LoginRateLimited();
+          throw e;
+        }
         return authService.verifyCredentials(parsed.data.email, parsed.data.password);
       },
     }),
