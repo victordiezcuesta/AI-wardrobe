@@ -92,8 +92,11 @@ describe("estilista: la IA solo puede usar prendas reales, del usuario y disponi
     expect(withAlt.alternatives).toHaveLength(1);
     const alt = await t.prisma.wardrobeItem.findUniqueOrThrow({ where: { id: withAlt.alternatives[0]! } });
     expect(alt.name).toBe("Chaqueta negra");
-    // 5) Se registró el consumo de IA.
-    expect(await t.prisma.aiUsageLog.count({ where: { userId: u, task: "OUTFIT_GENERATION", success: true } })).toBe(2);
+    // 5) Se registró el consumo de IA: UNA unidad por generación aunque hubiera un segundo intento con correcciones
+    //    (antes, una por llamada), con los tokens de ambas llamadas.
+    const logs = await t.prisma.aiUsageLog.findMany({ where: { userId: u, task: "OUTFIT_GENERATION" } });
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ success: true, inputTokens: 20, outputTokens: 40 });
   });
 
   it("no repite combinaciones ya propuestas y lo indica a la IA", async () => {

@@ -68,6 +68,68 @@ describe("editImage (Pollinations)", () => {
     await expect(editImage({ prompt: "p", images: refs })).rejects.toMatchObject({ code: "TRYON_BUSY" });
   });
 
+  /** Nada interno puede llegar al cliente: proveedor, variables de entorno, claves, créditos ni el cuerpo original. */
+  const LEAK = /pollinations|_API_KEY|sk_|clave|créditos|cr[eé]dit|detalle interno|ENOTFOUND|\b40[0-9]\b|\b5\d\d\b/i;
+  const failWith = async (res: () => Response | Promise<Response>) => {
+    vi.stubGlobal("fetch", vi.fn(async () => res()));
+    const { editImage } = await import("@/lib/pollinations/client");
+    return editImage({ prompt: "p", images: refs }).then(() => { throw new Error("no falló"); }, (e: { message: string; status: number; code: string }) => e);
+  };
+  const body = "detalle interno: invalid key sk_fake_key (gen.pollinations.ai)";
+
+  it.each([
+    [401, 503, "TRYON_NOT_CONFIGURED"],
+    [402, 503, "TRYON_NO_CREDITS"],
+    [403, 502, "TRYON_UPSTREAM"],
+    [400, 422, "TRYON_REJECTED"],
+    [422, 422, "TRYON_REJECTED"],
+    [429, 503, "TRYON_BUSY"],
+    [503, 503, "TRYON_BUSY"],
+    [500, 502, "TRYON_UPSTREAM"],
+  ])("HTTP %i → mismo estado/código (%i, %s) y mensaje genérico sin detalles internos", async (status, httpStatus, code) => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const err = await failWith(() => new Response(body, { status }));
+    expect(err).toMatchObject({ status: httpStatus, code });
+    expect(err.message).not.toMatch(LEAK);
+    expect(spy.mock.calls.flat().join(" ")).toContain(`Pollinations ${status}`); // el detalle queda en el log del servidor
+    spy.mockRestore();
+  });
+
+  it("Retry-After: solo se repite un número de segundos, nunca texto del proveedor", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await failWith(() => new Response("{}", { status: 429, headers: { "retry-after": "12" } }))).message).toContain("12s");
+    const odd = await failWith(() => new Response("{}", { status: 429, headers: { "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT sk_live_x" } }));
+    expect(odd).toMatchObject({ code: "TRYON_BUSY" });
+    expect(odd.message).not.toMatch(/GMT|sk_/);
+    spy.mockRestore();
+  });
+
+  it("errores inesperados (red, respuesta sin imagen) → códigos de siempre, sin filtrar el error original", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const net = await failWith(() => { throw new TypeError("getaddrinfo ENOTFOUND gen.pollinations.ai"); });
+    expect(net).toMatchObject({ status: 504, code: "TRYON_TIMEOUT" });
+    expect(net.message).not.toMatch(LEAK);
+    expect(spy.mock.calls.flat().join(" ")).toContain("ENOTFOUND");
+    const empty = await failWith(() => new Response(JSON.stringify({ error: body }), { status: 200 }));
+    expect(empty).toMatchObject({ status: 502, code: "TRYON_EMPTY" });
+    expect(empty.message).not.toMatch(LEAK);
+    spy.mockRestore();
+  });
+
+  it("sin clave: no revela el nombre de la variable de entorno (solo en el log)", async () => {
+    delete process.env.POLLINATIONS_API_KEY;
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const { editImage } = await import("@/lib/pollinations/client");
+    const err = await editImage({ prompt: "p", images: refs }).catch((e: { message: string }) => e);
+    expect(err).toMatchObject({ status: 503, code: "TRYON_NOT_CONFIGURED" });
+    expect((err as { message: string }).message).not.toMatch(LEAK);
+    expect(spy.mock.calls.flat().join(" ")).toContain("POLLINATIONS_API_KEY");
+    expect(fetchMock).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
   it("falla con claridad si falta la clave", async () => {
     delete process.env.POLLINATIONS_API_KEY;
     const { editImage } = await import("@/lib/pollinations/client");

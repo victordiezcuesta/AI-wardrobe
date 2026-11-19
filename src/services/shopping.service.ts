@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { env } from "@/lib/env";
 import { AppError, logError } from "@/lib/errors";
-import { asAiError, chat, parseJson } from "@/lib/openrouter/client";
+import { asAiError, chat, isSurelyNotBilled, parseJson } from "@/lib/openrouter/client";
 import { configuredProviders } from "@/lib/catalog/providers";
 import { prisma } from "@/lib/prisma";
 import { gapsSchema, rankingSchema, type GapsOutput } from "@/lib/validations/shopping";
@@ -46,20 +46,24 @@ function itemLine(alias: string, i: WardrobeItem) {
   return [alias, i.name, CATEGORY_LABELS[i.category as CategoryKey], i.primaryColor ?? "color s/d", i.style.join("/") || null, i.formality ? `formalidad ${i.formality}` : null].filter(Boolean).join(" | ");
 }
 
-async function callJson<T>(userId: string, task: "SHOPPING_GAPS" | "SHOPPING_RANKING", model: string, system: string, user: string, schema: z.ZodType<T>, schemaName: string, maxTokens: number): Promise<T> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const res = await chat({ model, schema, schemaName, temperature: 0.5, maxTokens, messages: [{ role: "system", content: system }, { role: "user", content: user }] });
-      const parsed = parseJson(res.text, schema);
-      await aiUsageService.log({ userId, task, provider: "openrouter", model, ...res.usage, success: true, latencyMs: res.latencyMs });
-      return parsed;
-    } catch (err) {
-      await aiUsageService.log({ userId, task, provider: "openrouter", model, success: false });
-      if (!(err instanceof z.ZodError || err instanceof SyntaxError) || attempt === 1) throw asAiError(err);
-      logError(`shopping.${task}.invalid`, err);
+/**
+ * Una tarea de IA de compras (huecos u ordenación) = UNA unidad de la cuota general, como antes cada tarea, pero ahora
+ * con reserva atómica y sin cobrar aparte el reintento interno por salida inválida. Si no queda cuota lanza 429 antes
+ * de llamar a la IA; la unidad solo se devuelve si OpenRouter no llegó a procesar nada.
+ */
+function callJson<T>(userId: string, task: "SHOPPING_GAPS" | "SHOPPING_RANKING", model: string, system: string, user: string, schema: z.ZodType<T>, schemaName: string, maxTokens: number): Promise<T> {
+  return aiUsageService.runReserved(userId, { task, provider: "openrouter", model }, { notBilled: isSurelyNotBilled }, async (meter) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await chat({ model, schema, schemaName, temperature: 0.5, maxTokens, messages: [{ role: "system", content: system }, { role: "user", content: user }] });
+        meter.record(res.usage);
+        return parseJson(res.text, schema);
+      } catch (err) {
+        if (!(err instanceof z.ZodError || err instanceof SyntaxError) || attempt === 1) throw asAiError(err);
+        logError(`shopping.${task}.invalid`, err);
+      }
     }
-  }
-  throw new AppError("La IA no devolvió una respuesta válida", 502, "AI_INVALID");
+  });
 }
 
 export interface ProductDTO { id: string; name: string; brand: string | null; store: string; priceCents: number; currency: string; color: string | null; imageUrl: string | null; url: string; matchReason: string | null; score: number | null; combinesWith: { id: string; name: string; thumbUrl: string | null }[] }
@@ -105,7 +109,6 @@ export const shoppingService = {
       const cached = recent ? await loadBatch(userId, recent.batchId, true) : null;
       if (cached) return cached; // mismo armario y perfil: no se vuelve a gastar IA
     }
-    await aiUsageService.assertQuota(userId);
 
     const pool = items.slice(0, MAX_ITEMS_IN_PROMPT);
     const alias = new Map(pool.map((it, i) => [`i${i + 1}`, it]));
@@ -132,7 +135,7 @@ export const shoppingService = {
       candidates.set(g.key, found.filter((c) => passesFilters(c, sp)).slice(0, CANDIDATES_PER_GAP));
     }
 
-    // 3) Ordenación con IA (solo entre candidatos reales); si falla, puntuación determinista.
+    // 3) Ordenación con IA (solo entre candidatos reales); si falla o no queda cuota, puntuación determinista.
     const withCandidates = gaps.filter((g) => (candidates.get(g.key)?.length ?? 0) > 0);
     type Ranked = { product: CatalogProduct; score: number; reason: string; matches: string[] };
     const ranked = new Map<string, Ranked[]>();

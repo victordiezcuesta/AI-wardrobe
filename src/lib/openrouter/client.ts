@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { env } from "@/lib/env";
-import { AppError } from "@/lib/errors";
+import { AppError, logError } from "@/lib/errors";
 
 /** JSON Schema sin la clave "$schema", que algunos proveedores rechazan en modo estricto. */
 function jsonSchemaFor(schema: z.ZodType) {
@@ -28,6 +28,15 @@ interface ChatOptions {
 }
 
 /**
+ * Mensajes que pueden llegar al cliente: nunca incluyen el proveedor, estados HTTP, claves ni el error original
+ * (ese detalle va solo al log del servidor). El código del AppError sigue distinguiendo cada caso.
+ */
+export const AI_MESSAGES = {
+  notConfigured: "El servicio de IA no está disponible en este momento.",
+  unavailable: "El servicio de IA no ha podido responder. Inténtalo de nuevo en unos minutos.",
+} as const;
+
+/**
  * Fallo del proveedor tras llamarlo. Es un AppError normal (mismo mensaje, estado y código para quien no lo distinga)
  * que además indica si alguna llamada PUDO procesarse y facturarse: `maybeBilled` es false solo cuando todos los
  * intentos recibieron un rechazo documentado como previo al procesamiento (ver REJECTED_BEFORE_PROCESSING).
@@ -50,7 +59,10 @@ const REJECTED_BEFORE_PROCESSING: ReadonlySet<number> = new Set([400, 401, 402])
 /** Llamada a OpenRouter con reintentos acotados (429/5xx) y salida JSON estructurada opcional. */
 export async function chat(opts: ChatOptions): Promise<ChatResult> {
   const key = env().OPENROUTER_API_KEY;
-  if (!key) throw new AppError("OpenRouter no está configurado (falta OPENROUTER_API_KEY)", 503, "AI_NOT_CONFIGURED");
+  if (!key) {
+    logError("openrouter.config", new Error("Falta OPENROUTER_API_KEY"));
+    throw new AppError(AI_MESSAGES.notConfigured, 503, "AI_NOT_CONFIGURED");
+  }
 
   const baseBody = {
     model: opts.model,
@@ -86,7 +98,10 @@ export async function chat(opts: ChatOptions): Promise<ChatResult> {
       if (!REJECTED_BEFORE_PROCESSING.has(res.status)) maybeBilled = true;
       if (res.status === 429 || res.status >= 500) throw new Error(`OpenRouter ${res.status}`);
       if (res.status === 400 && useStructured) { useStructured = false; throw new Error("OpenRouter 400 con response_format"); }
-      if (!res.ok) throw new AiProviderError(`OpenRouter rechazó la solicitud (${res.status})`, 502, "AI_UPSTREAM", maybeBilled);
+      if (!res.ok) {
+        logError("openrouter.rejected", new Error(`OpenRouter ${res.status}`));
+        throw new AiProviderError(AI_MESSAGES.unavailable, 502, "AI_UPSTREAM", maybeBilled);
+      }
       const data = (await res.json()) as {
         choices?: { message?: { content?: string } }[];
         usage?: { prompt_tokens?: number; completion_tokens?: number };
@@ -106,7 +121,8 @@ export async function chat(opts: ChatOptions): Promise<ChatResult> {
       if (attempt < 2) await sleep(800 * 2 ** attempt);
     }
   }
-  throw new AiProviderError(`El servicio de IA no responde: ${lastErr instanceof Error ? lastErr.message : "error"}`, 502, "AI_UNAVAILABLE", maybeBilled);
+  logError("openrouter.unavailable", lastErr);
+  throw new AiProviderError(AI_MESSAGES.unavailable, 502, "AI_UNAVAILABLE", maybeBilled);
 }
 
 /** Extrae JSON aunque el modelo lo envuelva en ``` y lo valida con Zod. */
@@ -120,4 +136,14 @@ export function asAiError(err: unknown): unknown {
   return err instanceof z.ZodError || err instanceof SyntaxError
     ? new AppError("La IA devolvió una respuesta no válida. Inténtalo de nuevo en unos segundos.", 502, "AI_INVALID")
     : err;
+}
+
+/**
+ * ¿Se puede afirmar con seguridad que una llamada fallida a OpenRouter no se procesó ni facturó? Solo si no se llegó a
+ * llamar (sin configurar) o todos los intentos recibieron un rechazo previo al procesamiento (`maybeBilled=false`).
+ * Timeouts, errores de red, respuestas inválidas, 5xx, 429, 403, estados desconocidos y errores ajenos: no.
+ */
+export function isSurelyNotBilled(err: unknown): boolean {
+  if (err instanceof AiProviderError) return !err.maybeBilled;
+  return err instanceof AppError && err.code === "AI_NOT_CONFIGURED";
 }

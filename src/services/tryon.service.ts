@@ -2,6 +2,7 @@ import { after } from "next/server";
 import { AppError, logError, notFound } from "@/lib/errors";
 import { deletePrivateImages, signedUrl, uploadPrivate } from "@/lib/cloudinary";
 import { editImage, type RefImage } from "@/lib/pollinations/client";
+import { publicTryOnError, TRYON_MESSAGES } from "@/lib/pollinations/messages";
 import { sniffImage } from "@/lib/uploads/validate";
 import { env } from "@/lib/env";
 import { prisma } from "@/lib/prisma";
@@ -35,20 +36,30 @@ export function toDTO(row: GeneratedImage) {
   const done = row.status === "COMPLETED" && row.publicId;
   return {
     id: row.id, status: row.status, scenario: row.scenario, pose: row.pose, outfitId: row.outfitId,
-    errorMessage: row.errorMessage, attempts: row.attempts, isFavorite: row.isFavorite, createdAt: row.createdAt, updatedAt: row.updatedAt,
+    errorMessage: publicTryOnError(row.errorMessage), attempts: row.attempts, isFavorite: row.isFavorite, createdAt: row.createdAt, updatedAt: row.updatedAt,
     imageUrl: done ? signedUrl(row.publicId!, { expiresInSec: 3600 }) : null,
     downloadUrl: done ? signedUrl(row.publicId!, { expiresInSec: 900, attachment: true }) : null,
   };
 }
 
-async function run(jobId: string) {
+/** Devuelve una reserva de try-on cuyo trabajo no llegó a llamar al proveedor. */
+const releaseQuota = (reservation: string) => aiUsageService.release(reservation).catch((e) => logError("tryon.quota_release", e));
+
+/**
+ * Genera la imagen de un trabajo y resuelve SU reserva de cuota (hecha al crear o reintentar):
+ * - completado → la reserva queda como uso real;
+ * - fallo ANTES de llamar a Pollinations (consentimiento retirado, foto o conjunto ya no disponibles, no se pudieron
+ *   descargar las referencias) o el trabajo ya no estaba pendiente → se devuelve la unidad;
+ * - cualquier fallo desde la llamada a Pollinations (sin garantías documentadas de no facturación) → consumida.
+ */
+async function run(jobId: string, reservation: string) {
   // Reclamo atómico: si dos ejecuciones coinciden, solo una pasa de PENDING a PROCESSING.
   const claimed = await prisma.generatedImage.updateMany({ where: { id: jobId, status: "PENDING" }, data: { status: "PROCESSING", attempts: { increment: 1 }, errorMessage: null } });
-  if (claimed.count === 0) return;
+  if (claimed.count === 0) return releaseQuota(reservation);
   const job = await prisma.generatedImage.findUnique({ where: { id: jobId } });
-  if (!job) return;
+  if (!job) return releaseQuota(reservation);
   const started = Date.now();
-  const model = env().POLLINATIONS_MODEL;
+  let providerCalled = false;
   try {
     await consentService.require(job.userId);
     if (!job.outfitId || !job.sourcePhotoId) throw new AppError("Falta el conjunto o la foto", 422);
@@ -68,32 +79,48 @@ async function run(jobId: string) {
       catch (e) { logError("tryon.garment", e); throw new AppError("No se pudo cargar la foto de una de las prendas", 502); }
     }
 
+    providerCalled = true;
     const out = await editImage({ prompt, images });
-    if (!sniffImage(out)) throw new AppError("El proveedor devolvió un archivo que no es una imagen", 502, "TRYON_INVALID");
+    if (!sniffImage(out)) { logError("tryon.invalid_output", new Error("La respuesta no es una imagen")); throw new AppError(TRYON_MESSAGES.failed, 502, "TRYON_INVALID"); }
     const stored = await uploadPrivate(out, `ai-wardrobe/${job.userId}/try-on`, { maxSide: 2048 });
 
     await prisma.generatedImage.update({ where: { id: job.id }, data: { status: "COMPLETED", publicId: stored.publicId, prompt, errorMessage: null } });
-    await aiUsageService.log({ userId: job.userId, task: "TRY_ON", provider: "pollinations", model, success: true, latencyMs: Date.now() - started });
+    await aiUsageService.complete(reservation, { success: true, latencyMs: Date.now() - started }).catch((e) => logError("tryon.quota_complete", e));
   } catch (err) {
     logError("tryon.run", err);
-    const message = err instanceof AppError ? err.message : "No se pudo generar la imagen. Inténtalo de nuevo.";
+    const message = err instanceof AppError ? err.message : TRYON_MESSAGES.failed;
     await prisma.generatedImage.update({ where: { id: job.id }, data: { status: "FAILED", errorMessage: message } }).catch(() => undefined);
-    await aiUsageService.log({ userId: job.userId, task: "TRY_ON", provider: "pollinations", model, success: false, latencyMs: Date.now() - started }).catch(() => undefined);
+    if (providerCalled) await aiUsageService.complete(reservation, { success: false, latencyMs: Date.now() - started }).catch((e) => logError("tryon.quota_complete", e));
+    else await releaseQuota(reservation);
   }
 }
+
+/** Reserva atómica de la cuota PROPIA del probador (solo cuenta TRY_ON, límite independiente). */
+const reserveTryOn = (userId: string) =>
+  aiUsageService.reserve(userId, { task: "TRY_ON", provider: "pollinations", model: env().POLLINATIONS_MODEL }, "TRY_ON");
 
 export const tryOnService = {
   async create(userId: string, input: { outfitId: string; photoPublicId: string; scenario: ScenarioKey; pose: PoseKey }) {
     await consentService.require(userId);
-    await aiUsageService.assertQuota(userId, "TRY_ON");
-    if (!env().POLLINATIONS_API_KEY) throw new AppError("El probador virtual no está configurado (falta POLLINATIONS_API_KEY)", 503, "TRYON_NOT_CONFIGURED");
+    if (!env().POLLINATIONS_API_KEY) {
+      logError("tryon.config", new Error("Falta POLLINATIONS_API_KEY"));
+      throw new AppError(TRYON_MESSAGES.unavailable, 503, "TRYON_NOT_CONFIGURED");
+    }
     if (!(await photoService.owns(userId, input.photoPublicId))) throw notFound("Foto");
     await outfitService.get(userId, input.outfitId); // comprueba que el conjunto es del usuario
     const active = await prisma.generatedImage.count({ where: { userId, status: { in: ["PENDING", "PROCESSING"] }, updatedAt: { gt: new Date(Date.now() - STALE_PROCESSING_MS) } } });
     if (active >= 2) throw new AppError("Ya tienes 2 imágenes en proceso. Espera a que terminen.", 429, "TOO_MANY_ACTIVE");
 
-    const job = await prisma.generatedImage.create({ data: { userId, outfitId: input.outfitId, sourcePhotoId: input.photoPublicId, scenario: input.scenario, pose: input.pose, status: "PENDING" } });
-    after(() => run(job.id)); // la respuesta sale ya; la generación sigue en segundo plano
+    // La unidad se reserva YA (no al terminar): un trabajo pendiente cuenta para el límite desde que se crea.
+    const reservation = await reserveTryOn(userId);
+    let job: GeneratedImage;
+    try {
+      job = await prisma.generatedImage.create({ data: { userId, outfitId: input.outfitId, sourcePhotoId: input.photoPublicId, scenario: input.scenario, pose: input.pose, status: "PENDING" } });
+    } catch (e) {
+      await releaseQuota(reservation);
+      throw e;
+    }
+    after(() => run(job.id, reservation)); // la respuesta sale ya; la generación sigue en segundo plano
     return toDTO(job);
   },
 
@@ -125,10 +152,13 @@ export const tryOnService = {
     if (!row) throw notFound("Imagen");
     if (row.status !== "FAILED") throw new AppError("Solo se pueden reintentar las generaciones fallidas", 409, "NOT_RETRYABLE");
     if (row.attempts >= MAX_ATTEMPTS) throw new AppError(`Máximo ${MAX_ATTEMPTS} intentos por imagen`, 429, "MAX_ATTEMPTS");
-    await aiUsageService.assertQuota(userId, "TRY_ON");
-    const reset = await prisma.generatedImage.updateMany({ where: { id, userId, status: "FAILED" }, data: { status: "PENDING", errorMessage: null } });
-    if (reset.count === 0) throw new AppError("La imagen ya está en proceso", 409, "ALREADY_RUNNING");
-    after(() => run(id));
+    const reservation = await reserveTryOn(userId);
+    const reset = await prisma.generatedImage.updateMany({ where: { id, userId, status: "FAILED" }, data: { status: "PENDING", errorMessage: null } }).catch(async (e) => { await releaseQuota(reservation); throw e; });
+    if (reset.count === 0) {
+      await releaseQuota(reservation);
+      throw new AppError("La imagen ya está en proceso", 409, "ALREADY_RUNNING");
+    }
+    after(() => run(id, reservation));
     return this.get(userId, id);
   },
 

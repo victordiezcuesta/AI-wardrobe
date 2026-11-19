@@ -1,15 +1,17 @@
 import { env } from "@/lib/env";
-import { AppError } from "@/lib/errors";
+import { AppError, logError } from "@/lib/errors";
+import { busyMessage, TRYON_MESSAGES } from "./messages";
 
 export interface RefImage { bytes: Buffer; mime: string; name: string }
 
-/** Mensajes seguros para el usuario; el detalle técnico no se expone. */
+/** Mensajes genéricos para el usuario (mismos códigos y estados); el estado HTTP real solo va al log del servidor. */
 function mapStatus(status: number, retryAfter: string | null): AppError {
-  if (status === 401) return new AppError("La clave de Pollinations no es válida", 503, "TRYON_NOT_CONFIGURED");
-  if (status === 402) return new AppError("Se han agotado los créditos de generación de imágenes", 503, "TRYON_NO_CREDITS");
-  if (status === 429 || status === 503) return new AppError(`El servicio de imágenes está saturado${retryAfter ? `; reintenta en ${retryAfter}s` : ""}`, 503, "TRYON_BUSY");
-  if (status === 400 || status === 422) return new AppError("El proveedor rechazó la imagen o la descripción (puede haber saltado su filtro de contenido)", 422, "TRYON_REJECTED");
-  return new AppError("El servicio de imágenes no ha podido generar el resultado", 502, "TRYON_UPSTREAM");
+  logError("pollinations.rejected", new Error(`Pollinations ${status}`));
+  if (status === 401) return new AppError(TRYON_MESSAGES.unavailable, 503, "TRYON_NOT_CONFIGURED");
+  if (status === 402) return new AppError(TRYON_MESSAGES.unavailable, 503, "TRYON_NO_CREDITS");
+  if (status === 429 || status === 503) return new AppError(busyMessage(retryAfter), 503, "TRYON_BUSY");
+  if (status === 400 || status === 422) return new AppError(TRYON_MESSAGES.rejected, 422, "TRYON_REJECTED");
+  return new AppError(TRYON_MESSAGES.failed, 502, "TRYON_UPSTREAM");
 }
 
 /**
@@ -19,7 +21,10 @@ function mapStatus(status: number, retryAfter: string | null): AppError {
  */
 export async function editImage(opts: { prompt: string; images: RefImage[] }): Promise<Buffer> {
   const e = env();
-  if (!e.POLLINATIONS_API_KEY) throw new AppError("El probador virtual no está configurado (falta POLLINATIONS_API_KEY)", 503, "TRYON_NOT_CONFIGURED");
+  if (!e.POLLINATIONS_API_KEY) {
+    logError("pollinations.config", new Error("Falta POLLINATIONS_API_KEY"));
+    throw new AppError(TRYON_MESSAGES.unavailable, 503, "TRYON_NOT_CONFIGURED");
+  }
 
   const form = new FormData();
   form.set("model", e.POLLINATIONS_MODEL);
@@ -37,8 +42,9 @@ export async function editImage(opts: { prompt: string; images: RefImage[] }): P
       body: form,
       signal: AbortSignal.timeout(240_000),
     });
-  } catch {
-    throw new AppError("El servicio de imágenes tardó demasiado en responder", 504, "TRYON_TIMEOUT");
+  } catch (err) {
+    logError("pollinations.network", err);
+    throw new AppError(TRYON_MESSAGES.timeout, 504, "TRYON_TIMEOUT");
   }
   if (!res.ok) throw mapStatus(res.status, res.headers.get("retry-after"));
 
@@ -49,5 +55,6 @@ export async function editImage(opts: { prompt: string; images: RefImage[] }): P
     const img = await fetch(first.url, { signal: AbortSignal.timeout(30_000) });
     if (img.ok) return Buffer.from(await img.arrayBuffer());
   }
-  throw new AppError("El proveedor no devolvió ninguna imagen", 502, "TRYON_EMPTY");
+  logError("pollinations.empty", new Error("Respuesta sin imagen"));
+  throw new AppError(TRYON_MESSAGES.failed, 502, "TRYON_EMPTY");
 }

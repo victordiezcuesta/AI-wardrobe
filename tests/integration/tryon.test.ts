@@ -84,11 +84,11 @@ describe("probador virtual", () => {
   it("si el proveedor falla: FAILED con mensaje claro, reintento y límite de intentos", async () => {
     const { tryOnService } = await import("@/services/tryon.service");
     const { AppError } = await import("@/lib/errors");
-    provider.edit.mockRejectedValue(new AppError("Se han agotado los créditos de generación de imágenes", 503, "TRYON_NO_CREDITS"));
+    provider.edit.mockRejectedValue(new AppError("El probador virtual no está disponible en este momento. Inténtalo más tarde.", 503, "TRYON_NO_CREDITS"));
     const dto = await tryOnService.create(u, input());
     await runBackground();
     let cur = await tryOnService.get(u, dto.id);
-    expect(cur).toMatchObject({ status: "FAILED", attempts: 1, errorMessage: "Se han agotado los créditos de generación de imágenes" });
+    expect(cur).toMatchObject({ status: "FAILED", attempts: 1, errorMessage: "El probador virtual no está disponible en este momento. Inténtalo más tarde." });
     expect(cur.imageUrl).toBeNull();
 
     await tryOnService.retry(u, dto.id); await runBackground();

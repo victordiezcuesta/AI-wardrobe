@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { env } from "@/lib/env";
 import { AppError, logError } from "@/lib/errors";
-import { asAiError, chat, parseJson } from "@/lib/openrouter/client";
+import { asAiError, chat, isSurelyNotBilled, parseJson } from "@/lib/openrouter/client";
 import { weatherToText } from "@/lib/weather/open-meteo";
 import { aiOutfitsSchema, type StylistRequest } from "@/lib/validations/stylist";
 import { profileRepository } from "@/repositories/profile.repository";
@@ -49,8 +49,6 @@ const shuffle = <T>(arr: T[]) => arr.map((v) => [Math.random(), v] as const).sor
 
 export const stylistService = {
   async generate(userId: string, req: StylistRequest) {
-    await aiUsageService.assertQuota(userId, "OUTFIT_GENERATION");
-
     const all = await wardrobeRepository.listAvailable(userId);
     if (all.length < MIN_ITEMS) throw new AppError(`Necesitas al menos ${MIN_ITEMS} prendas disponibles en tu armario para pedir conjuntos`, 422, "WARDROBE_TOO_SMALL");
 
@@ -89,32 +87,38 @@ export const stylistService = {
     ].filter(Boolean).join("\n\n");
 
     const model = env().OPENROUTER_MODEL_STYLIST;
-    let feedback = "";
-    let valid: ReturnType<typeof validateOutfits>["valid"] = [];
-
-    for (let attempt = 0; attempt < 2 && valid.length < 3; attempt++) {
-      try {
-        const res = await chat({
-          model, temperature: 0.9, maxTokens: 4000, schema: aiOutfitsSchema, schemaName: "outfits", timeoutMs: 50_000,
-          messages: [{ role: "system", content: SYSTEM }, { role: "user", content: feedback ? `${context}\n\nCORRECCIONES DEL INTENTO ANTERIOR (arréglalas):\n${feedback}` : context }],
-        });
-        const parsed = parseJson(res.text, aiOutfitsSchema);
-        await aiUsageService.log({ userId, task: "OUTFIT_GENERATION", provider: "openrouter", model, ...res.usage, success: true, latencyMs: res.latencyMs });
-        const result = validateOutfits(parsed, aliasMap, new Set([...avoid, ...valid.map((v) => outfitSignature(v.itemIds))]));
-        valid = [...valid, ...result.valid].slice(0, 5);
-        feedback = result.rejected.join("\n");
-      } catch (err) {
-        await aiUsageService.log({ userId, task: "OUTFIT_GENERATION", provider: "openrouter", model, success: false });
-        if (!(err instanceof z.ZodError || err instanceof SyntaxError) || attempt === 1) {
-          if (valid.length === 0) throw asAiError(err);
-          break;
+    type Valid = ReturnType<typeof validateOutfits>["valid"];
+    // Una generación = UNA unidad de la cuota del estilista (solo cuenta OUTFIT_GENERATION, como antes), incluido el
+    // segundo intento con correcciones. Se devuelve solo si OpenRouter no llegó a procesar nada.
+    const valid = await aiUsageService.runReserved(
+      userId, { task: "OUTFIT_GENERATION", provider: "openrouter", model }, { quotaTask: "OUTFIT_GENERATION", notBilled: isSurelyNotBilled },
+      async (meter) => {
+        let feedback = "";
+        let valid: Valid = [];
+        for (let attempt = 0; attempt < 2 && valid.length < 3; attempt++) {
+          try {
+            const res = await chat({
+              model, temperature: 0.9, maxTokens: 4000, schema: aiOutfitsSchema, schemaName: "outfits", timeoutMs: 50_000,
+              messages: [{ role: "system", content: SYSTEM }, { role: "user", content: feedback ? `${context}\n\nCORRECCIONES DEL INTENTO ANTERIOR (arréglalas):\n${feedback}` : context }],
+            });
+            meter.record(res.usage);
+            const parsed = parseJson(res.text, aiOutfitsSchema);
+            const result = validateOutfits(parsed, aliasMap, new Set([...avoid, ...valid.map((v) => outfitSignature(v.itemIds))]));
+            valid = [...valid, ...result.valid].slice(0, 5);
+            feedback = result.rejected.join("\n");
+          } catch (err) {
+            if (!(err instanceof z.ZodError || err instanceof SyntaxError) || attempt === 1) {
+              if (valid.length === 0) throw asAiError(err);
+              break;
+            }
+            logError("stylist.invalid_output", err);
+            feedback = "La respuesta no cumplía el esquema JSON.";
+          }
         }
-        logError("stylist.invalid_output", err);
-        feedback = "La respuesta no cumplía el esquema JSON.";
-      }
-    }
-
-    if (valid.length === 0) throw new AppError("La IA no pudo proponer conjuntos válidos con tu armario. Inténtalo de nuevo.", 502, "NO_VALID_OUTFITS");
+        if (valid.length === 0) throw new AppError("La IA no pudo proponer conjuntos válidos con tu armario. Inténtalo de nuevo.", 502, "NO_VALID_OUTFITS");
+        return valid;
+      },
+    );
 
     const requestId = randomUUID();
     const forDate = new Date(`${req.date}T${req.time ?? "12:00"}:00Z`);
