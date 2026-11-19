@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * Las páginas del panel no pueden confiar en la redirección del layout (se renderizan en paralelo): sin sesión válida
@@ -20,17 +20,25 @@ async function redirectTarget(render: () => Promise<unknown>): Promise<string | 
   }
 }
 
+type Page = () => Promise<unknown>;
+let DashboardPage: Page;
+let ProfilePage: Page;
+// Importación en frío de las páginas (next/image, componentes, constantes…): ~1 s en aislado, pero con la suite en
+// paralelo puede superar los 5 s de un test. Se hace una vez aquí, con margen propio, y los tests solo miden la lógica.
+beforeAll(async () => {
+  ({ default: DashboardPage } = await import("@/app/(dashboard)/dashboard/page"));
+  ({ default: ProfilePage } = await import("@/app/(dashboard)/profile/page"));
+}, 60_000);
+
 beforeEach(() => { state.session = null; dashboardGet.mockReset(); findById.mockReset(); });
 
 describe("páginas protegidas sin sesión", () => {
   it("dashboard redirige a /login sin consultar datos ni lanzar TypeError", async () => {
-    const { default: DashboardPage } = await import("@/app/(dashboard)/dashboard/page");
     expect(await redirectTarget(() => DashboardPage())).toBe("/login");
     expect(dashboardGet).not.toHaveBeenCalled();
   });
 
   it("profile redirige a /login sin consultar datos ni lanzar TypeError", async () => {
-    const { default: ProfilePage } = await import("@/app/(dashboard)/profile/page");
     expect(await redirectTarget(() => ProfilePage())).toBe("/login");
     expect(findById).not.toHaveBeenCalled();
   });
@@ -38,7 +46,6 @@ describe("páginas protegidas sin sesión", () => {
   it("con sesión válida, usan el id comprobado", async () => {
     state.session = { user: { id: "u1" } };
     findById.mockResolvedValue({ name: "Ana", profile: null });
-    const { default: ProfilePage } = await import("@/app/(dashboard)/profile/page");
     expect(await redirectTarget(() => ProfilePage())).toBeNull();
     expect(findById).toHaveBeenCalledWith("u1");
   });
