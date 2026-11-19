@@ -4,6 +4,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { signIn } from "next-auth/react";
 import { Button, Input } from "@/components/ui";
 import { loginErrorMessage } from "@/features/authentication/login-errors";
+import { safeCallbackPath } from "@/features/authentication/callback-url";
 
 export function LoginForm() {
   const router = useRouter();
@@ -25,8 +26,8 @@ export function LoginForm() {
     }
     setLoading(false);
     if (message) return setError(message);
-    const next = params.get("callbackUrl");
-    router.push(next && next.startsWith("/") ? next : "/dashboard");
+    // callbackUrl viene de la URL (no confiable): solo se sigue si es una ruta interna del mismo origen.
+    router.push(safeCallbackPath(params.get("callbackUrl"), window.location.origin));
     router.refresh();
   }
 
