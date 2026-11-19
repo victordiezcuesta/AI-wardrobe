@@ -24,8 +24,19 @@ describe("profileSchema", () => {
     const r = profileSchema.safeParse({ budgetMin: 100, budgetMax: 50 });
     expect(r.success).toBe(false);
   });
-  it("aplica valores por defecto a las listas", () => {
-    const r = profileSchema.parse({});
-    expect(r.usualStyles).toEqual([]);
+  it("no inventa valores para las listas omitidas (actualización parcial) y conserva [] explícito", () => {
+    const omitted = profileSchema.parse({});
+    for (const k of ["usualStyles", "exploreStyles", "favoriteColors", "avoidedColors", "favoriteBrands", "favoriteGarments"] as const) {
+      expect(omitted[k], k).toBeUndefined();
+      expect(k in omitted, k).toBe(false); // ni siquiera aparece la clave: Prisma no la toca
+    }
+    expect(profileSchema.parse({ usualStyles: [] }).usualStyles).toEqual([]);
+    expect(profileSchema.parse({ usualStyles: [" casual "] }).usualStyles).toEqual(["casual"]);
+  });
+  it("rechaza listas inválidas", () => {
+    expect(profileSchema.safeParse({ usualStyles: [""] }).success).toBe(false);
+    expect(profileSchema.safeParse({ usualStyles: Array(13).fill("x") }).success).toBe(false);
+    expect(profileSchema.safeParse({ favoriteColors: null }).success).toBe(false);
+    expect(profileSchema.safeParse({ favoriteColors: "rojo" }).success).toBe(false);
   });
 });

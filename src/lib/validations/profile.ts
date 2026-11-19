@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-const tags = (max = 20) => z.array(z.string().trim().min(1).max(40)).max(max).default([]);
+/**
+ * Lista opcional SIN valor por defecto: en un PUT parcial, una lista omitida queda `undefined` y Prisma no la toca;
+ * `[]` explícito la vacía. (Con `.default([])`, omitirla la borraba.) Al crear el perfil, la columna ya tiene
+ * DEFAULT ARRAY[] en la base de datos.
+ */
+const tags = (max = 20) => z.array(z.string().trim().min(1).max(40)).max(max).optional();
 
 export const profileSchema = z.object({
   name: z.string().trim().max(80).optional(),
