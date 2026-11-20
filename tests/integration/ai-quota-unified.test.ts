@@ -127,6 +127,24 @@ describe("estilista", () => {
     expect(await t.prisma.aiUsageLog.findFirst({ where: { userId: u.id } })).toMatchObject({ success: false });
   }, 20_000);
 
+  it("429 del proveedor (cupo gratuito) → una sola llamada, AI_RATE_LIMITED 429 genérico; rechazo previo: la unidad se devuelve", async () => {
+    const u = await user();
+    openrouter({ outfits: [http(429)] });
+    const err = await (await services()).stylist.generate(u.id, req).then(() => null, (e: { status: number; message: string; code: string }) => e);
+    expect(err).toMatchObject({ status: 429, code: "AI_RATE_LIMITED", message: "El servicio de IA ha alcanzado su límite de uso. Inténtalo de nuevo más tarde." });
+    expect(calls).toEqual(["outfits"]);
+    expect(await count(u.id)).toBe(0);
+  });
+
+  it("404 «No endpoints found» → error genérico AI_UPSTREAM sin detalles; la unidad se devuelve", async () => {
+    const u = await user();
+    openrouter({ outfits: [() => new Response(JSON.stringify({ error: { message: "No endpoints found matching your data policy" } }), { status: 404 })] });
+    const err = await (await services()).stylist.generate(u.id, req).then(() => null, (e: { message: string; code: string }) => e);
+    expect(err).toMatchObject({ code: "AI_UPSTREAM", message: "El servicio de IA no ha podido responder. Inténtalo de nuevo en unos minutos." });
+    expect(err!.message).not.toMatch(/endpoint|policy|404|OpenRouter/i);
+    expect(await count(u.id)).toBe(0);
+  });
+
   it("armario insuficiente → no reserva nada", async () => {
     const u = await t.prisma.user.create({ data: { email: `vacio${Math.random()}@q.com` } });
     openrouter({ outfits: [threeLooks] });

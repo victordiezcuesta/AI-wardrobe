@@ -36,6 +36,7 @@ function fromDetected(d: DetectedItem, img: StoredImage, extraReview: boolean): 
 /** Motivo para el cliente sin detalles internos (claves, proveedor, códigos HTTP): el detalle va solo al log. */
 export function analysisFailureReason(err: unknown): string {
   if (err instanceof AppError && err.code === "RATE_LIMITED") return err.message; // cuota diaria agotada: útil y sin datos internos
+  if (err instanceof AppError && err.code === "AI_RATE_LIMITED") return "El análisis automático ha alcanzado su límite de uso. Completa los datos a mano o inténtalo más tarde.";
   if (err instanceof AppError && err.code === "AI_NOT_CONFIGURED") return "El análisis automático no está disponible en este momento.";
   return "La IA no ha podido analizar la foto. Completa los datos a mano o inténtalo más tarde.";
 }

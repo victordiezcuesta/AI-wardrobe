@@ -165,7 +165,7 @@ describe("errores del proveedor", () => {
     expect(await units()).toBe(0);
   }, 20_000);
 
-  it.each([500, 502, 503, 504, 429])("%i en todos los reintentos → no hay garantía de que no se procesara: UNA unidad consumida", async (status) => {
+  it.each([500, 502, 503, 504])("%i en todos los reintentos → no hay garantía de que no se procesara: UNA unidad consumida", async (status) => {
     provider(() => httpError(status));
     const r = await analyze();
     expect(r.body.status).toBe("analysis_failed");
@@ -173,6 +173,45 @@ describe("errores del proveedor", () => {
     expect(calls).toBe(3);
     expect(await units()).toBe(1); // tres intentos, una sola unidad
     expect((await rows())[0]).toMatchObject({ success: false });
+  }, 20_000);
+
+  it("429 (cupo gratuito del proveedor) → sin reintentos, prenda por revisar con motivo propio; rechazo previo: la unidad se devuelve", async () => {
+    provider(() => httpError(429));
+    const r = await analyze();
+    expect(r.status).toBe(200);
+    expect(r.body.status).toBe("analysis_failed");
+    expect(r.body.items?.[0]?.needsReview).toBe(true);
+    expect(r.body.reason).toBe("El análisis automático ha alcanzado su límite de uso. Completa los datos a mano o inténtalo más tarde.");
+    expect(JSON.stringify(r.body)).not.toMatch(/OpenRouter|sk-or|429/);
+    expect(calls).toBe(1);
+    expect(await units()).toBe(0);
+  });
+
+  it("404 «No endpoints found» (política de datos) → rechazo previo: la unidad se devuelve y no se filtra el motivo", async () => {
+    provider(() => httpError(404, JSON.stringify({ error: { message: "No endpoints found matching your data policy (Free model publication)" } })));
+    const r = await analyze();
+    expect(r.body.status).toBe("analysis_failed");
+    expect(r.body.reason).toBe("La IA no ha podido analizar la foto. Completa los datos a mano o inténtalo más tarde.");
+    expect(JSON.stringify(r.body)).not.toMatch(/OpenRouter|endpoint|policy|404/i);
+    expect(calls).toBe(1);
+    expect(await units()).toBe(0);
+  });
+
+  it("404 sin motivo de enrutado → dudoso: consumida", async () => {
+    provider(() => httpError(404));
+    await analyze();
+    expect(await units()).toBe(1);
+  });
+
+  it("un intento dudoso (5xx o red) seguido de un 429 o un 404 de enrutado → la unidad NO se devuelve", async () => {
+    const noEndpoints = () => httpError(404, JSON.stringify({ error: { message: "No endpoints found matching your data policy" } }));
+    provider(() => httpError(503), () => httpError(429));
+    await analyze();
+    expect(await units()).toBe(1);
+    provider(() => { throw new TypeError("fetch failed"); }, noEndpoints);
+    await analyze();
+    expect(calls).toBe(2);
+    expect(await units()).toBe(2);
   }, 20_000);
 
   it("403 → dudoso (no todos sus motivos son previos al procesamiento): consumida", async () => {
@@ -278,6 +317,25 @@ describe("concurrencia y reintentos", () => {
     provider(() => new Promise((resolve) => setTimeout(() => resolve(httpError(401)), 30)));
     await Promise.all(Array.from({ length: 6 }, () => analyze()));
     expect(await units()).toBe(LIMIT - 2); // todas las reservas devueltas, ni una fila ajena borrada
+  }, 30_000);
+
+  it("simultáneos con 429 (cupo del proveedor) → ni se supera el límite ni se libera más de lo reservado; luego otro 429 tampoco consume", async () => {
+    await fill(LIMIT - 2);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let maxUnits = 0;
+    provider(async () => {
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      maxUnits = Math.max(maxUnits, await units()); // reservas vigentes mientras el proveedor «procesa»
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      inFlight--;
+      return httpError(429);
+    });
+    const results = await Promise.all(Array.from({ length: 6 }, () => analyze()));
+    expect(results.every((r) => r.body.status === "analysis_failed")).toBe(true);
+    expect(maxInFlight).toBeLessThanOrEqual(2); // nunca más llamadas simultáneas que unidades libres
+    expect(maxUnits).toBeLessThanOrEqual(LIMIT); // el límite no se supera en ningún momento
+    expect(await units()).toBe(LIMIT - 2); // todas las reservas devueltas (una reserva es una fila), ni una ajena borrada
   }, 30_000);
 
   it("liberar una reserva dos veces no devuelve más de una unidad; completar una liberada no la resucita", async () => {
