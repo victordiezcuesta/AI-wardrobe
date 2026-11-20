@@ -14,7 +14,8 @@ const baseSchema = z.object({
   OPENROUTER_MODEL_STYLIST: z.string().optional(),
   OPENROUTER_MODEL_CHEAP: z.string().optional(),
   POLLINATIONS_API_KEY: z.string().optional(),
-  POLLINATIONS_MODEL: z.string().default("google/gemini-2.5-flash-image"),
+  // Modelo gratuito (no `paid_only`) con /v1/images/edits y hasta 10 referencias; ver .env.example.
+  POLLINATIONS_MODEL: z.string().default("black-forest-labs/flux.2-klein-4b"),
   POLLINATIONS_BASE_URL: z.string().url().default("https://gen.pollinations.ai"),
   POLLINATIONS_MAX_REFERENCES: z.coerce.number().int().min(1).max(8).default(5),
   POLLINATIONS_IMAGE_SIZE: z.string().regex(/^\d{3,4}x\d{3,4}$/).optional(),

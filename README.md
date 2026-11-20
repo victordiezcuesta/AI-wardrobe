@@ -85,8 +85,8 @@ La app usa Prisma 7 con el **adaptador de Neon** (`@prisma/adapter-neon`). El es
 ## 8. Configuración de Pollinations
 
 1. Crea una clave **secreta** (`sk_…`) en <https://enter.pollinations.ai> → `POLLINATIONS_API_KEY`. Es solo de servidor.
-2. `POLLINATIONS_MODEL` (defecto `google/gemini-2.5-flash-image`). La documentación oficial lista como modelos con varias imágenes de referencia `bytedance/seedream-4.0`, `google/gemini-2.5-flash-image` y `black-forest-labs/flux.2-klein-4b`; comprueba la lista vigente.
-3. `POLLINATIONS_MAX_REFERENCES` (defecto 5): imagen de la persona + prendas con foto. El resto de prendas se describe en el texto.
+2. `POLLINATIONS_MODEL` (defecto `black-forest-labs/flux.2-klein-4b`, gratuito: se paga con el saldo Quest y admite hasta 10 referencias). Los modelos marcados `paid_only` en <https://gen.pollinations.ai/image/models> (p. ej. `google/gemini-2.5-flash-image`) exigen saldo de pago y responden 402 sin él; comprueba la lista vigente.
+3. `POLLINATIONS_MAX_REFERENCES` (defecto 5, máximo 8): imagen de la persona + prendas con foto; el resto de prendas se describe en el texto. No debe superar el `max_reference_images` del modelo elegido (flux.2-klein-4b: 10; microsoft/mai-image-*-flash: 5).
 4. La generación usa `POST /v1/images/edits` con `response_format=b64_json` (el resultado no queda alojado en su servidor) y es de pago por créditos; `TRYON_DAILY_LIMIT_PER_USER` limita el gasto.
 5. **Limitación importante:** no hay garantía de conservar la identidad ni los detalles exactos de las prendas. Es una recreación con IA y así se indica en la interfaz.
 6. Se exige **consentimiento explícito** (verificado en servidor) antes de guardar o enviar ninguna foto personal.

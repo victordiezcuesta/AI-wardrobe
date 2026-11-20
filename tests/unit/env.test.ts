@@ -57,7 +57,7 @@ describe("variables de texto", () => {
   });
   it("con valor por defecto y vacía → aplica el valor por defecto", () => {
     const e = parse({ POLLINATIONS_MODEL: "", POLLINATIONS_BASE_URL: "", CATALOG_STORES: "", CATALOG_REGION: "", EMAIL_FROM: "", APP_TIMEZONE: "", NEXT_PUBLIC_APP_URL: "" });
-    expect(e.POLLINATIONS_MODEL).toBe("google/gemini-2.5-flash-image");
+    expect(e.POLLINATIONS_MODEL).toBe("black-forest-labs/flux.2-klein-4b");
     expect(e.POLLINATIONS_BASE_URL).toBe("https://gen.pollinations.ai");
     expect(e.CATALOG_STORES).toContain("Mango");
     expect(e.CATALOG_REGION).toBe("ES");

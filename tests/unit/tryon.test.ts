@@ -56,7 +56,7 @@ describe("editImage (Pollinations)", () => {
     expect((init.headers as Record<string, string>).Authorization).toBe("Bearer sk_test");
     const form = init.body as FormData;
     expect(form.get("response_format")).toBe("b64_json");
-    expect(form.get("model")).toBe("google/gemini-2.5-flash-image");
+    expect(form.get("model")).toBe("black-forest-labs/flux.2-klein-4b");
     expect(form.getAll("image")).toHaveLength(2);
   });
 
