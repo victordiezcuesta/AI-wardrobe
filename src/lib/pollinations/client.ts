@@ -1,6 +1,9 @@
 import { env } from "@/lib/env";
 import { AppError, logError } from "@/lib/errors";
+import { fetchImage } from "@/lib/uploads/validate";
 import { busyMessage, TRYON_MESSAGES } from "./messages";
+
+const MAX_RESULT_BYTES = 20 * 1024 * 1024;
 
 export interface RefImage { bytes: Buffer; mime: string; name: string }
 
@@ -52,8 +55,12 @@ export async function editImage(opts: { prompt: string; images: RefImage[] }): P
   const first = data?.data?.[0];
   if (first?.b64_json) return Buffer.from(first.b64_json, "base64");
   if (first?.url) {
-    const img = await fetch(first.url, { signal: AbortSignal.timeout(30_000) });
-    if (img.ok) return Buffer.from(await img.arrayBuffer());
+    // Respaldo si el proveedor ignora `b64_json`. La URL la dicta el proveedor: solo se acepta en el mismo host de su
+    // API (POLLINATIONS_BASE_URL), por HTTPS, con tamaño acotado y contenido de imagen real; cualquier otro destino,
+    // incluidas sus redirecciones, se rechaza sin descargarlo y el resultado cuenta como vacío (TRYON_EMPTY).
+    const allowedHosts = [new URL(e.POLLINATIONS_BASE_URL).hostname];
+    try { return (await fetchImage(first.url, { allowedHosts, maxBytes: MAX_RESULT_BYTES, timeoutMs: 30_000 })).bytes; }
+    catch (err) { logError("pollinations.result_url", err); }
   }
   logError("pollinations.empty", new Error("Respuesta sin imagen"));
   throw new AppError(TRYON_MESSAGES.failed, 502, "TRYON_EMPTY");

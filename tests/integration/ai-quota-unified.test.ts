@@ -15,6 +15,8 @@ const PNG = vi.hoisted(() => Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x
 const pollinations = vi.hoisted(() => ({ edit: vi.fn() }));
 
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
+vi.mock("node:dns/promises", () => { const lookup = async () => [{ address: "104.18.20.1", family: 4 }]; return { lookup, default: { lookup } }; }); // sin DNS real: IP pública
+vi.mock("@/lib/uploads/pinned-request", () => ({ requestPinned: (url: URL) => fetch(url) })); // sin conexiones reales: las descargas pasan por el fetch simulado
 vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: (fn: () => Promise<unknown>) => { bg.jobs.push(fn); } }));
 vi.mock("@/lib/pollinations/client", () => ({ editImage: pollinations.edit }));
 vi.mock("@/lib/cloudinary", () => ({

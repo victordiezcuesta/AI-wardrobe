@@ -1,4 +1,6 @@
 import { AppError } from "@/lib/errors";
+import { assertAllowedUrl, resolvePublicAddresses } from "./remote-url";
+import { requestPinned } from "./pinned-request";
 
 export const MAX_UPLOAD_BYTES = 4 * 1024 * 1024; // límite de cuerpo de las funciones de Vercel ≈ 4,5 MB
 
@@ -69,4 +71,71 @@ export async function readUploadForm(req: Request, maxBytes = MAX_UPLOAD_REQUEST
   } catch {
     throw new AppError("La subida no es válida", 400, "INVALID_UPLOAD");
   }
+}
+
+export const MAX_IMAGE_REDIRECTS = 3;
+const REDIRECT_STATUSES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]);
+
+/** Descarta el cuerpo de una respuesta que no se va a leer (libera la conexión). */
+const discard = (res: Response) => res.body?.cancel().catch(() => undefined);
+
+/**
+ * Descarga una imagen en el servidor sin abrir la puerta a SSRF:
+ * - la URL inicial y CADA redirección (máx. 3, seguidas a mano) se validan con `assertAllowedUrl` (HTTPS, sin
+ *   credenciales ni puerto, host exacto de `allowedHosts`, nunca localhost/IP privada) ANTES de pedirlas; nada se
+ *   descarga de un destino no validado;
+ * - en cada salto el host se resuelve una vez (`resolvePublicAddresses`: todas sus IP deben ser públicas) y la conexión
+ *   se fija a esas IP (`requestPinned`), sin segunda resolución DNS (DNS rebinding) y con TLS sobre el hostname original;
+ * - un único timeout cubre DNS, redirecciones y lectura del cuerpo;
+ * - el tamaño se corta en streaming (sin leerla entera) y el contenido debe tener firma JPEG, PNG o WebP.
+ * Los errores no se muestran al usuario: van al log del llamador.
+ */
+export async function fetchImage(
+  url: string,
+  opts: { allowedHosts: readonly string[]; maxBytes: number; timeoutMs: number },
+): Promise<{ bytes: Buffer; mime: string }> {
+  const allowed = new Set(opts.allowedHosts.map((h) => h.toLowerCase()));
+  const signal = AbortSignal.timeout(opts.timeoutMs);
+  let current = assertAllowedUrl(url, allowed);
+  let res: Response;
+  for (let redirects = 0; ; redirects++) {
+    const addresses = await resolvePublicAddresses(current.hostname, signal);
+    res = await requestPinned(current, addresses, { signal }); // no sigue redirecciones por su cuenta
+    if (!REDIRECT_STATUSES.has(res.status)) break;
+    await discard(res);
+    if (redirects >= MAX_IMAGE_REDIRECTS) throw new Error("Demasiadas redirecciones");
+    const location = res.headers.get("location");
+    if (!location) throw new Error("Redirección sin destino");
+    let next: URL;
+    try { next = new URL(location, current); } catch { throw new Error("Redirección no válida"); }
+    current = assertAllowedUrl(next, allowed);
+  }
+  // Solo 200: un 206 (contenido parcial) u otro 2xx no garantiza la imagen completa.
+  if (res.status !== 200) { await discard(res); throw new Error(`No se pudo descargar la imagen (${res.status})`); }
+  if (Number(res.headers.get("content-length")) > opts.maxBytes) { await discard(res); throw new Error("Imagen demasiado grande"); }
+  if (!res.body) throw new Error("Respuesta sin cuerpo");
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  // El timeout corta también la lectura del cuerpo, aunque el stream no atienda a la señal por su cuenta.
+  const onAbort = () => { reader.cancel(signal.reason).catch(() => undefined); };
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      signal.throwIfAborted(); // un cuerpo cortado por el timeout nunca se da por completo
+      if (done) break;
+      total += value.byteLength;
+      if (total > opts.maxBytes) { await reader.cancel().catch(() => undefined); throw new Error("Imagen demasiado grande"); }
+      chunks.push(value);
+    }
+  } catch (err) {
+    throw signal.aborted ? signal.reason : err;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+  const bytes = Buffer.concat(chunks);
+  const kind = sniffImage(bytes);
+  if (!kind) throw new Error("El contenido descargado no es una imagen válida");
+  return { bytes, mime: `image/${kind}` };
 }

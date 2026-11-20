@@ -15,6 +15,17 @@ const session = vi.hoisted(() => ({ userId: "" }));
 const cloud = vi.hoisted(() => ({ upload: vi.fn() }));
 const PNG = vi.hoisted(() => Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5, 6]));
 
+const dns = vi.hoisted(() => ({ addresses: {} as Record<string, string> }));
+vi.mock("node:dns/promises", () => {
+  // Sin DNS real: IP pública salvo que la prueba fije otra para un host.
+  const lookup = async (host: string) => [{ address: dns.addresses[host] ?? "104.18.20.1", family: (dns.addresses[host] ?? "").includes(":") ? 6 : 4 }];
+  return { lookup, default: { lookup } };
+});
+/** Conector fijado simulado: delega en el fetch simulado de cada prueba y registra las IP con las que se conectaría. */
+const pinned = vi.hoisted(() => ({ calls: [] as { url: string; addresses: unknown }[] }));
+vi.mock("@/lib/uploads/pinned-request", () => ({
+  requestPinned: (url: URL, addresses: unknown) => { pinned.calls.push({ url: String(url), addresses }); return fetch(url); },
+}));
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
 vi.mock("@/lib/auth/session", () => ({ requireUserId: async () => session.userId }));
 vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: (fn: () => Promise<unknown>) => { bg.jobs.push(fn); } }));
@@ -34,6 +45,8 @@ afterAll(async () => { await t?.stop(); });
 let errSpy: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
   bg.jobs.length = 0;
+  dns.addresses = {};
+  pinned.calls = [];
   cloud.upload.mockReset();
   cloud.upload.mockImplementation(async (_b: Buffer, folder: string) => ({ publicId: `${folder}/r${Math.random()}`, width: 1, height: 1 }));
   errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -161,5 +174,105 @@ describe("endpoints del probador: errores sin detalles internos", () => {
     const res = await create(u.body);
     expect(res.status).toBe(403);
     expect(JSON.parse(res.text)).toMatchObject({ error: { code: "CONSENT_REQUIRED" } });
+  });
+});
+
+/**
+ * Descargas del probador contra SSRF, con el flujo real (servicio + cliente de Pollinations): solo hosts permitidos,
+ * cada redirección validada y nada descargado de destinos no autorizados. La cuota se resuelve igual que antes:
+ * fallo antes de llamar a Pollinations → unidad devuelta; desde la llamada → consumida.
+ */
+describe("descargas seguras (SSRF)", () => {
+  const PNG_RES = () => new Response(new Uint8Array(PNG), { status: 200 });
+  let fetched: string[] = [];
+  /** `route` decide la respuesta de cada URL descargada; /v1/images/edits responde `edits`. */
+  function net(route: (url: string) => Response, edits: () => Response = imageOk) {
+    fetched = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      fetched.push(u);
+      return u.includes("/v1/images/edits") ? edits() : route(u);
+    }));
+  }
+  const editsCalled = () => fetched.some((u) => u.includes("/v1/images/edits"));
+  const tryOnUnits = (userId: string) => t.prisma.aiUsageLog.count({ where: { userId, task: "TRY_ON" } });
+  async function run(body: unknown) {
+    const created = await create(body);
+    expect(created.status).toBe(202);
+    const id = (JSON.parse(created.text) as { image: { id: string } }).image.id;
+    await runBackground();
+    return getJob(id);
+  }
+
+  it("foto privada: api.cloudinary.com redirige a res.cloudinary.com → se sigue el salto validado y se completa", async () => {
+    const u = await user();
+    net((url) => (url.startsWith("https://api.cloudinary.com/") ? new Response(null, { status: 302, headers: { location: "https://res.cloudinary.com/demo/image/authenticated/s--x--/p1.jpg" } }) : PNG_RES()));
+    const res = await run(u.body);
+    expect(res.image).toMatchObject({ status: "COMPLETED" });
+    expect(fetched).toContain("https://res.cloudinary.com/demo/image/authenticated/s--x--/p1.jpg");
+    // Cada descarga (y cada salto) se conecta a la IP resuelta y validada para ese host.
+    expect(pinned.calls.length).toBeGreaterThanOrEqual(2);
+    for (const c of pinned.calls) expect(c.addresses).toEqual([{ address: "104.18.20.1", family: 4 }]);
+    // Toda descarga (no la llamada a la API de Pollinations) pasó por requestPinned, una vez cada una.
+    expect(fetched.filter((x) => !x.includes("/v1/images/edits"))).toEqual(pinned.calls.map((c) => c.url));
+    expect(await tryOnUnits(u.id)).toBe(1);
+  });
+
+  it.each([
+    ["metadatos de la nube por HTTP", "http://169.254.169.254/latest/meta-data/"],
+    ["localhost", "https://localhost/admin"],
+    ["IP privada", "https://10.0.0.5/x.png"],
+    ["dominio no autorizado", "https://evil.example.com/x.png"],
+  ])("la foto privada redirige a %s → FAILED genérico, destino nunca pedido, sin llamar a Pollinations y unidad devuelta", async (_n, location) => {
+    const u = await user();
+    net((url) => (url.startsWith("https://api.cloudinary.com/") ? new Response(null, { status: 302, headers: { location } }) : PNG_RES()));
+    const res = await run(u.body);
+    expect(res.image).toMatchObject({ status: "FAILED" });
+    expect(res.text).not.toMatch(LEAK);
+    expect(res.text).not.toMatch(/169\.254|localhost|10\.0\.0\.5|evil/);
+    expect(fetched).not.toContain(location);
+    expect(logged()).toMatch(/Destino de imagen no permitido|Host de imagen no permitido|Solo se descargan imágenes por HTTPS/); // motivo concreto, solo en el log
+    expect(editsCalled()).toBe(false);
+    expect(await tryOnUnits(u.id)).toBe(0);
+  });
+
+  it("una prenda cuyo host resuelve a una IP privada (DNS manipulado) → no se descarga; FAILED y unidad devuelta", async () => {
+    const u = await user();
+    dns.addresses["res.cloudinary.com"] = "10.1.2.3";
+    net(() => PNG_RES());
+    const res = await run(u.body);
+    expect(res.image).toMatchObject({ status: "FAILED" });
+    expect(fetched.some((x) => x.startsWith("https://res.cloudinary.com/"))).toBe(false);
+    expect(logged()).toContain("resuelve a una dirección no permitida");
+    expect(editsCalled()).toBe(false);
+    expect(await tryOnUnits(u.id)).toBe(0);
+  });
+
+  it("Pollinations responde con URL en el host de su API (sin b64_json) → se descarga y se completa", async () => {
+    const u = await user();
+    net(() => PNG_RES(), () => new Response(JSON.stringify({ data: [{ url: "https://gen.pollinations.ai/media/r1.png" }] }), { status: 200 }));
+    const res = await run(u.body);
+    expect(res.image).toMatchObject({ status: "COMPLETED" });
+    expect(fetched).toContain("https://gen.pollinations.ai/media/r1.png");
+  });
+
+  it.each([
+    ["en otro dominio", "https://evil.example.com/r.png", null],
+    ["en una IP interna", "https://169.254.169.254/latest/meta-data/", null],
+    ["que redirige a localhost", "https://gen.pollinations.ai/media/r1.png", "http://localhost:3000/api/admin"],
+  ])("Pollinations responde con URL %s → no se sigue; FAILED genérico y la unidad queda consumida (se llamó al proveedor)", async (_n, url, location) => {
+    const u = await user();
+    net(
+      (x) => (x === url && location ? new Response(null, { status: 302, headers: { location } }) : PNG_RES()),
+      () => new Response(JSON.stringify({ data: [{ url }] }), { status: 200 }),
+    );
+    const res = await run(u.body);
+    expect(res.image).toMatchObject({ status: "FAILED" });
+    expect(res.text).not.toMatch(LEAK);
+    if (location) expect(fetched).not.toContain(location);
+    else expect(fetched).not.toContain(url);
+    expect(logged()).toContain("pollinations.result_url");
+    expect(logged()).toMatch(/Destino de imagen no permitido|Host de imagen no permitido|Solo se descargan imágenes por HTTPS/);
+    expect(await tryOnUnits(u.id)).toBe(1);
   });
 });

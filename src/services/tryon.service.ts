@@ -3,7 +3,7 @@ import { AppError, logError, notFound } from "@/lib/errors";
 import { deletePrivateImages, signedUrl, uploadPrivate } from "@/lib/cloudinary";
 import { editImage, type RefImage } from "@/lib/pollinations/client";
 import { publicTryOnError, TRYON_MESSAGES } from "@/lib/pollinations/messages";
-import { sniffImage } from "@/lib/uploads/validate";
+import { fetchImage, sniffImage } from "@/lib/uploads/validate";
 import { env } from "@/lib/env";
 import { prisma } from "@/lib/prisma";
 import type { GeneratedImage } from "@/generated/prisma/client";
@@ -19,18 +19,25 @@ const STALE_PROCESSING_MS = 6 * 60_000;
 const STALE_PENDING_MS = 2 * 60_000;
 const MAX_REF_BYTES = 8 * 1024 * 1024;
 
-async function fetchBytes(url: string): Promise<{ bytes: Buffer; mime: string }> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
-  if (!res.ok) throw new Error(`No se pudo descargar una imagen de referencia (${res.status})`);
-  const bytes = Buffer.from(await res.arrayBuffer());
-  if (bytes.length > MAX_REF_BYTES) throw new Error("Imagen de referencia demasiado grande");
-  const kind = sniffImage(bytes);
-  if (!kind) throw new Error("Una imagen de referencia no es válida");
-  return { bytes, mime: `image/${kind}` };
-}
+/**
+ * Hosts de los que se descargan referencias (comprobados en el SDK de Cloudinary 2.11, sin private_cdn/cname/
+ * upload_prefix configurados): `signedUrl()` → api.cloudinary.com (UPLOAD_PREFIX, API de descarga, que puede redirigir
+ * al CDN) y las prendas → res.cloudinary.com (SHARED_CDN).
+ */
+const CLOUDINARY_DOWNLOAD_HOSTS = ["api.cloudinary.com", "res.cloudinary.com"] as const;
+const fetchBytes = (url: string) => fetchImage(url, { allowedHosts: CLOUDINARY_DOWNLOAD_HOSTS, maxBytes: MAX_REF_BYTES, timeoutMs: 20_000 });
 
-/** Solo se descargan referencias del CDN de Cloudinary (evita SSRF si un dato se corrompiera). */
-const isCloudinary = (u: string) => { try { return new URL(u).hostname === "res.cloudinary.com"; } catch { return false; } };
+/**
+ * Solo se descargan referencias del CDN de Cloudinary de NUESTRA cuenta, por HTTPS (evita SSRF y el uso de imágenes
+ * de otras cuentas de Cloudinary si un dato se corrompiera o se manipulara).
+ */
+export function isOwnCloudinaryUrl(u: string): boolean {
+  try {
+    const url = new URL(u);
+    return url.protocol === "https:" && url.hostname === "res.cloudinary.com" && !url.username && !url.password && !url.port
+      && url.pathname.startsWith(`/${env().CLOUDINARY_CLOUD_NAME}/`);
+  } catch { return false; }
+}
 
 export function toDTO(row: GeneratedImage) {
   const done = row.status === "COMPLETED" && row.publicId;
@@ -67,7 +74,7 @@ async function run(jobId: string, reservation: string) {
     const outfit = await outfitService.get(job.userId, job.outfitId);
 
     const withUrls = await prisma.wardrobeItem.findMany({ where: { userId: job.userId, id: { in: outfit.items.map((i) => i.itemId) } }, select: { id: true, name: true, category: true, primaryColor: true, imageUrl: true } });
-    const promptItems: PromptItem[] = withUrls.map((i) => ({ id: i.id, name: i.name, category: i.category as CategoryKey, color: i.primaryColor, hasImage: !!i.imageUrl && isCloudinary(i.imageUrl) }));
+    const promptItems: PromptItem[] = withUrls.map((i) => ({ id: i.id, name: i.name, category: i.category as CategoryKey, color: i.primaryColor, hasImage: !!i.imageUrl && isOwnCloudinaryUrl(i.imageUrl) }));
     const referenced = pickReferences(promptItems, env().POLLINATIONS_MAX_REFERENCES);
     const prompt = buildTryOnPrompt(promptItems, referenced, job.scenario as ScenarioKey, job.pose as PoseKey);
 
