@@ -24,7 +24,7 @@ Integraciones de proveedor (OpenRouter, Pollinations, Cloudinary, Open-Meteo, ca
 
 **Estilista:** petición → cuota → prendas disponibles (alias) + perfil + preferencias + recientes + clima → OpenRouter → `validateOutfits` → reintento con correcciones si hace falta → BD.
 
-**Probador:** consentimiento → `POST /api/try-on` crea `GeneratedImage(PENDING)` y responde 202 → `after()` reclama el trabajo (PENDING→PROCESSING atómico), descarga referencias (solo CDN de Cloudinary), llama a Pollinations (`/v1/images/edits`, multipart, `b64_json`), valida el binario y sube a Cloudinary privado → el cliente sondea `GET /api/try-on/:id`. Los trabajos atascados se marcan fallidos al consultarlos.
+**Probador:** consentimiento → `POST /api/try-on` crea `GeneratedImage(PENDING)` y responde 202 → `after()` reclama el trabajo (PENDING→PROCESSING atómico), descarga referencias (solo de Cloudinary: la foto personal por su URL firmada de `api.cloudinary.com`, que puede redirigir a `res.cloudinary.com`, y las prendas desde `res.cloudinary.com` de la propia cuenta), llama a Pollinations (`/v1/images/edits`, multipart, `b64_json`), valida el binario y sube a Cloudinary privado → el cliente sondea `GET /api/try-on/:id`. Los trabajos atascados se marcan fallidos al consultarlos.
 
 **Compras:** huecos (IA) → búsqueda en `CatalogProduct` → filtros del perfil → ranking (IA, con respaldo determinista) → lote persistido. El catálogo se importa aparte (`catalog-sync`, cron o script) desde feeds autorizados.
 
@@ -38,7 +38,13 @@ Todas las relaciones con `User` son `onDelete: Cascade`: eliminar la cuenta borr
 
 - Contraseñas: bcrypt (coste 12). Tokens de verificación/recuperación: 32 bytes aleatorios, solo se guarda su SHA-256, de un solo uso, con caducidad.
 - Respuestas de registro y recuperación idénticas exista o no la cuenta (no se enumeran emails).
-- Archivos: tamaño máximo y formato por firma binaria (no por extensión/Content-Type).
+- Archivos: tamaño máximo y formato por firma binaria (no por extensión/Content-Type). Las subidas se rechazan antes de leer el cuerpo si su `Content-Length` supera el límite o no es un número válido, y el cuerpo se lee con un límite estricto antes de interpretar el multipart (también sin `Content-Length`: se corta en cuanto lo supera).
+- Descargas en servidor (`fetchImage`, protección SSRF): solo HTTPS a una lista exacta de hosts que da quien llama (probador: `api.cloudinary.com` y `res.cloudinary.com`; resultado de Pollinations: solo el host de `POLLINATIONS_BASE_URL`). Se rechazan credenciales, puertos, nombres locales e IP privadas, de loopback o link-local (IPv4 e IPv6). Cada salto (máx. 3 redirecciones) se valida, se resuelve por DNS una sola vez y la conexión se fija a esas IP (sin DNS rebinding), con TLS sobre el hostname original, un único timeout, tamaño limitado en streaming y firma de imagen comprobada.
+- Imágenes y base de datos:
+  - Tras un fallo al guardar una imagen recién subida (foto personal, prenda o resultado del probador), solo se elimina de Cloudinary si se confirma que ninguna fila la referencia; si se guardó pese al error se da por guardada, y si no se puede verificar se conserva.
+  - Las prendas eliminan su imagen de Cloudinary al retirar la **última referencia del propio usuario** (prendas que comparten foto). Los borrados concurrentes se serializan con `SELECT … FOR UPDATE`. Si Cloudinary falla, la prenda se conserva para reintentar.
+  - Las fotos personales se eliminan a petición de su propietario: tras comprobar la propiedad, primero en Cloudinary y después se retira la referencia del perfil (si Cloudinary falla, la referencia se conserva). No se comprueba si alguna generación antigua la citaba como foto de origen: al reintentarla, falla de forma controlada.
+  - El borrado de una generación del probador solo elimina la fila si no cambió desde que se leyó (si entretanto se guardó su resultado, se vuelve a decidir con el nuevo).
 - CSRF: cookies SameSite + comprobación de `Origin` en toda mutación.
 - Cabeceras: CSP, `X-Frame-Options: DENY`, `nosniff`, HSTS, `Permissions-Policy`; API con `Cache-Control: no-store`.
 - Secretos solo en servidor; los errores internos no se devuelven al cliente.

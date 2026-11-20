@@ -111,7 +111,7 @@ La migración inicial está en `prisma/migrations/0001_init/`. **Se generó con 
 ## 11. Tests
 
 ```bash
-npm test             # 115 tests, ~45 s, sin servicios externos
+npm test             # ~1 min, sin servicios externos
 npm run lint
 npm run typecheck
 npm run check        # lint + typecheck + tests
@@ -120,6 +120,45 @@ npm run check        # lint + typecheck + tests
 - **Unitarios:** validaciones, parser CSV, normalización de catálogo, prompts, clientes de proveedores con `fetch` simulado, seguridad (CSRF).
 - **Integración:** ejecutan los servicios y repositorios **reales con el Prisma Client real contra PostgreSQL real** (PGlite, PostgreSQL en WASM, con la migración del proyecto aplicada). Solo se simulan los proveedores externos (OpenRouter, Pollinations, Cloudinary, Open-Meteo). Cubren registro y recuperación de contraseña, aislamiento entre usuarios, rate limit, cuotas, el estilista (ningún id inventado, ajeno o no disponible llega al usuario), aprendizaje de preferencias, compras, probador virtual y eliminación de cuenta.
 - **Higiene:** `.env.example` completo y vacío, ausencia de secretos en el código y migración al día.
+- **Descargas y TLS:** `tests/unit/pinned-request.test.ts` levanta servidores HTTPS locales con una CA de prueba generada al vuelo: necesita `openssl` instalado (y la dirección `127.0.0.2`, presente en Linux, para su prueba de control).
+
+### Concurrencia con PostgreSQL real (opcional)
+
+PGlite tiene **una sola conexión**, así que no puede demostrar bloqueos entre transacciones. `tests/integration/pg-concurrency.test.ts` lo hace contra un PostgreSQL **local y desechable** con varias conexiones (borrados simultáneos de prendas que comparten foto con `FOR UPDATE`, y borrado del probador frente a la finalización de una generación). Sin la variable `TEST_PG_URL` se omite, también en `npm run check`. Se niega a conectarse directamente a hosts que no sean locales (`127.0.0.1`, `localhost`, `::1`), pero **no puede detectar un túnel o una redirección de puertos local** hacia una base de datos externa: **nunca la apuntes a Neon, tampoco a través de un túnel** (SSH, `kubectl port-forward`, proxies locales…). Cada ejecución crea su propia base de datos `race_<aleatorio>`, aplica la migración del proyecto y la elimina al terminar, también si alguna prueba falla (si el proceso se interrumpe a la fuerza, puede quedar una `race_*` en ese PostgreSQL desechable).
+
+**1. Levantar** (requiere Docker). Si el puerto 55432 está ocupado, usa otro en `-p 127.0.0.1:<puerto>:5432` y **cambia también ese puerto en `TEST_PG_URL`** (paso 2):
+
+```bash
+# Primera vez: datos en memoria (--tmpfs), sin volumen que conserve una contraseña antigua.
+docker run -d --name ai-wardrobe-pgrace -e POSTGRES_PASSWORD="$(openssl rand -hex 16)" \
+  -p 127.0.0.1:55432:5432 --tmpfs /var/lib/postgresql/data postgres:17-alpine
+
+# Si el contenedor ya existe (aunque esté parado), reutilízalo:
+docker start ai-wardrobe-pgrace
+
+# Espera a que el servidor DEFINITIVO acepte conexiones TCP (-h 127.0.0.1). Sin -h, pg_isready usa el socket local y
+# puede dar «listo» durante la inicialización (con --tmpfs ocurre en cada arranque), cuando aún no escucha por TCP:
+until docker exec ai-wardrobe-pgrace pg_isready -h 127.0.0.1 -U postgres -q; do sleep 1; done
+```
+
+**2. Ejecutar** (la contraseña se lee de la configuración del propio contenedor y se pasa con `PGPASSWORD` solo a este comando: ni va en la URL ni queda exportada en la terminal):
+
+```bash
+PGPASSWORD="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' ai-wardrobe-pgrace | sed -n 's/^POSTGRES_PASSWORD=//p')" \
+  TEST_PG_URL="postgresql://postgres@127.0.0.1:55432/postgres" npx vitest run tests/integration/pg-concurrency.test.ts
+```
+
+**3. Limpiar:**
+
+```bash
+docker stop ai-wardrobe-pgrace                  # pararlo (se puede volver a arrancar con docker start)
+docker rm ai-wardrobe-pgrace                    # eliminarlo cuando ya no lo necesites
+```
+
+**Si ya existen el contenedor o el volumen:**
+
+- `docker run` falla con «name is already in use»: el contenedor existe; usa `docker start ai-wardrobe-pgrace` (paso 1) en lugar de crearlo de nuevo.
+- Si un contenedor anterior se creó con un volumen con nombre (p. ej. `-v ai-wardrobe-pgrace-data:/var/lib/postgresql/data`), ese volumen conserva la contraseña con la que se inicializó: `POSTGRES_PASSWORD` solo se aplica la primera vez. Reutiliza el contenedor original (su contraseña sale de `docker inspect`, paso 2) o, si el volumen es solo de estas pruebas y ya no lo necesitas, elimínalo tras borrar el contenedor: `docker volume rm ai-wardrobe-pgrace-data`. No borres volúmenes que no sean de estas pruebas.
 
 ## 12. Build de producción
 
