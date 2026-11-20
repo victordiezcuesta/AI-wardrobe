@@ -1,5 +1,6 @@
 import { after } from "next/server";
 import { AppError, logError, notFound } from "@/lib/errors";
+import { safeDbError } from "@/lib/errors/db";
 import { deletePrivateImages, signedUrl, uploadPrivate } from "@/lib/cloudinary";
 import { editImage, type RefImage } from "@/lib/pollinations/client";
 import { publicTryOnError, TRYON_MESSAGES } from "@/lib/pollinations/messages";
@@ -18,6 +19,8 @@ import { buildTryOnPrompt, pickReferences, type PromptItem } from "./tryon-promp
 const STALE_PROCESSING_MS = 6 * 60_000;
 const STALE_PENDING_MS = 2 * 60_000;
 const MAX_REF_BYTES = 8 * 1024 * 1024;
+/** Relecturas de una fila que cambia mientras se borra (p. ej. una generación que termina justo entonces). */
+const REMOVE_ATTEMPTS = 3;
 
 /**
  * Hosts de los que se descargan referencias (comprobados en el SDK de Cloudinary 2.11, sin private_cdn/cname/
@@ -48,6 +51,21 @@ export function toDTO(row: GeneratedImage) {
     downloadUrl: done ? signedUrl(row.publicId!, { expiresInSec: 900, attachment: true }) : null,
   };
 }
+
+/**
+ * ¿Quedó guardada en alguna fila la referencia a un resultado recién subido? Se usa tras un fallo al persistirlo:
+ * "saved" → hay referencia (no se borra); "absent" → confirmado que ninguna fila la usa (se puede borrar);
+ * "unknown" → no se pudo consultar la base de datos: no se borra a ciegas (solo se registra, sin el publicId).
+ */
+async function resultReference(publicId: string): Promise<"saved" | "absent" | "unknown"> {
+  try {
+    return (await prisma.generatedImage.count({ where: { publicId } })) > 0 ? "saved" : "absent";
+  } catch (e) {
+    logError("tryon.orphan_unverified", safeDbError(e));
+    return "unknown";
+  }
+}
+
 
 /** Devuelve una reserva de try-on cuyo trabajo no llegó a llamar al proveedor. */
 const releaseQuota = (reservation: string) => aiUsageService.release(reservation).catch((e) => logError("tryon.quota_release", e));
@@ -91,12 +109,31 @@ async function run(jobId: string, reservation: string) {
     if (!sniffImage(out)) { logError("tryon.invalid_output", new Error("La respuesta no es una imagen")); throw new AppError(TRYON_MESSAGES.failed, 502, "TRYON_INVALID"); }
     const stored = await uploadPrivate(out, `ai-wardrobe/${job.userId}/try-on`, { maxSide: 2048 });
 
-    await prisma.generatedImage.update({ where: { id: job.id }, data: { status: "COMPLETED", publicId: stored.publicId, prompt, errorMessage: null } });
+    let saved: { count: number };
+    try {
+      saved = await prisma.generatedImage.updateMany({ where: { id: job.id, userId: job.userId }, data: { status: "COMPLETED", publicId: stored.publicId, prompt, errorMessage: null } });
+    } catch (err) {
+      // El guardado falló (o se perdió su respuesta): se comprueba qué quedó antes de tocar la imagen.
+      const ref = await resultReference(stored.publicId);
+      if (ref !== "saved") {
+        if (ref === "absent") await deletePrivateImages([stored.publicId]).catch((e) => logError("tryon.orphan", e));
+        // "unknown": no se borra la imagen; el catch exterior tampoco podrá marcar FAILED una fila que sí la guardó.
+        throw safeDbError(err); // fallo normal: FAILED (si no hay resultado guardado) y cuota como siempre
+      }
+      logError("tryon.persist_uncertain", safeDbError(err)); // se guardó pese al error: el trabajo está completo
+      saved = { count: 1 };
+    }
+    // Si el usuario borró el trabajo mientras se generaba, el resultado no tiene a quién pertenecer: se elimina.
+    if (saved.count === 0) await deletePrivateImages([stored.publicId]).catch((e) => logError("tryon.orphan", e));
     await aiUsageService.complete(reservation, { success: true, latencyMs: Date.now() - started }).catch((e) => logError("tryon.quota_complete", e));
   } catch (err) {
-    logError("tryon.run", err);
+    // Errores de base de datos (consentimiento, foto, conjunto, prendas, guardado): solo su código, nunca su mensaje
+    // (puede repetir argumentos: id de usuario, publicId de la foto personal o del resultado). El resto, completos.
+    logError("tryon.run", safeDbError(err));
     const message = err instanceof AppError ? err.message : TRYON_MESSAGES.failed;
-    await prisma.generatedImage.update({ where: { id: job.id }, data: { status: "FAILED", errorMessage: message } }).catch(() => undefined);
+    // Solo si la fila NO tiene un resultado guardado (condición atómica): si el guardado se confirmó pero no se pudo
+    // verificar, la fila queda COMPLETED con su publicId y no puede pasar a FAILED (ni reintentarse y sobrescribirlo).
+    await prisma.generatedImage.updateMany({ where: { id: job.id, publicId: null }, data: { status: "FAILED", errorMessage: message } }).catch(() => undefined);
     if (providerCalled) await aiUsageService.complete(reservation, { success: false, latencyMs: Date.now() - started }).catch((e) => logError("tryon.quota_complete", e));
     else await releaseQuota(reservation);
   }
@@ -175,10 +212,24 @@ export const tryOnService = {
     return this.get(userId, id);
   },
 
+  /**
+   * Primero el proveedor: si falla, la fila se conserva con su publicId y se puede reintentar (sin fotos privadas
+   * huérfanas). La fila solo se borra si sigue IGUAL que cuando se leyó (mismo publicId y updatedAt, en una sola
+   * sentencia): si entretanto una generación terminó y guardó su resultado, el borrado no la toca y se vuelve a decidir
+   * con la fila actual (y su nuevo publicId). Si la fila se borra antes de que la generación guarde, es `run()` quien
+   * elimina su resultado.
+   */
   async remove(userId: string, id: string) {
-    const row = await prisma.generatedImage.findFirst({ where: { id, userId } });
-    if (!row) throw notFound("Imagen");
-    await prisma.generatedImage.delete({ where: { id } });
-    if (row.publicId) await deletePrivateImages([row.publicId]).catch((e) => logError("tryon.delete", e));
+    for (let attempt = 0; attempt < REMOVE_ATTEMPTS; attempt++) {
+      const row = await prisma.generatedImage.findFirst({ where: { id, userId }, select: { publicId: true, updatedAt: true } });
+      if (!row) {
+        if (attempt === 0) throw notFound("Imagen");
+        return; // la borró otra petición mientras tanto
+      }
+      if (row.publicId) await deletePrivateImages([row.publicId]);
+      const removed = await prisma.generatedImage.deleteMany({ where: { id, userId, publicId: row.publicId, updatedAt: row.updatedAt } });
+      if (removed.count > 0) return;
+    }
+    throw new AppError("La imagen se está actualizando. Inténtalo de nuevo en unos segundos.", 409, "IMAGE_BUSY");
   },
 };

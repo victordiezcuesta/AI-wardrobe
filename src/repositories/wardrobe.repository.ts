@@ -42,6 +42,29 @@ export const wardrobeRepository = {
   markWorn: (userId: string, itemIds: string[]) =>
     prisma.wardrobeItem.updateMany({ where: { userId, id: { in: itemIds } }, data: { wearCount: { increment: 1 }, lastWornAt: new Date() } }),
   countByImage: (userId: string, publicId: string) => prisma.wardrobeItem.count({ where: { userId, imagePublicId: publicId } }),
+  findByImage: (userId: string, publicId: string) =>
+    prisma.wardrobeItem.findFirst({ where: { userId, imagePublicId: publicId }, orderBy: { createdAt: "desc" } }),
+  /**
+   * Comprobación de seguridad ANTES de borrar una imagen: ¿la usa alguna prenda, de cualquier usuario? Única consulta
+   * sin userId (una imagen nunca debe borrarse si otra fila la referencia); solo devuelve un booleano, ningún dato.
+   */
+  isImageReferenced: async (publicId: string) => (await prisma.wardrobeItem.count({ where: { imagePublicId: publicId } })) > 0,
+  /**
+   * Quita una prenda que comparte foto SOLO si la foto sigue usada por otra; si es la última, no borra nada y devuelve
+   * "last" para que el llamador borre primero la foto (y conserve la prenda si eso falla). Bloquea con FOR UPDATE, en
+   * orden de id (sin interbloqueos), todas las prendas del usuario con esa foto: dos borrados simultáneos se
+   * serializan y el segundo ve el resultado del primero, así que nunca deciden ambos «aún hay otra».
+   * "missing": la prenda ya no existe (otro borrado se adelantó) o ya no usa esa foto.
+   */
+  removeIfImageShared: (userId: string, id: string, publicId: string) =>
+    prisma.$transaction(async (tx): Promise<"removed" | "last" | "missing"> => {
+      const refs = await tx.$queryRaw<{ id: string }[]>`SELECT "id" FROM "WardrobeItem"
+        WHERE "userId" = ${userId} AND "imagePublicId" = ${publicId} ORDER BY "id" FOR UPDATE`;
+      if (!refs.some((r) => r.id === id)) return "missing";
+      if (refs.length === 1) return "last";
+      await tx.wardrobeItem.deleteMany({ where: { id, userId } });
+      return "removed";
+    }),
   summary: (userId: string) =>
     prisma.wardrobeItem.groupBy({ by: ["status"], where: { userId }, _count: { _all: true } }),
 };
