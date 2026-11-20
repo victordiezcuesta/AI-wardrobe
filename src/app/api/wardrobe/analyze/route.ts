@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { AppError, handler } from "@/lib/errors";
 import { requireUserId } from "@/lib/auth/session";
-import { readImageFile } from "@/lib/uploads/validate";
+import { readImageFile, readUploadForm } from "@/lib/uploads/validate";
 import { wardrobeService } from "@/services/wardrobe.service";
 import { rateLimit } from "@/lib/rate-limit";
 
@@ -13,7 +13,7 @@ const modeSchema = z.enum(["single", "multi"]).default("single");
 export const POST = handler("wardrobe.analyze", async (req: Request) => {
   const userId = await requireUserId();
   await rateLimit(`wardrobe:upload:${userId}`, 120, 3600);
-  const form = await req.formData();
+  const form = await readUploadForm(req); // cuerpo leído con límite estricto, haya o no Content-Length
   const file = form.get("file");
   if (!(file instanceof File)) throw new AppError("Falta la imagen", 422, "INVALID_FILE");
   const mode = modeSchema.parse(form.get("mode") ?? undefined);

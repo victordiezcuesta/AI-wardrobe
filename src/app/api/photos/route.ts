@@ -3,7 +3,7 @@ import { z } from "zod";
 import { AppError, handler } from "@/lib/errors";
 import { requireUserId } from "@/lib/auth/session";
 import { rateLimit } from "@/lib/rate-limit";
-import { readImageFile } from "@/lib/uploads/validate";
+import { readImageFile, readUploadForm } from "@/lib/uploads/validate";
 import { photoService } from "@/services/photo.service";
 
 export const GET = handler("photos.list", async () => NextResponse.json({ photos: await photoService.list(await requireUserId()) }));
@@ -11,7 +11,7 @@ export const GET = handler("photos.list", async () => NextResponse.json({ photos
 export const POST = handler("photos.add", async (req: Request) => {
   const userId = await requireUserId();
   await rateLimit(`photos:${userId}`, 20, 3600);
-  const file = (await req.formData()).get("file");
+  const file = (await readUploadForm(req)).get("file"); // cuerpo leído con límite estricto, haya o no Content-Length
   if (!(file instanceof File)) throw new AppError("Falta la imagen", 422, "INVALID_FILE");
   const buffer = await readImageFile(file);
   return NextResponse.json({ photo: await photoService.add(userId, buffer) }, { status: 201 });
