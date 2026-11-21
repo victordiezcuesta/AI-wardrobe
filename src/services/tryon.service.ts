@@ -83,6 +83,9 @@ async function run(jobId: string, reservation: string) {
   if (claimed.count === 0) return releaseQuota(reservation);
   const job = await prisma.generatedImage.findUnique({ where: { id: jobId } });
   if (!job) return releaseQuota(reservation);
+  // Intento que ESTA ejecución acaba de reclamar: todas sus escrituras posteriores se condicionan a él, para que una
+  // ejecución antigua (p. ej. marcada como atascada y luego reintentada) nunca toque la fila de un intento posterior.
+  const attempt = job.attempts;
   const started = Date.now();
   let providerCalled = false;
   try {
@@ -111,7 +114,12 @@ async function run(jobId: string, reservation: string) {
 
     let saved: { count: number };
     try {
-      saved = await prisma.generatedImage.updateMany({ where: { id: job.id, userId: job.userId }, data: { status: "COMPLETED", publicId: stored.publicId, prompt, errorMessage: null } });
+      // Solo si la fila sigue siendo de este intento y sin resultado. FAILED se admite: si get() la marcó como atascada
+      // y nadie la ha reintentado, esta ejecución aún puede completarla. Un reintento (PENDING o intento mayor) la gana.
+      saved = await prisma.generatedImage.updateMany({
+        where: { id: job.id, userId: job.userId, attempts: attempt, publicId: null, status: { in: ["PROCESSING", "FAILED"] } },
+        data: { status: "COMPLETED", publicId: stored.publicId, prompt, errorMessage: null },
+      });
     } catch (err) {
       // El guardado falló (o se perdió su respuesta): se comprueba qué quedó antes de tocar la imagen.
       const ref = await resultReference(stored.publicId);
@@ -123,7 +131,8 @@ async function run(jobId: string, reservation: string) {
       logError("tryon.persist_uncertain", safeDbError(err)); // se guardó pese al error: el trabajo está completo
       saved = { count: 1 };
     }
-    // Si el usuario borró el trabajo mientras se generaba, el resultado no tiene a quién pertenecer: se elimina.
+    // 0 filas: esta ejecución perdió la propiedad del trabajo (el usuario lo borró o un reintento lo reclamó). No se
+    // toca el resultado vigente; solo se elimina la imagen que ESTA ejecución acaba de generar.
     if (saved.count === 0) await deletePrivateImages([stored.publicId]).catch((e) => logError("tryon.orphan", e));
     await aiUsageService.complete(reservation, { success: true, latencyMs: Date.now() - started }).catch((e) => logError("tryon.quota_complete", e));
   } catch (err) {
@@ -131,9 +140,10 @@ async function run(jobId: string, reservation: string) {
     // (puede repetir argumentos: id de usuario, publicId de la foto personal o del resultado). El resto, completos.
     logError("tryon.run", safeDbError(err));
     const message = err instanceof AppError ? err.message : TRYON_MESSAGES.failed;
-    // Solo si la fila NO tiene un resultado guardado (condición atómica): si el guardado se confirmó pero no se pudo
-    // verificar, la fila queda COMPLETED con su publicId y no puede pasar a FAILED (ni reintentarse y sobrescribirlo).
-    await prisma.generatedImage.updateMany({ where: { id: job.id, publicId: null }, data: { status: "FAILED", errorMessage: message } }).catch(() => undefined);
+    // Condición atómica: solo la fila de ESTE intento, aún en PROCESSING y sin resultado guardado. Si el guardado se
+    // confirmó pero no se pudo verificar, queda COMPLETED con su publicId y no pasa a FAILED; si un reintento posterior
+    // ya la reclamó, el fallo tardío de esta ejecución no la toca.
+    await prisma.generatedImage.updateMany({ where: { id: job.id, publicId: null, status: "PROCESSING", attempts: attempt }, data: { status: "FAILED", errorMessage: message } }).catch(() => undefined);
     if (providerCalled) await aiUsageService.complete(reservation, { success: false, latencyMs: Date.now() - started }).catch((e) => logError("tryon.quota_complete", e));
     else await releaseQuota(reservation);
   }
@@ -168,15 +178,23 @@ export const tryOnService = {
     return toDTO(job);
   },
 
-  /** Devuelve el estado actual; si un trabajo lleva demasiado tiempo parado, lo marca como fallido. */
+  /**
+   * Devuelve el estado actual; si un trabajo lleva demasiado tiempo parado, lo marca como fallido. El marcado es
+   * condicional (mismo estado y updatedAt que en la lectura): si entretanto se reclamó o terminó, no se pisa. En
+   * cualquier caso se devuelve la fila tal como está ahora, nunca un FAILED basado en una lectura obsoleta.
+   */
   async get(userId: string, id: string) {
-    let row = await prisma.generatedImage.findFirst({ where: { id, userId } });
+    const row = await prisma.generatedImage.findFirst({ where: { id, userId } });
     if (!row) throw notFound("Imagen");
     const age = Date.now() - row.updatedAt.getTime();
-    if ((row.status === "PROCESSING" && age > STALE_PROCESSING_MS) || (row.status === "PENDING" && age > STALE_PENDING_MS)) {
-      row = await prisma.generatedImage.update({ where: { id }, data: { status: "FAILED", errorMessage: "La generación tardó demasiado. Puedes reintentarlo." } });
-    }
-    return toDTO(row);
+    if (!((row.status === "PROCESSING" && age > STALE_PROCESSING_MS) || (row.status === "PENDING" && age > STALE_PENDING_MS))) return toDTO(row);
+    await prisma.generatedImage.updateMany({
+      where: { id, userId, status: row.status, updatedAt: row.updatedAt },
+      data: { status: "FAILED", errorMessage: "La generación tardó demasiado. Puedes reintentarlo." },
+    });
+    const current = await prisma.generatedImage.findFirst({ where: { id, userId } });
+    if (!current) throw notFound("Imagen");
+    return toDTO(current);
   },
 
   async list(userId: string, opts: { cursor?: string; favorites?: boolean }) {
