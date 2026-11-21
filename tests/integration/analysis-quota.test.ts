@@ -31,6 +31,13 @@ const ok = (content: unknown = { items: [ITEM] }) =>
   new Response(JSON.stringify({ choices: [{ message: { content: typeof content === "string" ? content : JSON.stringify(content) } }], usage: { prompt_tokens: 100, completion_tokens: 40 } }), { status: 200 });
 const httpError = (status: number, body = "error interno del proveedor sk-or-v1-secreto") => new Response(body, { status });
 
+/**
+ * Rastros internos del proveedor en una respuesta: sus textos (OpenRouter, claves sk-or, «endpoint», «policy») o un
+ * código HTTP 401, 404 o 429 como código independiente. Con \b, los dígitos que solo forman parte de un identificador o
+ * de una fecha ISO (p. ej. «.404Z», «ab429cd») no cuentan: no son un código y antes provocaban fallos intermitentes.
+ */
+const INTERNAL_TRACES = /OpenRouter|sk-or|endpoint|policy|\b(?:401|404|429)\b/i;
+
 /** Respuestas del proveedor en orden; registra cuántas llamadas recibe. Ignora otros fetch. */
 let calls = 0;
 function provider(...replies: (() => Response | Promise<Response>)[]) {
@@ -84,6 +91,45 @@ async function analyze(fields: Record<string, string> = {}, file: Uint8Array | n
 const units = (id = userId) => t.prisma.aiUsageLog.count({ where: { userId: id } });
 const rows = (id = userId) => t.prisma.aiUsageLog.findMany({ where: { userId: id } });
 const fill = (n: number, id = userId) => t.prisma.aiUsageLog.createMany({ data: Array.from({ length: n }, () => ({ userId: id, task: "OUTFIT_GENERATION" as const, provider: "openrouter", model: "m", success: true })) });
+
+/** El detector no da falsos positivos con identificadores ni fechas, y sigue detectando fugas reales. */
+describe("detector de rastros internos (INTERNAL_TRACES)", () => {
+  /** Respuesta con la misma forma que la de /api/wardrobe/analyze tras un fallo del proveedor. */
+  const body = (item: Record<string, unknown> = {}) => JSON.stringify({
+    status: "analysis_failed",
+    reason: "La IA no ha podido analizar la foto. Completa los datos a mano o inténtalo más tarde.",
+    items: [{
+      id: "cmi8k2x0f0001ab12cd34ef56", userId: "cmi8k2wzz0000gh78ij90kl12", name: "Prenda sin analizar", category: "OTHER", needsReview: true,
+      imagePublicId: "ai-wardrobe/u/wardrobe/img3", imageUrl: "https://res.cloudinary.com/demo/img3.png", thumbUrl: "https://res.cloudinary.com/demo/t3.png",
+      createdAt: "2026-11-21T10:15:41.123Z", updatedAt: "2026-11-21T10:15:41.123Z", ...item,
+    }],
+  });
+
+  it("una respuesta normal no se marca", () => expect(body()).not.toMatch(INTERNAL_TRACES));
+
+  it.each([".401Z", ".404Z", ".429Z"])("una fecha terminada en %s no es un falso positivo", (ms) => {
+    const at = `2026-11-21T10:15:41${ms}`;
+    expect(body({ createdAt: at, updatedAt: at })).not.toMatch(INTERNAL_TRACES);
+    expect(body({ createdAt: at })).toMatch(new RegExp(ms.slice(1, 4))); // la comprobación anterior (subcadena) sí fallaba
+  });
+
+  it.each([["429", "cmi8k2x0f0429ab12cd34ef56"], ["401", "cmi401x0f0001ab12cd34ef56"], ["404", "cmi8k2x0f0001ab12cd34e404"]])(
+    "un identificador que contiene %s no es un falso positivo", (_code, id) => expect(body({ id, userId: id })).not.toMatch(INTERNAL_TRACES),
+  );
+
+  it.each([
+    ["Error 429", "Error 429 del proveedor"],
+    ["HTTP 401", "HTTP 401 Unauthorized"],
+    ["HTTP 404", "HTTP 404 Not Found"],
+    ["código entre signos", "status=429; retry"],
+    ["texto de OpenRouter", "OpenRouter rejected the request"],
+    ["clave sk-or", "invalid key sk-or-v1-abc123"],
+    ["motivo de enrutado", "No endpoints found matching your data policy"],
+  ])("una fuga real (%s) sí se detecta", (_n, leaked) => {
+    expect(body({ description: leaked })).toMatch(INTERNAL_TRACES);
+    expect(JSON.stringify({ status: "analysis_failed", reason: leaked })).toMatch(INTERNAL_TRACES);
+  });
+});
 
 describe("análisis correcto", () => {
   it("consume exactamente una unidad, registrada como éxito con sus tokens", async () => {
@@ -153,7 +199,7 @@ describe("errores del proveedor", () => {
     expect(r.body.status).toBe("analysis_failed");
     expect(r.body.items?.[0]?.needsReview).toBe(true);
     expect(r.body.reason).toBe("La IA no ha podido analizar la foto. Completa los datos a mano o inténtalo más tarde.");
-    expect(JSON.stringify(r.body)).not.toMatch(/OpenRouter|sk-or|401/);
+    expect(JSON.stringify(r.body)).not.toMatch(INTERNAL_TRACES);
     expect(calls).toBe(1);
     expect(await units()).toBe(0);
   });
@@ -182,7 +228,7 @@ describe("errores del proveedor", () => {
     expect(r.body.status).toBe("analysis_failed");
     expect(r.body.items?.[0]?.needsReview).toBe(true);
     expect(r.body.reason).toBe("El análisis automático ha alcanzado su límite de uso. Completa los datos a mano o inténtalo más tarde.");
-    expect(JSON.stringify(r.body)).not.toMatch(/OpenRouter|sk-or|429/);
+    expect(JSON.stringify(r.body)).not.toMatch(INTERNAL_TRACES);
     expect(calls).toBe(1);
     expect(await units()).toBe(0);
   });
@@ -192,7 +238,7 @@ describe("errores del proveedor", () => {
     const r = await analyze();
     expect(r.body.status).toBe("analysis_failed");
     expect(r.body.reason).toBe("La IA no ha podido analizar la foto. Completa los datos a mano o inténtalo más tarde.");
-    expect(JSON.stringify(r.body)).not.toMatch(/OpenRouter|endpoint|policy|404/i);
+    expect(JSON.stringify(r.body)).not.toMatch(INTERNAL_TRACES);
     expect(calls).toBe(1);
     expect(await units()).toBe(0);
   });

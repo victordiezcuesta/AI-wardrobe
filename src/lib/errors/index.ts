@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
+import { safeDbError } from "./db";
 
 export class AppError extends Error {
   constructor(
@@ -32,7 +33,9 @@ export function toResponse(scope: string, err: unknown) {
       { status: 422 },
     );
   }
-  logError(scope, err);
+  // Errores de base de datos: solo su código (Prisma puede repetir en el mensaje argumentos de la consulta, como ids o
+  // publicId). El resto se registra completo. La respuesta al cliente no cambia.
+  logError(scope, safeDbError(err));
   return NextResponse.json({ error: { code: "INTERNAL", message: "Error interno" } }, { status: 500 });
 }
 
