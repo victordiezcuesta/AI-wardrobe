@@ -159,8 +159,15 @@ export async function deleteAllUserAssets(userId: string): Promise<void> {
 export const APP_ROOT_PREFIX = "ai-wardrobe/";
 /** Tipos de entrega de las imágenes de la aplicación: públicas (`upload`) y privadas (`authenticated`). */
 export type DeliveryType = "upload" | "authenticated";
-/** Página tal como la devuelve la Admin API (se valida en quien la usa: no se confía en su forma). */
-export interface ResourcePage { resources?: unknown; next_cursor?: unknown }
+/**
+ * Página tal como la devuelve la Admin API (se valida en quien la usa: no se confía en su forma). En las respuestas
+ * correctas, el SDK copia las cabeceras `X-FeatureRateLimit-*` a `rate_limit_*` (`reset_at` llega como Date aunque
+ * su tipo diga string); en los errores (p. ej. 420) no las incluye.
+ */
+export interface ResourcePage {
+  resources?: unknown; next_cursor?: unknown;
+  rate_limit_allowed?: unknown; rate_limit_remaining?: unknown; rate_limit_reset_at?: unknown;
+}
 
 /**
  * SOLO LECTURA (Admin API, `GET /resources/image/<tipo>`): una página del inventario de imágenes de la aplicación para

@@ -71,7 +71,7 @@ const CRON_SECRET = ["cron", "prueba", "0123456789abcdef"].join("-"); // fictici
 beforeAll(async () => { setTestEnv(); process.env.CRON_SECRET = CRON_SECRET; t = await startTestDb(); holder.prisma = t.prisma; }, 60_000);
 afterAll(async () => { await t?.stop(); });
 beforeEach(async () => {
-  await t.prisma.$executeRawUnsafe(`TRUNCATE "User" CASCADE`);
+  await t.prisma.$executeRawUnsafe(`TRUNCATE "User", "CatalogProduct" CASCADE`);
   holder.writes = []; admin.pages = { upload: [], authenticated: [] }; admin.calls = []; admin.mutations = []; admin.aborted = 0;
   errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
 });
@@ -80,7 +80,9 @@ afterEach(() => { errSpy.mockRestore(); });
 const NOW = new Date("2026-11-21T12:00:00Z");
 const OLD = "2026-11-18T12:00:00Z"; // 3 días: supera el periodo de seguridad (24 h)
 const RECENT = "2026-11-21T11:00:00Z"; // 1 hora
-const res = (public_id: string, type: "upload" | "authenticated", created_at = OLD) => ({ public_id, type, created_at });
+/** Recurso como lo devuelve la Admin API (con los metadatos completos; `asset_id` estable y distinto por recurso). */
+const res = (public_id: string, type: "upload" | "authenticated", created_at = OLD) =>
+  ({ public_id, type, created_at, asset_id: `a${Buffer.from(`${type}:${public_id}`).toString("hex").slice(-31)}`, version: 1732190000, bytes: 12345, format: "jpg", resource_type: "image" });
 /** Reparte recursos en páginas encadenadas por cursor (`<tipo>-c<n>`). */
 function paginate(type: "upload" | "authenticated", ...pages: unknown[][]) {
   admin.pages[type] = pages.map((resources, i) => ({ resources, ...(i < pages.length - 1 ? { next_cursor: `${type}-c${i + 1}` } : {}) }));
@@ -90,11 +92,11 @@ async function user(photos: string[] = []) {
   return t.prisma.user.create({ data: { email: `m${Math.random().toString(36).slice(2)}@q.com`, profile: { create: { photoPublicIds: photos } } } });
 }
 const item = (userId: string, imagePublicId: string | null) =>
-  t.prisma.wardrobeItem.create({ data: { userId, name: "Prenda", category: "OTHER", imagePublicId, imageUrl: imagePublicId ? `https://res.cloudinary.com/demo/${imagePublicId}.jpg` : null } });
+  t.prisma.wardrobeItem.create({ data: { userId, name: "Prenda", category: "OTHER", imagePublicId, imageUrl: imagePublicId ? `https://res.cloudinary.com/demo/image/upload/v1/${imagePublicId}` : null } });
 const generated = (userId: string, publicId: string | null, sourcePhotoId: string | null = null) =>
   t.prisma.generatedImage.create({ data: { userId, scenario: "x", pose: "y", status: publicId ? "COMPLETED" : "FAILED", publicId, sourcePhotoId } });
 const counts = (r: Awaited<ReturnType<typeof detect>>) => r.byCategory;
-const ZERO = { REFERENCED: 0, ORPHAN_CANDIDATE: 0, TOO_RECENT: 0, UNKNOWN: 0, INCOMPLETE: 0 };
+const ZERO = { REFERENCED: 0, ORPHAN_CANDIDATE: 0, TOO_RECENT: 0, UNKNOWN: 0, INCOMPLETE: 0, QUARANTINED: 0 };
 
 describe("clasificación", () => {
   it("prenda referenciada, compartida por varias prendas, foto personal y resultado de try-on → REFERENCED", async () => {
@@ -108,7 +110,7 @@ describe("clasificación", () => {
     const r = await detect();
     expect(r.complete).toBe(true);
     expect(counts(r)).toEqual({ ...ZERO, REFERENCED: 4 });
-    expect(r.byKind).toEqual({ wardrobe: 2, personal: 1, tryOn: 1, unknown: 0 });
+    expect(r.byKind).toEqual({ wardrobe: 2, personal: 1, tryOn: 1, unknown: 0, quarantine: 0 });
     expect(r.resourcesExamined).toBe(4);
     expect(r.brokenReferences).toEqual({ total: 0, wardrobe: 0, personal: 0, tryOn: 0 });
   });
@@ -245,6 +247,9 @@ describe("paginación e inventarios incompletos", () => {
     expect(r.pages).toEqual({ upload: 1, authenticated: 1 });
     expect(r.errors).toEqual([{ stage: "inventory", scope: "upload", code: "CLOUDINARY_420" }]);
     expect(r.resourcesExamined).toBe(2);
+    expect(r.inventoryStatus).toBe("INCOMPLETE");
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 2 }); // lo leído no justifica nada: ni el público parcial ni el privado completo
+    expect(r.candidatesWithheld).toBe(2);
     expect(JSON.stringify(r)).not.toContain(u.id); // el mensaje del proveedor no llega al informe
   });
 
@@ -298,8 +303,11 @@ describe("paginación e inventarios incompletos", () => {
     try {
       const r = await detect();
       expect(r.complete).toBe(false);
-      expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 }); // try-on sí se pudo verificar
-      expect(r.errors).toEqual([{ stage: "database", scope: "wardrobe", code: "P1001" }]);
+      // la prenda no se pudo verificar; el try-on tampoco puede salir candidato: sin URLs no se sabe si alguna lo usa (19.1)
+      expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 2 });
+      // la misma tabla también alimenta las referencias por URL: las dos consultas quedan registradas como fallidas
+      expect(r.errors).toEqual([{ stage: "database", scope: "wardrobe", code: "P1001" }, { stage: "database", scope: "urls", code: "P1001" }]);
+      expect(r.urlReferences).toBeNull();
       expect(r.brokenReferences.wardrobe).toBeNull();
       expect(r.referencesOutsidePrefix).toBeNull(); // una fuente sin consultar: recuento desconocido, no 0
     } finally { holder.prisma = real; }
@@ -492,5 +500,493 @@ describe("endpoint /api/cron/media-reconcile", () => {
     expect(body).toMatchObject({ complete: true, resourcesExamined: 1, graceHours: 24, byCategory: { ORPHAN_CANDIDATE: 1 } });
     expect(JSON.stringify(body)).not.toContain(u.id);
     expect(admin.calls.map((c) => c.type)).toEqual(["upload", "authenticated"]);
+  });
+});
+
+// ───────────────────────────── Fase 19.1: endurecimiento ─────────────────────────────
+
+const url = (id: string, type = "upload", extra = "") => `https://res.cloudinary.com/demo/image/${type}/${extra}v1/${id}`;
+
+describe("19.1 referencias por URL", () => {
+  it("una URL propia (normal, transformada, versionada, con extensión o privada) protege su recurso aunque no haya publicId", async () => {
+    const u = await user();
+    const ids = ["w-img", "w-thumb", "w-ext", "g-url", "avatar", "cat", "shop"].map((n) => `ai-wardrobe/${u.id}/wardrobe/${n}`);
+    const priv = `ai-wardrobe/${u.id}/try-on/g`;
+    await t.prisma.wardrobeItem.create({ data: { userId: u.id, name: "Heredada", category: "OTHER", imageUrl: url(ids[0]!), thumbUrl: url(ids[1]!, "upload", "c_fill,g_auto,h_600,w_480/") } });
+    await t.prisma.wardrobeItem.create({ data: { userId: u.id, name: "Heredada 2", category: "OTHER", imageUrl: `${url(ids[2]!)}.jpg` } });
+    await t.prisma.generatedImage.create({ data: { userId: u.id, scenario: "x", pose: "y", status: "COMPLETED", imageUrl: url(ids[3]!) } });
+    await t.prisma.generatedImage.create({ data: { userId: u.id, scenario: "x", pose: "y", status: "COMPLETED", imageUrl: `https://api.cloudinary.com/v1_1/demo/image/download?public_id=${encodeURIComponent(priv)}&type=authenticated` } });
+    await t.prisma.user.update({ where: { id: u.id }, data: { image: url(ids[4]!) } });
+    await t.prisma.catalogProduct.create({ data: { id: `c${Math.random().toString(36).slice(2)}`, provider: "p", feedId: "f", externalId: "e", store: "s", name: "n", category: "OTHER", priceCents: 1, imageUrl: url(ids[5]!), url: "https://tienda.example/p" } });
+    const rec = await t.prisma.shoppingRecommendation.create({ data: { userId: u.id, batchId: "b", gapLabel: "g", gapReason: "r", searchQuery: "q" } });
+    await t.prisma.shoppingProduct.create({ data: { recommendationId: rec.id, provider: "p", externalId: "e", name: "n", store: "s", url: "https://tienda.example/p", imageUrl: url(ids[6]!) } });
+    paginate("upload", ids.map((id) => res(id, "upload")));
+    paginate("authenticated", [res(priv, "authenticated")]);
+    const r = await detect();
+    expect(r.complete).toBe(true);
+    expect(counts(r)).toEqual({ ...ZERO, REFERENCED: 8 });
+    expect(r.protection.referencedByUrlOnly).toBe(8);
+    expect(r.urlReferences).toEqual({ scanned: 8, own: 8, ownOutsidePrefix: 0, external: 0, ambiguous: 0 });
+  });
+
+  it("URLs externas (otra cuenta con la misma ruta, tiendas, avatares) no protegen nada", async () => {
+    const u = await user();
+    const id = `ai-wardrobe/${u.id}/wardrobe/w`;
+    await t.prisma.wardrobeItem.create({ data: { userId: u.id, name: "x", category: "OTHER", imageUrl: `https://res.cloudinary.com/otra-cuenta/image/upload/v1/${id}` } });
+    await t.prisma.user.update({ where: { id: u.id }, data: { image: "https://lh3.googleusercontent.com/a/x=s96-c" } });
+    await t.prisma.catalogProduct.create({ data: { id: `c${Math.random().toString(36).slice(2)}`, provider: "p", feedId: "f", externalId: "e2", store: "s", name: "n", category: "OTHER", priceCents: 1, imageUrl: "https://cdn.tienda.example/a.jpg", url: "https://tienda.example/p" } });
+    paginate("upload", [res(id, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, ORPHAN_CANDIDATE: 1 });
+    expect(r.urlReferences).toEqual({ scanned: 3, own: 0, ownOutsidePrefix: 0, external: 3, ambiguous: 0 }); // D5: el catálogo se lee entero
+  });
+
+  it("URL propia ambigua con propietario → lo NO referenciado de ese propietario queda INCOMPLETE; el resto de usuarios no se ve afectado", async () => {
+    const a = await user(); const b = await user();
+    await t.prisma.wardrobeItem.create({ data: { userId: a.id, name: "x", category: "OTHER", imageUrl: `https://res.cloudinary.com/demo/image/upload/carpeta-rara/ai-wardrobe/${a.id}/wardrobe/x` } });
+    const refd = `ai-wardrobe/${a.id}/wardrobe/ref`;
+    await item(a.id, refd);
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(refd, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, REFERENCED: 1, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 });
+    expect(r.protection.ambiguousUrl).toBe(1);
+    expect(r.urlReferences?.ambiguous).toBe(1);
+    expect(r.complete).toBe(true); // la ambigüedad protege, no es un error
+  });
+
+  it("URL ambigua sin propietario identificable → nada sin referencia puede salir candidato", async () => {
+    const a = await user(); const b = await user();
+    await t.prisma.user.update({ where: { id: a.id }, data: { image: "https://img.example.com/ai-wardrobe/_quarantine/wardrobe/x" } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 2 });
+    expect(r.protection.ambiguousUrl).toBe(2);
+  });
+
+  it("si falla la lectura de URLs → nada sin publicId sale candidato y el informe es incompleto", async () => {
+    const u = await user();
+    paginate("upload", [res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload")]);
+    const real = t.prisma;
+    holder.prisma = new Proxy(real, {
+      get(target, prop) {
+        if (prop === "catalogProduct") return { findMany: async () => { throw new Error("caída"); } };
+        const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as PrismaClient;
+    try {
+      const r = await detect();
+      expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1 });
+      expect(r.urlReferences).toBeNull();
+      expect(r.errors).toEqual([{ stage: "database", scope: "urls", code: "DB_ERROR" }]);
+      expect(r.complete).toBe(false);
+    } finally { holder.prisma = real; }
+  });
+
+  it("los campos históricos no se modifican y el informe no contiene las URLs", async () => {
+    const u = await user();
+    const id = `ai-wardrobe/${u.id}/wardrobe/w`;
+    const row = await t.prisma.wardrobeItem.create({ data: { userId: u.id, name: "x", category: "OTHER", imageUrl: url(id), thumbUrl: url(id) } });
+    paginate("upload", [res(id, "upload")]);
+    const r = await detect();
+    expect(await t.prisma.wardrobeItem.findUnique({ where: { id: row.id } })).toEqual(row);
+    expect(holder.writes).toEqual([]);
+    expect(JSON.stringify(r)).not.toMatch(/https?:|ai-wardrobe\//);
+  });
+});
+
+describe("19.1 inventario incompleto: nada avanza como candidato", () => {
+  it("una página recibida con cursor y la siguiente sin llegar → INCOMPLETE; ningún ORPHAN_CANDIDATE en NINGÚN tipo", async () => {
+    const u = await user();
+    paginate("authenticated", [res(`ai-wardrobe/${u.id}/try-on/a`, "authenticated")]); // completo
+    admin.pages.upload = [{ resources: [res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload")], next_cursor: "upload-c1" }, new Error("x")];
+    const r = await detect();
+    expect(r.inventoryStatus).toBe("INCOMPLETE");
+    expect(r.inventoryComplete).toEqual({ upload: false, authenticated: true });
+    expect(r.byCategory.ORPHAN_CANDIDATE).toBe(0);
+    expect(r.candidatesWithheld).toBe(2);
+  });
+
+  it("recursos recientes y referenciados se siguen clasificando igual; solo se retienen los que habrían sido candidatos", async () => {
+    const u = await user();
+    const refd = `ai-wardrobe/${u.id}/wardrobe/r`;
+    await item(u.id, refd);
+    admin.pages.upload = [{ resources: [res(refd, "upload"), res(`ai-wardrobe/${u.id}/wardrobe/n`, "upload", RECENT), res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload")], next_cursor: "upload-c1" }, new Error("x")];
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, REFERENCED: 1, TOO_RECENT: 1, INCOMPLETE: 1 });
+    expect(r.candidatesWithheld).toBe(1);
+  });
+
+  it.each([
+    ["recurso sin public_id", { created_at: OLD }, "MALFORMED_RESOURCE"],
+    ["recurso que no es un objeto", "basura", "MALFORMED_RESOURCE"],
+    ["type que no es texto", { public_id: "ai-wardrobe/u/wardrobe/x", type: 3 }, "MALFORMED_RESOURCE"],
+    ["otro tipo de entrega", { public_id: "ai-wardrobe/u/wardrobe/x", type: "private" }, "UNEXPECTED_RESOURCE"],
+    ["no es una imagen", { public_id: "ai-wardrobe/u/wardrobe/x", type: "upload", resource_type: "video" }, "UNEXPECTED_RESOURCE"],
+    ["fuera del prefijo pedido", { public_id: "otra-app/u/wardrobe/x", type: "upload" }, "UNEXPECTED_RESOURCE"],
+  ])("página bien recibida pero con un %s → inventario incompleto (una sola vez por código) y sin candidatos", async (_n, bad, code) => {
+    const u = await user();
+    paginate("upload", [bad, res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload"), bad]);
+    const r = await detect();
+    expect(r.inventoryComplete.upload).toBe(false);
+    expect(r.errors).toEqual([{ stage: "inventory", scope: "upload", code }]);
+    expect(counts(r)).toEqual({ ...ZERO, UNKNOWN: 2, INCOMPLETE: 1 });
+    expect(r.candidatesWithheld).toBe(1);
+  });
+});
+
+describe("19.1 metadatos de Cloudinary", () => {
+  it("respuesta completa: se cuentan todos los metadatos", async () => {
+    const u = await user();
+    paginate("upload", [res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload"), res(`ai-wardrobe/${u.id}/wardrobe/b`, "upload")]);
+    const r = await detect();
+    expect(r.metadata).toEqual({ assetId: 2, version: 2, createdAt: 2, bytes: 2, format: 2 });
+    expect(counts(r)).toEqual({ ...ZERO, ORPHAN_CANDIDATE: 2 });
+  });
+
+  it("sin asset_id → INCOMPLETE; version/bytes/format inválidos solo quedan en null (son informativos)", async () => {
+    const u = await user();
+    const { asset_id: _drop, ...noAsset } = res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload");
+    const weird = { ...res(`ai-wardrobe/${u.id}/wardrobe/b`, "upload"), version: "7", bytes: -1, format: "" };
+    paginate("upload", [noAsset, weird]);
+    const r = await detect();
+    expect(r.metadata).toEqual({ assetId: 1, version: 1, createdAt: 2, bytes: 1, format: 1 });
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 });
+    expect(r.protection.missingMetadata).toBe(1);
+  });
+
+  it("normalizeResource conserva los valores tal cual y no inventa los ausentes", async () => {
+    const { normalizeResource } = await import("@/services/media-reconcile.service");
+    const full = { public_id: "ai-wardrobe/u/wardrobe/x", asset_id: "0123456789abcdef0123456789abcdef", version: 17, created_at: OLD, bytes: 0, format: "webp", resource_type: "image", type: "upload" };
+    expect(normalizeResource(full, "upload")).toEqual({ ok: true, item: { publicId: full.public_id, delivery: "upload", assetId: full.asset_id, version: 17, createdAt: new Date(OLD), bytes: 0, format: "webp", resourceType: "image", type: "upload" } });
+    expect(normalizeResource({ public_id: "ai-wardrobe/u/wardrobe/x" }, "authenticated")).toEqual({ ok: true, item: { publicId: "ai-wardrobe/u/wardrobe/x", delivery: "authenticated", assetId: null, version: null, createdAt: null, bytes: null, format: null, resourceType: null, type: null } });
+    expect(normalizeResource({ ...full, version: 1.5, bytes: "3", asset_id: "", created_at: "x" }, "upload")).toMatchObject({ ok: true, item: { version: null, bytes: null, assetId: null, createdAt: null } });
+    expect(normalizeResource(null, "upload")).toEqual({ ok: false, code: "MALFORMED_RESOURCE" });
+    expect(normalizeResource([full], "upload")).toEqual({ ok: false, code: "MALFORMED_RESOURCE" });
+    expect(normalizeResource({ ...full, public_id: "" }, "upload")).toEqual({ ok: false, code: "MALFORMED_RESOURCE" });
+    expect(normalizeResource({ ...full, resource_type: 1 }, "upload")).toEqual({ ok: false, code: "MALFORMED_RESOURCE" });
+    expect(normalizeResource(full, "authenticated")).toEqual({ ok: false, code: "UNEXPECTED_RESOURCE" });
+  });
+});
+
+describe("19.1 cuarentena (solo reconocimiento)", () => {
+  it("ai-wardrobe/<userId>/_quarantine/<tipo>/<nombre> → QUARANTINED, nunca huérfana aunque sea antigua y sin referencia", async () => {
+    const u = await user();
+    const q = (k: string) => `ai-wardrobe/${u.id}/_quarantine/${k}/x`;
+    paginate("upload", [res(q("wardrobe"), "upload")]);
+    paginate("authenticated", [res(q("personal"), "authenticated"), res(q("try-on"), "authenticated"), res(q("wardrobe"), "authenticated")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, QUARANTINED: 4 });
+    expect(r.quarantine).toEqual({ wardrobe: 2, personal: 1, tryOn: 1, publicDelivery: 1 });
+    expect(r.byKind).toEqual({ wardrobe: 0, personal: 0, tryOn: 0, unknown: 0, quarantine: 4 });
+    expect(r.complete).toBe(true);
+  });
+
+  it("rutas de cuarentena mal formadas o carpetas reservadas como propietario → UNKNOWN (nunca candidatas)", async () => {
+    const u = await user();
+    paginate("upload", [
+      res(`ai-wardrobe/${u.id}/_quarantine/otros/x`, "upload"), res(`ai-wardrobe/${u.id}/_quarantine/wardrobe/sub/x`, "upload"),
+      res(`ai-wardrobe/${u.id}/_quarantine/x`, "upload"), res("ai-wardrobe/_quarantine/wardrobe/x", "upload"), res("ai-wardrobe/_x/wardrobe/y", "upload"),
+    ]);
+    expect(counts(await detect())).toEqual({ ...ZERO, UNKNOWN: 5 });
+  });
+});
+
+describe("19.1 periodo de gracia mínimo", () => {
+  it("effectiveGraceMs: por defecto 24 h; nunca menos de 1 h; valores no numéricos → por defecto", async () => {
+    const { effectiveGraceMs, MIN_GRACE_MS, DEFAULT_GRACE_MS } = await import("@/services/media-reconcile.service");
+    expect(DEFAULT_GRACE_MS).toBe(24 * 3_600_000);
+    expect(MIN_GRACE_MS).toBe(3_600_000);
+    expect(effectiveGraceMs()).toBe(DEFAULT_GRACE_MS);
+    for (const g of [0, -1, 1000, 3_599_999]) expect(effectiveGraceMs(g)).toBe(MIN_GRACE_MS);
+    for (const g of [Number.NaN, Number.POSITIVE_INFINITY]) expect(effectiveGraceMs(g)).toBe(DEFAULT_GRACE_MS);
+    expect(effectiveGraceMs(48 * 3_600_000)).toBe(48 * 3_600_000);
+  });
+
+  it("graceMs: 0 no hace candidato un recurso de 30 min; sí uno de 2 h", async () => {
+    const u = await user();
+    const at = (ms: number) => new Date(NOW.getTime() - ms).toISOString();
+    paginate("upload", [res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload", at(30 * 60_000)), res(`ai-wardrobe/${u.id}/wardrobe/b`, "upload", at(2 * 3_600_000))]);
+    const r = await detect({ graceMs: 0 });
+    expect(r.graceHours).toBe(1);
+    expect(counts(r)).toEqual({ ...ZERO, TOO_RECENT: 1, ORPHAN_CANDIDATE: 1 });
+  });
+});
+
+describe("19.1 cuota de la Admin API", () => {
+  it("se toma de la ÚLTIMA respuesta correcta (campos rate_limit_* del SDK; reset_at como Date o texto)", async () => {
+    admin.pages.upload = [{ resources: [], next_cursor: "upload-c1", rate_limit_allowed: 500, rate_limit_remaining: 499, rate_limit_reset_at: new Date("2026-11-21T13:00:00Z") }, { resources: [], rate_limit_allowed: 500, rate_limit_remaining: 498, rate_limit_reset_at: "2026-11-21T13:00:00Z" }];
+    admin.pages.authenticated = [{ resources: [], rate_limit_allowed: 500, rate_limit_remaining: 497, rate_limit_reset_at: new Date("2026-11-21T13:00:00Z") }];
+    const r = await detect();
+    expect(r.rateLimit).toEqual({ allowed: 500, remaining: 497, resetAt: "2026-11-21T13:00:00.000Z" });
+  });
+
+  it("sin esos campos → null; valores inválidos → null por campo (no se inventan); un error posterior no la borra", async () => {
+    expect((await detect()).rateLimit).toBeNull();
+    admin.pages.upload = [{ resources: [], next_cursor: "upload-c1", rate_limit_allowed: Number.NaN, rate_limit_remaining: 10, rate_limit_reset_at: "no-es-fecha" }, Object.assign(new Error("x"), { http_code: 420 })];
+    const r = await detect();
+    expect(r.rateLimit).toEqual({ allowed: null, remaining: 10, resetAt: null });
+    expect(r.errors).toContainEqual({ stage: "inventory", scope: "upload", code: "CLOUDINARY_420" });
+  });
+});
+
+// ───────────────────────────── Fase 19.1.2: regresiones D1–D5 ─────────────────────────────
+
+describe("19.1.2 D1: URL problemática guardada en la base de datos", () => {
+  it.each([
+    ["res: barras codificadas + % roto en el query", (o: string) => `https://res.cloudinary.com/demo/image/upload/ai-wardrobe%2F${o}%2Fwardrobe%2Fx?_a=%ZZ`],
+    ["CDN: barras codificadas + % roto", (o: string) => `https://cdn.example.com/ai-wardrobe%2F${o}%2Fwardrobe%2Fx?_a=%ZZ`],
+    ["api: public_id con % roto", (o: string) => `https://api.cloudinary.com/v1_1/demo/image/download?public_id=ai-wardrobe%2F${o}%2Fwardrobe%2Fx%ZZ`],
+  ])("%s en WardrobeItem.imageUrl → el recurso posiblemente referenciado NO es candidato; otro usuario no se ve afectado", async (_n, make) => {
+    const a = await user(); const b = await user();
+    await t.prisma.wardrobeItem.create({ data: { userId: a.id, name: "Heredada", category: "OTHER", imageUrl: make(a.id) } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/x`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/x`, "upload")]);
+    const r = await detect();
+    expect(r.complete).toBe(true);
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 });
+    expect(r.protection.ambiguousUrl).toBe(1);
+    expect(r.urlReferences).toMatchObject({ ambiguous: 1, external: 0, ownOutsidePrefix: 0 });
+  });
+
+  it("URL de nuestra cuenta no interpretable y sin indicios → protección global (ningún candidato)", async () => {
+    const a = await user(); const b = await user();
+    await t.prisma.user.update({ where: { id: a.id }, data: { image: "https://res.cloudinary.com/demo/video/upload/sample?_a=%ZZ" } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/x`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/x`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 2 });
+  });
+
+  it("con protección global, lo referenciado sigue REFERENCED y la cuarentena sigue QUARANTINED", async () => {
+    const u = await user();
+    const refd = `ai-wardrobe/${u.id}/wardrobe/r`;
+    await item(u.id, refd);
+    await t.prisma.user.update({ where: { id: u.id }, data: { image: "https://img.example.com/ai-wardrobe/_x/y" } });
+    paginate("upload", [res(refd, "upload"), res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload")]);
+    paginate("authenticated", [res(`ai-wardrobe/${u.id}/_quarantine/personal/q`, "authenticated")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, REFERENCED: 1, INCOMPLETE: 1, QUARANTINED: 1 });
+  });
+});
+
+describe("19.1.2 D2: created_at estricto (ISO 8601 UTC con Z)", () => {
+  it.each([
+    ["1"], ["0"], ["2026"], ["Nov 1"], ["2026-11-18T12:00:00"], [" 2026-11-18T12:00:00Z"], ["2026-11-18T12:00:00Z "],
+    ["2026-02-30T12:00:00Z"], ["2026-13-01T00:00:00Z"], ["2026-11-18T24:00:00Z"], ["2026-11-18T12:60:00Z"], ["2026-11-18T12:00:60Z"],
+    ["2026-11-18T12:00:00+00:00"], ["2026-11-18 12:00:00Z"], ["2026-11-18"], ["0050-01-01T00:00:00Z"], ["2026-11-18T12:00:00.Z"],
+  ])("%j → INCOMPLETE (nunca candidato)", async (createdAt) => {
+    const u = await user();
+    paginate("upload", [{ ...res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload"), created_at: createdAt }]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1 });
+    expect(r.protection.missingMetadata).toBe(1);
+  });
+
+  it.each([["2026-11-18T12:00:00Z"], ["2026-11-18T12:00:00.123Z"], ["2026-11-18T12:00:00.1Z"], ["2024-02-29T23:59:59.999999Z"]])("%j válido → se acepta", async (createdAt) => {
+    const u = await user();
+    paginate("upload", [{ ...res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload"), created_at: createdAt }]);
+    expect(counts(await detect())).toEqual({ ...ZERO, ORPHAN_CANDIDATE: 1 });
+  });
+
+  it("parseUtcTimestamp conserva los milisegundos y rechaza lo que new Date() aceptaría", async () => {
+    const { parseUtcTimestamp } = await import("@/services/media-reconcile.service");
+    expect(parseUtcTimestamp("2026-11-18T12:00:00.123Z")?.toISOString()).toBe("2026-11-18T12:00:00.123Z");
+    expect(parseUtcTimestamp("2026-11-18T12:00:00Z")?.toISOString()).toBe("2026-11-18T12:00:00.000Z");
+    for (const v of ["1", "Nov 1", "2026", 1732190000, null, undefined, new Date()]) expect(parseUtcTimestamp(v)).toBeNull();
+  });
+});
+
+describe("19.1.2 D3: metadatos obligatorios", () => {
+  it.each([
+    ["sin type", { type: undefined }],
+    ["sin resource_type", { resource_type: undefined }],
+    ["sin ninguno de los dos", { type: undefined, resource_type: undefined }],
+    ["asset_id corto", { asset_id: "abc" }],
+    ["asset_id en mayúsculas", { asset_id: "0123456789ABCDEF0123456789ABCDEF" }],
+    ["asset_id con espacios", { asset_id: " 0123456789abcdef0123456789abcdef" }],
+    ["asset_id de 33 caracteres", { asset_id: "0123456789abcdef0123456789abcdef0" }],
+    ["asset_id que no es texto", { asset_id: 123 }],
+  ])("%s → INCOMPLETE (nunca se rellena con lo pedido al endpoint)", async (_n, patch) => {
+    const u = await user();
+    paginate("upload", [{ ...res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload"), ...patch }]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1 });
+    expect(r.protection.missingMetadata).toBe(1);
+  });
+
+  it("normalizeResource deja type y resource_type en null cuando no vienen", async () => {
+    const { normalizeResource } = await import("@/services/media-reconcile.service");
+    const n = normalizeResource({ public_id: "ai-wardrobe/u/wardrobe/x", asset_id: "0123456789abcdef0123456789abcdef", created_at: OLD }, "upload");
+    expect(n).toMatchObject({ ok: true, item: { type: null, resourceType: null, delivery: "upload" } });
+  });
+});
+
+describe("19.1.2 D4: varios propietarios en una URL ambigua", () => {
+  it("se protegen los recursos no referenciados de TODOS los propietarios mencionados", async () => {
+    const a = await user(); const b = await user(); const c = await user();
+    await t.prisma.user.update({ where: { id: c.id }, data: { image: `https://img.example.com/ai-wardrobe/${a.id}/x?also=ai-wardrobe/${b.id}/y` } });
+    paginate("upload", [a, b, c].map((x) => res(`ai-wardrobe/${x.id}/wardrobe/o`, "upload")));
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 2, ORPHAN_CANDIDATE: 1 });
+    expect(r.protection.ambiguousUrl).toBe(2);
+  });
+});
+
+describe("19.1.2 D5: compras y catálogo se leen sin filtro de texto", () => {
+  it.each([
+    ["host codificado", (id: string) => `https://res.cloudin%61ry.com/demo/image/upload/v1/${id}`, "REFERENCED"],
+    ["host en mayúsculas", (id: string) => `https://RES.CLOUDINARY.COM/demo/image/upload/v1/${id}`, "REFERENCED"],
+    ["carpeta codificada en un CDN", (id: string) => `https://cdn.tienda.example/${id.replace("ai-wardrobe", "ai%2Dwardrobe")}`, "INCOMPLETE"],
+  ])("%s en CatalogProduct y ShoppingProduct → protege el recurso", async (_n, make, category) => {
+    const u = await user();
+    const ids = [`ai-wardrobe/${u.id}/wardrobe/cat`, `ai-wardrobe/${u.id}/wardrobe/shop`];
+    await t.prisma.catalogProduct.create({ data: { id: `c${Math.random().toString(36).slice(2)}`, provider: "p", feedId: "f", externalId: "e", store: "s", name: "n", category: "OTHER", priceCents: 1, imageUrl: make(ids[0]!), url: "https://tienda.example/p" } });
+    const rec = await t.prisma.shoppingRecommendation.create({ data: { userId: u.id, batchId: "b", gapLabel: "g", gapReason: "r", searchQuery: "q" } });
+    await t.prisma.shoppingProduct.create({ data: { recommendationId: rec.id, provider: "p", externalId: "e", name: "n", store: "s", url: "https://tienda.example/p", imageUrl: make(ids[1]!) } });
+    paginate("upload", ids.map((id) => res(id, "upload")));
+    const r = await detect();
+    expect(r.byCategory.ORPHAN_CANDIDATE).toBe(0);
+    expect(r.byCategory[category as "REFERENCED" | "INCOMPLETE"]).toBe(2);
+  });
+});
+
+describe("19.1.2 huecos de la auditoría", () => {
+  it("solo falla la consulta informativa sourcePhoto → inventario COMPLETE, informe NO completo y candidatos retenidos", async () => {
+    const u = await user();
+    paginate("upload", [res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload")]);
+    const real = t.prisma;
+    holder.prisma = new Proxy(real, {
+      get(target, prop) {
+        if (prop === "generatedImage") return { findMany: async (a: { where?: { sourcePhotoId?: unknown } }) => {
+          if (a?.where?.sourcePhotoId) throw new Error("caída");
+          return real.generatedImage.findMany(a as never);
+        } };
+        const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as PrismaClient;
+    try {
+      const r = await detect();
+      expect(r.inventoryStatus).toBe("COMPLETE");
+      expect(r.complete).toBe(false);
+      expect(r.errors).toEqual([{ stage: "database", scope: "sourcePhoto", code: "DB_ERROR" }]);
+      expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1 });
+      expect(r.candidatesWithheld).toBe(1);
+    } finally { holder.prisma = real; }
+  });
+});
+
+// ───────────────────────────── Fase 19.1.4: N1 y cobertura adicional ─────────────────────────────
+
+describe("19.1.4 cobertura adicional del detector", () => {
+  it("N1 de extremo a extremo: byte UTF-8 inválido junto a caracteres codificados en WardrobeItem.imageUrl → su propietario queda protegido", async () => {
+    const a = await user(); const b = await user();
+    await t.prisma.wardrobeItem.create({ data: { userId: a.id, name: "x", category: "OTHER", imageUrl: `https://cdn.example.com/ai-wardrob%65%2F${a.id}%2F%FF/x` } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 });
+    expect(r.protection.ambiguousUrl).toBe(1);
+  });
+
+  it("N1: mención con byte inválido sin propietario acotable → protección global (ningún candidato)", async () => {
+    const a = await user(); const b = await user();
+    await t.prisma.user.update({ where: { id: a.id }, data: { image: "https://cdn.example.com/ai-wardrobe%2F%FFcmowner/x" } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
+    expect(counts(await detect())).toEqual({ ...ZERO, INCOMPLETE: 2 });
+  });
+
+  it("una referencia EXACTA por URL prevalece sobre la protección global", async () => {
+    const u = await user();
+    const exact = `ai-wardrobe/${u.id}/wardrobe/exacta`;
+    await t.prisma.wardrobeItem.create({ data: { userId: u.id, name: "Heredada", category: "OTHER", imageUrl: `https://res.cloudinary.com/demo/image/upload/v1/${exact}` } });
+    await t.prisma.user.update({ where: { id: u.id }, data: { image: "https://img.example.com/ai-wardrobe/_x/y" } }); // global
+    paginate("upload", [res(exact, "upload"), res(`ai-wardrobe/${u.id}/wardrobe/otra`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, REFERENCED: 1, INCOMPLETE: 1 });
+    expect(r.protection).toMatchObject({ referencedByUrlOnly: 1, ambiguousUrl: 1 });
+  });
+
+  it("un indicio de propietario SOLO en el fragmento protege a ese propietario (y no a otros)", async () => {
+    const a = await user(); const b = await user();
+    await t.prisma.user.update({ where: { id: b.id }, data: { image: `https://img.example.com/foto.jpg#ai-wardrobe/${a.id}/x` } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 });
+    expect(r.protection.ambiguousUrl).toBe(1);
+  });
+
+  it.each([
+    ["usuario:contraseña", (id: string) => `https://ai-wardrobe:${id}@img.example.com/foto.jpg`],
+    ["usuario con barra codificada", (id: string) => `https://ai-wardrobe%2F${id}@img.example.com/foto.jpg`],
+  ])("un indicio de propietario SOLO en las credenciales (%s) protege a ese propietario", async (_n, make) => {
+    const a = await user(); const b = await user();
+    await t.prisma.user.update({ where: { id: b.id }, data: { image: make(a.id) } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 });
+  });
+
+  it("fallo aislado de ShoppingProduct → ningún candidato; URLs desconocidas; inventario COMPLETE pero informe no completo", async () => {
+    const u = await user();
+    const refd = `ai-wardrobe/${u.id}/wardrobe/r`;
+    await item(u.id, refd);
+    paginate("upload", [res(refd, "upload"), res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload")]);
+    const real = t.prisma;
+    holder.prisma = new Proxy(real, {
+      get(target, prop) {
+        if (prop === "shoppingProduct") return { findMany: async () => { throw new Error("caída"); } };
+        const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as PrismaClient;
+    try {
+      const r = await detect();
+      expect(counts(r)).toEqual({ ...ZERO, REFERENCED: 1, INCOMPLETE: 1 });
+      expect(r.byCategory.ORPHAN_CANDIDATE).toBe(0);
+      expect(r.urlReferences).toBeNull();
+      expect(r.errors).toEqual([{ stage: "database", scope: "urls", code: "DB_ERROR" }]);
+      expect(r.inventoryStatus).toBe("COMPLETE");
+      expect(r.complete).toBe(false);
+      expect(r.candidatesWithheld).toBe(0); // quedó INCOMPLETE antes (URLs desconocidas): no es un contador exhaustivo
+    } finally { holder.prisma = real; }
+  });
+});
+
+// ───────────────────────────── Fase 19.1.6: I1 y M1 ─────────────────────────────
+
+describe("19.1.6 I1 y M1 en el detector", () => {
+  it("URL exacta con A en la ruta y B en las credenciales (WardrobeItem.imageUrl) → A y B protegidos; C sigue candidato", async () => {
+    const a = await user(); const b = await user(); const c = await user();
+    await t.prisma.wardrobeItem.create({ data: { userId: a.id, name: "x", category: "OTHER", imageUrl: `https://ai-wardrobe:${b.id}@res.cloudinary.com/demo/image/upload/v1/ai-wardrobe/${a.id}/wardrobe/x` } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/x`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${c.id}/wardrobe/o`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 2, ORPHAN_CANDIDATE: 1 });
+    expect(r.protection).toMatchObject({ referencedByUrlOnly: 0, ambiguousUrl: 2 });
+    expect(r.urlReferences).toMatchObject({ own: 0, ambiguous: 1 });
+  });
+
+  it("descarga exacta con A en public_id y B en el fragmento (GeneratedImage.imageUrl) → A y B protegidos; C sigue candidato", async () => {
+    const a = await user(); const b = await user(); const c = await user();
+    await t.prisma.generatedImage.create({ data: { userId: a.id, scenario: "x", pose: "y", status: "COMPLETED", imageUrl: `https://api.cloudinary.com/v1_1/demo/image/download?public_id=ai-wardrobe%2F${a.id}%2Ftry-on%2Fg&type=authenticated#ai-wardrobe/${b.id}/y` } });
+    paginate("authenticated", [res(`ai-wardrobe/${a.id}/try-on/g`, "authenticated"), res(`ai-wardrobe/${b.id}/try-on/o`, "authenticated"), res(`ai-wardrobe/${c.id}/try-on/o`, "authenticated")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 2, ORPHAN_CANDIDATE: 1 });
+    expect(r.protection.ambiguousUrl).toBe(2);
+  });
+
+  it("M1: propietario truncado por un byte inválido → protección global (no solo el prefijo)", async () => {
+    const a = await user(); const b = await user();
+    // Mención de `a` con un byte inválido pegado: el propietario completo no es identificable.
+    await t.prisma.user.update({ where: { id: b.id }, data: { image: `https://cdn.example.com/ai-wardrobe/${a.id}%FF/wardrobe/x` } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 2 });
+    expect(r.protection.ambiguousUrl).toBe(2);
+  });
+
+  it("M1: propietario completo seguido de un separador → protección específica (el otro usuario sigue candidato)", async () => {
+    const a = await user(); const b = await user();
+    await t.prisma.user.update({ where: { id: b.id }, data: { image: `https://cdn.example.com/ai-wardrobe/${a.id}/%FF/x` } });
+    paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
+    expect(counts(await detect())).toEqual({ ...ZERO, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 });
   });
 });
