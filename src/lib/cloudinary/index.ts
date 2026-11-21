@@ -1,3 +1,4 @@
+import { Agent } from "node:https";
 import { v2 as cloudinary, type UploadApiResponse } from "cloudinary";
 import { env } from "@/lib/env";
 import { AppError, logError } from "@/lib/errors";
@@ -152,4 +153,36 @@ export async function deleteAllUserAssets(userId: string): Promise<void> {
     }
   }
   await c.api.delete_folder(`ai-wardrobe/${userId}`).catch(() => undefined); // carpeta vacía: mejor esfuerzo
+}
+
+/** Raíz de todo lo que sube la aplicación (`ai-wardrobe/<userId>/<tipo>/…`). El inventario nunca recorre nada fuera. */
+export const APP_ROOT_PREFIX = "ai-wardrobe/";
+/** Tipos de entrega de las imágenes de la aplicación: públicas (`upload`) y privadas (`authenticated`). */
+export type DeliveryType = "upload" | "authenticated";
+/** Página tal como la devuelve la Admin API (se valida en quien la usa: no se confía en su forma). */
+export interface ResourcePage { resources?: unknown; next_cursor?: unknown }
+
+/**
+ * SOLO LECTURA (Admin API, `GET /resources/image/<tipo>`): una página del inventario de imágenes de la aplicación para
+ * un tipo de entrega. El prefijo es fijo (APP_ROOT_PREFIX): quien llama no puede recorrer otras carpetas. No modifica
+ * nada en Cloudinary. Consume cuota horaria de la Admin API.
+ *
+ * Cancelación real: el SDK no acepta AbortSignal y su `timeout` solo programa `request.setTimeout` sin cerrar nada, pero
+ * sí reenvía la opción `agent` a `https.request`. Cada página usa su propio Agent: al abortarse `signal`, `agent.destroy()`
+ * cierra el socket de la petición en curso (el SDK la rechaza con ECONNRESET) y no queda nada ejecutándose en segundo
+ * plano. Al terminar, por cualquier vía, el Agent se destruye también.
+ */
+export async function listAppResourcesPage(type: DeliveryType, cursor?: string, signal?: AbortSignal): Promise<ResourcePage> {
+  if (signal?.aborted) throw signal.reason; // ya cancelada: no se crea ningún recurso
+  const agent = new Agent({ keepAlive: false });
+  const cancel = () => agent.destroy();
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    return (await client().api.resources({
+      resource_type: "image", type, prefix: APP_ROOT_PREFIX, max_results: 500, agent, ...(cursor ? { next_cursor: cursor } : {}),
+    })) as ResourcePage;
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    agent.destroy();
+  }
 }
