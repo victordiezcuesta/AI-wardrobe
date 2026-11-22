@@ -149,11 +149,18 @@ const optString = (v: unknown, max: number) => (typeof v === "string" && v.lengt
 const optInt = (v: unknown, min: number) => (typeof v === "number" && Number.isSafeInteger(v) && v >= min ? v : null);
 
 /**
- * HIPÓTESIS PENDIENTE DE VERIFICAR con una respuesta real de la Cloudinary Admin API: `asset_id` tiene 32 caracteres
- * hexadecimales en minúscula (ni el SDK ni el repositorio lo documentan). Hasta verificarlo, cualquier otro formato se
- * trata como inválido (null) y el recurso nunca puede convertirse en candidato.
+ * `asset_id` se trata como un identificador OPACO: no se presupone ningún formato (ni el SDK ni el repositorio documentan
+ * uno) y solo se compara por igualdad exacta entre observaciones. Validación conservadora, sin normalizar ni transformar
+ * el valor: texto de 1 a MAX_ASSET_ID_LENGTH unidades UTF-16, sin espacios en blanco, caracteres de control, caracteres
+ * de formato invisibles ni surrogates sueltos (harían que dos valores aparentemente iguales no lo fueran). Cualquier otro
+ * valor → null: el recurso queda INCOMPLETE y nunca puede convertirse en candidato.
  */
-const ASSET_ID = /^[0-9a-f]{32}$/;
+export const MAX_ASSET_ID_LENGTH = 128;
+const ASSET_ID_FORBIDDEN = /[\s\p{Cc}\p{Cf}\p{Cs}]/u;
+export function parseOpaqueAssetId(v: unknown): string | null {
+  if (typeof v !== "string" || v.length === 0 || v.length > MAX_ASSET_ID_LENGTH) return null;
+  return ASSET_ID_FORBIDDEN.test(v) ? null : v;
+}
 const ISO_UTC = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/;
 /**
  * Fecha ISO 8601 en UTC con `Z` (fracción de segundo opcional), sin espacios, y REAL: los componentes deben coincidir
@@ -177,7 +184,7 @@ export function parseUtcTimestamp(v: unknown): Date | null {
  * Valida un recurso de la Admin API (su tipado es `any`). MALFORMED: sin `public_id` utilizable o con `type`/
  * `resource_type` que no son texto. UNEXPECTED: no es lo que se pidió (otro tipo de entrega, no es imagen o fuera del
  * prefijo). Cualquier metadato ausente o inválido queda en null: nunca se rellena con lo que se pidió al endpoint.
- * OBLIGATORIOS para clasificar (si falta alguno, el recurso queda INCOMPLETE): `asset_id` (32 hex), `created_at`
+ * OBLIGATORIOS para clasificar (si falta alguno, el recurso queda INCOMPLETE): `asset_id` (opaco, ver parseOpaqueAssetId), `created_at`
  * (ISO UTC estricto), `type` (== el pedido) y `resource_type` (== "image"). Informativos: `version`, `bytes`, `format`.
  */
 export function normalizeResource(raw: unknown, requested: DeliveryType): NormalizedResource {
@@ -195,7 +202,7 @@ export function normalizeResource(raw: unknown, requested: DeliveryType): Normal
     ok: true,
     item: {
       publicId, delivery: requested,
-      assetId: typeof r.asset_id === "string" && ASSET_ID.test(r.asset_id) ? r.asset_id : null,
+      assetId: parseOpaqueAssetId(r.asset_id),
       version: optInt(r.version, 1),
       createdAt: parseUtcTimestamp(r.created_at),
       bytes: optInt(r.bytes, 0),

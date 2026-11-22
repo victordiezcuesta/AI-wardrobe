@@ -800,10 +800,9 @@ describe("19.1.2 D3: metadatos obligatorios", () => {
     ["sin type", { type: undefined }],
     ["sin resource_type", { resource_type: undefined }],
     ["sin ninguno de los dos", { type: undefined, resource_type: undefined }],
-    ["asset_id corto", { asset_id: "abc" }],
-    ["asset_id en mayúsculas", { asset_id: "0123456789ABCDEF0123456789ABCDEF" }],
-    ["asset_id con espacios", { asset_id: " 0123456789abcdef0123456789abcdef" }],
-    ["asset_id de 33 caracteres", { asset_id: "0123456789abcdef0123456789abcdef0" }],
+    ["asset_id vacío", { asset_id: "" }],
+    ["asset_id con espacio inicial", { asset_id: " 0123456789abcdef0123456789abcdef" }],
+    ["asset_id de 129 caracteres", { asset_id: "a".repeat(129) }],
     ["asset_id que no es texto", { asset_id: 123 }],
   ])("%s → INCOMPLETE (nunca se rellena con lo pedido al endpoint)", async (_n, patch) => {
     const u = await user();
@@ -988,5 +987,69 @@ describe("19.1.6 I1 y M1 en el detector", () => {
     await t.prisma.user.update({ where: { id: b.id }, data: { image: `https://cdn.example.com/ai-wardrobe/${a.id}/%FF/x` } });
     paginate("upload", [res(`ai-wardrobe/${a.id}/wardrobe/o`, "upload"), res(`ai-wardrobe/${b.id}/wardrobe/o`, "upload")]);
     expect(counts(await detect())).toEqual({ ...ZERO, INCOMPLETE: 1, ORPHAN_CANDIDATE: 1 });
+  });
+});
+
+// ───────────────────────────── Fase 19.2.0: asset_id opaco ─────────────────────────────
+
+describe("19.2.0 asset_id como identificador opaco", () => {
+  it.each([
+    ["hexadecimal de 32 en minúscula", "0123456789abcdef0123456789abcdef"],
+    ["hexadecimal en mayúsculas", "0123456789ABCDEF0123456789ABCDEF"],
+    ["corto", "abc"],
+    ["33 caracteres", "0123456789abcdef0123456789abcdef0"],
+    ["UUID con guiones", "123e4567-e89b-12d3-a456-426614174000"],
+    ["con prefijo y separadores", "asset:v2/AbC_123.x"],
+    ["letras no ASCII", "ÄßЖ漢字"],
+    ["exactamente 128 caracteres", "a".repeat(128)],
+    ["par surrogate válido (emoji)", "id-😀"],
+  ])("válido (%s) → se acepta tal cual y el recurso puede ser candidato", async (_n, assetId) => {
+    const u = await user();
+    paginate("upload", [{ ...res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload"), asset_id: assetId }]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, ORPHAN_CANDIDATE: 1 });
+    expect(r.metadata.assetId).toBe(1);
+  });
+
+  it.each([
+    ["vacío", ""],
+    ["129 caracteres", "a".repeat(129)],
+    ["solo espacios", "   "],
+    ["espacio inicial", " abc"],
+    ["espacio final", "abc "],
+    ["espacio intermedio", "ab c"],
+    ["tabulador", "ab\tc"],
+    ["salto de línea", "abc\n"],
+    ["NUL", "ab\u0000c"],
+    ["DEL", "ab\u007Fc"],
+    ["control C1", "ab\u0085c"],
+    ["espacio sin ruptura", "ab\u00A0c"],
+    ["carácter de ancho cero", "ab\u200Bc"],
+    ["BOM", "\uFEFFabc"],
+    ["surrogate suelto", "ab\uD800c"],
+    ["número", 123],
+    ["null", null],
+    ["objeto", { id: "abc" }],
+    ["lista", ["abc"]],
+  ])("inválido (%s) → INCOMPLETE (nunca candidato)", async (_n, assetId) => {
+    const u = await user();
+    paginate("upload", [{ ...res(`ai-wardrobe/${u.id}/wardrobe/a`, "upload"), asset_id: assetId }]);
+    const r = await detect();
+    expect(counts(r)).toEqual({ ...ZERO, INCOMPLETE: 1 });
+    expect(r.protection.missingMetadata).toBe(1);
+    expect(r.metadata.assetId).toBe(0);
+  });
+
+  it("parseOpaqueAssetId no normaliza ni transforma: devuelve exactamente el mismo valor; la igualdad es exacta", async () => {
+    const { parseOpaqueAssetId, MAX_ASSET_ID_LENGTH, normalizeResource } = await import("@/services/media-reconcile.service");
+    expect(MAX_ASSET_ID_LENGTH).toBe(128);
+    for (const v of ["AbC", "abc", "ÄßЖ", "a".repeat(128), "x-y_z.1:2/3"]) expect(parseOpaqueAssetId(v)).toBe(v);
+    expect(parseOpaqueAssetId("AbC")).not.toBe(parseOpaqueAssetId("abc")); // sin pasar a minúsculas
+    // Formas Unicode distintas (NFC y NFD) se conservan distintas: no se normaliza.
+    expect(parseOpaqueAssetId("\u00E9")).toBe("\u00E9");
+    expect(parseOpaqueAssetId("e\u0301")).toBe("e\u0301");
+    expect(parseOpaqueAssetId("\u00E9")).not.toBe(parseOpaqueAssetId("e\u0301"));
+    const n = normalizeResource({ public_id: "ai-wardrobe/u/wardrobe/x", asset_id: "Mixed-Case_ID", created_at: OLD, type: "upload", resource_type: "image" }, "upload");
+    expect(n).toMatchObject({ ok: true, item: { assetId: "Mixed-Case_ID" } });
   });
 });
