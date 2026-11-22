@@ -21,6 +21,25 @@ let t: TestDb;
 beforeAll(async () => { setTestEnv(); t = await startTestDb(); holder.prisma = t.prisma; }, 60_000);
 afterAll(async () => { await t?.stop(); });
 
+/** Ejecución de reconciliación a la que apuntan los MediaAsset de prueba (no pertenece a ningún usuario). */
+let reconcileRunId: string | undefined;
+async function reconcileRun() {
+  reconcileRunId ??= (await t.prisma.mediaReconcileRun.create({ data: { fencingToken: 1, graceHours: 24 } })).id;
+  return reconcileRunId;
+}
+const NOW = new Date("2026-11-20T00:00:00Z");
+/** Candidatos de la reconciliación de medios: sin FK a User, solo `ownerUserId` (deben borrarse con la cuenta). */
+async function mediaAssets(userId: string) {
+  const runId = await reconcileRun();
+  const base = { assetId: `asset-${userId}`, resourceCreatedAt: NOW, firstCandidateAt: NOW, lastCandidateAt: NOW, firstCandidateRunId: runId, lastCandidateRunId: runId, ownerUserId: userId };
+  await t.prisma.mediaAsset.createMany({ data: [
+    { ...base, publicId: `ai-wardrobe/${userId}/wardrobe/w1`, kind: "WARDROBE", delivery: "UPLOAD" },
+    { ...base, publicId: `ai-wardrobe/${userId}/personal/p1`, kind: "PERSONAL", delivery: "AUTHENTICATED", ownerMissing: true },
+  ] });
+}
+/** Tras un error de base de datos recibido por la conexión de Prisma, PGLiteSocketServer la cierra: se abre otra. */
+const heal = async () => { await t.prisma.$queryRawUnsafe("SELECT 1").catch(() => undefined); await t.prisma.$queryRawUnsafe("SELECT 1"); };
+
 async function seed(email: string, password: string) {
   const u = await t.prisma.user.create({ data: { email, name: "N", passwordHash: await bcrypt.hash(password, 4), profile: { create: { usualStyles: ["casual"], photoPublicIds: ["p1"], aiPhotoConsent: true } } } });
   const item = await t.prisma.wardrobeItem.create({ data: { userId: u.id, name: "Camisa", category: "SHIRT" } });
@@ -34,6 +53,7 @@ async function seed(email: string, password: string) {
   await t.prisma.aiUsageLog.create({ data: { userId: u.id, task: "ITEM_ANALYSIS", provider: "openrouter", model: "m" } });
   await t.prisma.verificationToken.create({ data: { identifier: email, token: `tok-${email}`, expires: new Date(Date.now() + 1e6) } });
   await t.prisma.$executeRawUnsafe(`INSERT INTO "RateLimit"("key","count") VALUES ('stylist:${u.id}', 3), ('login:${email}', 1)`);
+  await mediaAssets(u.id);
   return u.id;
 }
 const counts = (id: string) => Promise.all([
@@ -41,7 +61,7 @@ const counts = (id: string) => Promise.all([
   t.prisma.outfit.count({ where: { userId: id } }), t.prisma.outfitItem.count({ where: { outfit: { userId: id } } }), t.prisma.outfitFeedback.count({ where: { userId: id } }),
   t.prisma.outfitHistory.count({ where: { userId: id } }), t.prisma.userPreference.count({ where: { userId: id } }), t.prisma.favoriteItem.count({ where: { userId: id } }),
   t.prisma.generatedImage.count({ where: { userId: id } }), t.prisma.shoppingRecommendation.count({ where: { userId: id } }), t.prisma.shoppingProduct.count({ where: { recommendation: { userId: id } } }),
-  t.prisma.aiUsageLog.count({ where: { userId: id } }),
+  t.prisma.aiUsageLog.count({ where: { userId: id } }), t.prisma.mediaAsset.count({ where: { ownerUserId: id } }),
 ]);
 
 describe("cuenta: exportación y eliminación", () => {
@@ -79,15 +99,48 @@ describe("cuenta: exportación y eliminación", () => {
   it("elimina definitivamente la cuenta y TODOS sus datos, sin tocar los de otros", async () => {
     const { accountService } = await import("@/services/account.service");
     const otherBefore = await counts(b);
+    const runsBefore = await t.prisma.mediaReconcileRun.findMany({ orderBy: { id: "asc" } });
+    const lockBefore = await t.prisma.mediaReconcileLock.findMany();
+    expect(await t.prisma.mediaAsset.count({ where: { ownerUserId: a } })).toBe(2);
     await accountService.delete(a, "ClaveA-12345");
 
     expect(cloud.deleted).toEqual([a]); // se pidió borrar las imágenes de este usuario
-    expect(await counts(a)).toEqual(Array(13).fill(0)); // 13 tablas dependientes, todas a cero
+    expect(await counts(a)).toEqual(Array(14).fill(0)); // 13 tablas dependientes + MediaAsset (sin FK), todas a cero
+    // La reconciliación no es del usuario: sus ejecuciones y el lock quedan exactamente igual.
+    expect(await t.prisma.mediaReconcileRun.findMany({ orderBy: { id: "asc" } })).toEqual(runsBefore);
+    expect(await t.prisma.mediaReconcileLock.findMany()).toEqual(lockBefore);
     expect(await t.prisma.verificationToken.count({ where: { identifier: "a@acct.com" } })).toBe(0);
     const rl = await t.prisma.$queryRawUnsafe<{ key: string }[]>(`SELECT "key" FROM "RateLimit" WHERE "key" LIKE '%${a}'`);
     expect(rl).toHaveLength(0);
     expect(await counts(b)).toEqual(otherBefore); // el otro usuario, intacto
     expect(await t.prisma.verificationToken.count({ where: { identifier: "b@acct.com" } })).toBe(1);
+    expect(await t.prisma.mediaAsset.count({ where: { ownerUserId: b } })).toBe(2); // los MediaAsset de otro, intactos
+  });
+
+  it("si la transacción falla al borrar la cuenta, no hay eliminación parcial: MediaAsset y el resto siguen intactos", async () => {
+    const { accountService } = await import("@/services/account.service");
+    const c = await seed("c@acct.com", "ClaveC-12345");
+    const before = await counts(c);
+    // Fallo REAL de PostgreSQL en el último paso de la transacción (borrar el usuario), después de MediaAsset.
+    await t.prisma.$executeRawUnsafe(`CREATE FUNCTION test_block_user_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF OLD."id" = '${c}' THEN RAISE EXCEPTION 'borrado bloqueado por la prueba'; END IF; RETURN OLD; END $$`);
+    await t.prisma.$executeRawUnsafe(`CREATE TRIGGER test_block_user_delete BEFORE DELETE ON "User" FOR EACH ROW EXECUTE FUNCTION test_block_user_delete()`);
+    try {
+      await expect(accountService.delete(c, "ClaveC-12345")).rejects.toThrow(/borrado bloqueado por la prueba/);
+      await heal();
+      expect(await counts(c)).toEqual(before); // nada borrado, MediaAsset incluido
+      expect(await t.prisma.mediaAsset.count({ where: { ownerUserId: c } })).toBe(2);
+      expect(await t.prisma.verificationToken.count({ where: { identifier: "c@acct.com" } })).toBe(1);
+      const rl = await t.prisma.$queryRawUnsafe<{ key: string }[]>(`SELECT "key" FROM "RateLimit" WHERE "key" LIKE '%${c}'`);
+      expect(rl).toHaveLength(1);
+    } finally {
+      await heal();
+      await t.prisma.$executeRawUnsafe(`DROP TRIGGER test_block_user_delete ON "User"`);
+      await t.prisma.$executeRawUnsafe(`DROP FUNCTION test_block_user_delete()`);
+    }
+    // Sin el bloqueo, el reintento completa la eliminación (MediaAsset incluido).
+    await accountService.delete(c, "ClaveC-12345");
+    expect(await counts(c)).toEqual(Array(14).fill(0));
   });
 });
 

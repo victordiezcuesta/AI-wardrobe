@@ -44,6 +44,10 @@ export const accountService = {
     await prisma.$transaction([
       prisma.verificationToken.deleteMany({ where: { identifier: user.email } }),
       prisma.$executeRaw`DELETE FROM "RateLimit" WHERE "key" LIKE ${`%:${userId}`}`,
+      // Reconciliación de medios: MediaAsset no tiene FK a User (debe poder sobrevivir a la cuenta mientras el
+      // reconciliador la necesite), así que no hay cascada. Sus imágenes ya se borraron arriba en Cloudinary: se eliminan
+      // aquí, en la MISMA transacción que la cuenta (o todo o nada). Las ejecuciones y el lock no son del usuario.
+      prisma.mediaAsset.deleteMany({ where: { ownerUserId: userId } }),
       prisma.user.delete({ where: { id: userId } }), // cascada: perfil, armario, conjuntos, imágenes, compras, preferencias, registros de IA…
     ]);
   },
