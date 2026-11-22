@@ -7,7 +7,7 @@
 import { readFileSync } from "node:fs";
 import { getDMMF } from "@prisma/internals";
 
-type Field = { name: string; kind: string; type: string; isList: boolean; isRequired: boolean; isId: boolean; hasDefaultValue: boolean; default?: unknown; relationFromFields?: string[]; relationToFields?: string[]; relationOnDelete?: string; isUpdatedAt: boolean };
+type Field = { name: string; kind: string; type: string; isList: boolean; isRequired: boolean; isId: boolean; hasDefaultValue: boolean; default?: unknown; relationFromFields?: string[]; relationToFields?: string[]; relationOnDelete?: string; relationOnUpdate?: string; isUpdatedAt: boolean };
 
 const q = (s: string) => `"${s}"`;
 const SCALARS: Record<string, string> = { String: "TEXT", Int: "INTEGER", Float: "DOUBLE PRECISION", Boolean: "BOOLEAN", DateTime: "TIMESTAMP(3)", Json: "JSONB", BigInt: "BIGINT", Decimal: "DECIMAL(65,30)", Bytes: "BYTEA" };
@@ -59,8 +59,10 @@ async function main() {
   for (const m of models) {
     for (const f of m.fields.filter((x) => x.kind === "object" && x.relationFromFields?.length)) {
       const from = f.relationFromFields!, to = f.relationToFields!;
-      const onDelete = { Cascade: "CASCADE", SetNull: "SET NULL", Restrict: "RESTRICT", NoAction: "NO ACTION" }[f.relationOnDelete ?? ""] ?? (f.isRequired ? "RESTRICT" : "SET NULL");
-      out.push(`-- AddForeignKey\nALTER TABLE ${q(m.name)} ADD CONSTRAINT ${q(`${m.name}_${from.join("_")}_fkey`)} FOREIGN KEY (${from.map(q).join(", ")}) REFERENCES ${q(f.type)}(${to.map(q).join(", ")}) ON DELETE ${onDelete} ON UPDATE CASCADE;\n`);
+      const actions: Record<string, string> = { Cascade: "CASCADE", SetNull: "SET NULL", Restrict: "RESTRICT", NoAction: "NO ACTION" };
+      const onDelete = actions[f.relationOnDelete ?? ""] ?? (f.isRequired ? "RESTRICT" : "SET NULL");
+      const onUpdate = actions[f.relationOnUpdate ?? ""] ?? "CASCADE"; // sin acción explícita: CASCADE, como Prisma
+      out.push(`-- AddForeignKey\nALTER TABLE ${q(m.name)} ADD CONSTRAINT ${q(`${m.name}_${from.join("_")}_fkey`)} FOREIGN KEY (${from.map(q).join(", ")}) REFERENCES ${q(f.type)}(${to.map(q).join(", ")}) ON DELETE ${onDelete} ON UPDATE ${onUpdate};\n`);
     }
   }
   process.stdout.write(out.join("\n"));

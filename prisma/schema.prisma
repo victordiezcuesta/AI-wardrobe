@@ -427,3 +427,118 @@ model CatalogSync {
   @@index([provider, feedId, startedAt])
 }
 
+
+// ─────────────────────────── Reconciliación de medios de Cloudinary (fase 19.2.2) ───────────────────────────
+// Solo modelo de datos: el detector todavía no escribe en estas tablas. Restricciones CHECK adicionales en la migración
+// 0002_media_reconcile_persistence (Prisma no las modela).
+// `updatedAt` (@updatedAt) lo rellena Prisma Client, NO la base de datos (no tiene DEFAULT): cualquier INSERT o UPDATE en
+// SQL directo (p. ej. la adquisición atómica del lease) debe asignarlo explícitamente.
+
+enum MediaReconcileRunKind {
+  DETECT
+}
+
+enum MediaReconcileRunStatus {
+  RUNNING
+  COMPLETED
+  INCOMPLETE
+  FAILED
+  ABANDONED
+}
+
+enum MediaDelivery {
+  UPLOAD
+  AUTHENTICATED
+}
+
+enum MediaAssetKind {
+  WARDROBE
+  PERSONAL
+  TRY_ON
+}
+
+enum MediaAssetState {
+  CANDIDATE
+  CONFIRMED
+  CLEARED
+}
+
+/// Lease persistente del reconciliador: fila ÚNICA "media-reconcile" (CHECK), creada por la migración. Cada adquisición
+/// incrementa fencingToken; una ejecución que perdió el lease ya no coincide con él y no puede escribir.
+/// FK compuesta (holderRunId, fencingToken) → MediaReconcileRun(id, fencingToken): el dueño existe y su token es el del
+/// lock. ON DELETE RESTRICT impide borrar la ejecución que tiene el lease y ON UPDATE RESTRICT, cambiar su id o su
+/// token: un cambio accidental falla en vez de propagarse en silencio al lock. Sin dueño
+/// (holderRunId NULL) la FK no se aplica: así se libera. Adquirir: en una transacción, crear la ejecución con el token
+/// siguiente y, en la MISMA sentencia, subir fencingToken y fijar holderRunId, leaseExpiresAt y heartbeatAt.
+model MediaReconcileLock {
+  name           String             @id
+  fencingToken   Int                @default(0)
+  holderRunId    String?
+  leaseExpiresAt DateTime?
+  heartbeatAt    DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  holderRun      MediaReconcileRun? @relation("MediaReconcileLockHolder", fields: [holderRunId, fencingToken], references: [id, fencingToken], onDelete: Restrict, onUpdate: Restrict)
+}
+
+/// Historial de ejecuciones: SOLO datos agregados (sin publicId, userId, URLs ni respuestas del proveedor).
+model MediaReconcileRun {
+  id                String                  @id @default(cuid())
+  kind              MediaReconcileRunKind   @default(DETECT)
+  status            MediaReconcileRunStatus @default(RUNNING)
+  fencingToken      Int                     @unique
+  startedAt         DateTime                @default(now())
+  heartbeatAt       DateTime                @default(now())
+  finishedAt        DateTime?
+  inventoryComplete Boolean                 @default(false)
+  complete          Boolean                 @default(false)
+  graceHours        Float
+  summary           Json?
+  errorCodes        String[]                @default([])
+  codeVersion       String?
+  updatedAt         DateTime                @updatedAt
+  lockHolder        MediaReconcileLock[]    @relation("MediaReconcileLockHolder")
+  firstCandidates   MediaAsset[]            @relation("MediaAssetFirstCandidateRun")
+  lastCandidates    MediaAsset[]            @relation("MediaAssetLastCandidateRun")
+
+  @@unique([id, fencingToken]) // destino de la FK compuesta del lock
+  @@index([kind, startedAt])
+  @@index([status, heartbeatAt])
+}
+
+/// Recurso de Cloudinary que ha sido ORPHAN_CANDIDATE en alguna ejecución COMPLETA. Identidad: (delivery, publicId).
+/// `publicId` sigue exactamente el formato del detector (APP_PATH):
+/// `ai-wardrobe/<ownerUserId>/<wardrobe|personal|try-on>/<nombre>`. El propietario, el tipo (`kind`) y la entrega
+/// (`delivery`) deben coincidir con la ruta (CHECK en la migración).
+/// `assetId` es opaco: se guarda exactamente como llega y solo se compara por igualdad. `ownerUserId` obligatorio y sin FK
+/// a User: la fila debe poder existir aunque la cuenta ya no exista (se borrará explícitamente con la cuenta en fases futuras).
+model MediaAsset {
+  id                  String            @id @default(cuid())
+  publicId            String
+  delivery            MediaDelivery
+  kind                MediaAssetKind
+  ownerUserId         String
+  assetId             String
+  version             Int?
+  bytes               Int?
+  format              String?
+  resourceCreatedAt   DateTime
+  state               MediaAssetState   @default(CANDIDATE)
+  firstCandidateAt    DateTime
+  lastCandidateAt     DateTime
+  firstCandidateRunId String
+  lastCandidateRunId  String
+  sightings           Int               @default(1)
+  ownerMissing        Boolean           @default(false)
+  rowVersion          Int               @default(0)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  firstCandidateRun   MediaReconcileRun @relation("MediaAssetFirstCandidateRun", fields: [firstCandidateRunId], references: [id], onDelete: Restrict)
+  lastCandidateRun    MediaReconcileRun @relation("MediaAssetLastCandidateRun", fields: [lastCandidateRunId], references: [id], onDelete: Restrict)
+
+  @@unique([delivery, publicId])
+  @@index([state, lastCandidateAt])
+  @@index([lastCandidateRunId])
+  @@index([firstCandidateRunId])
+  @@index([ownerUserId])
+}
