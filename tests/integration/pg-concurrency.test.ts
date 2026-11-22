@@ -257,3 +257,255 @@ describe.skipIf(!ADMIN_URL)("PostgreSQL real con varias conexiones", () => {
     });
   });
 });
+
+describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de la fila del lock)", () => {
+  const OPTS = { graceHours: 24, ttlMs: 60_000, lockTimeoutMs: 10_000 };
+  const COMPLETED = { status: "COMPLETED" as const, inventoryComplete: true };
+  /** Cuarta conexión independiente: retiene filas (como recoverAbandoned: SELECT … FOR UPDATE sin modificarlas). */
+  let holderDb: PrismaClient;
+  beforeAll(() => {
+    if (!ADMIN_URL) return;
+    const url = new URL(ADMIN_URL);
+    url.pathname = `/${dbName}`;
+    holderDb = client(url.toString(), 1);
+  });
+  afterAll(async () => { await holderDb?.$disconnect(); });
+  const leaseSvc = async () => {
+    const { createMediaLease } = await import("@/services/media-lease.service");
+    return { a: createMediaLease(app), b: createMediaLease(other) }; // A y B: procesos con conexiones independientes
+  };
+  const lockRow = () => monitor.mediaReconcileLock.findUniqueOrThrow({ where: { name: "media-reconcile" } });
+  const runStatus = async (id: string) => (await monitor.mediaReconcileRun.findUniqueOrThrow({ where: { id } })).status;
+  const LOCK_STMT = `SELECT 1 FROM "MediaReconcileLock" WHERE "name" = 'media-reconcile' FOR UPDATE`;
+  /** Retiene una fila en una transacción de holderDb hasta abrir `done` (sin modificarla). */
+  async function hold(stmt = LOCK_STMT) {
+    const inside = gate(); const done = gate();
+    const p = holderDb.$transaction(async (tx) => { await tx.$queryRawUnsafe(stmt); inside.open(); await done.wait; }, { maxWait: 10_000, timeout: 60_000 });
+    await reached(inside, p);
+    return { release: async () => { done.open(); await p; } };
+  }
+  /** Simula que el lease vigente caducó (SQL de preparación, fuera de cualquier operación del servicio). */
+  const expireNow = () => app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "heartbeatAt" = (clock_timestamp() AT TIME ZONE 'UTC') - interval '2 seconds',
+    "leaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') - interval '1 second' WHERE "holderRunId" IS NOT NULL`);
+  beforeEach(async () => {
+    if (!ADMIN_URL) return;
+    await app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "holderRunId" = NULL, "leaseExpiresAt" = NULL, "heartbeatAt" = NULL, "fencingToken" = 0`);
+    await app.$executeRawUnsafe(`DELETE FROM "MediaAsset"`);
+    await app.$executeRawUnsafe(`DELETE FROM "MediaReconcileRun"`);
+  });
+  async function acquiredBy(svc: Awaited<ReturnType<typeof leaseSvc>>["a"]) {
+    const r = await svc.acquire(OPTS);
+    if (r.status !== "ACQUIRED") throw new Error("no adquirió");
+    return r.lease;
+  }
+
+  it("A retiene la fila del lock en una operación protegida; B espera; al terminar A, B adquiere y A ya no puede renovar, operar ni liberar", async () => {
+    const { a: svcA, b: svcB } = await leaseSvc();
+    const la = await acquiredBy(svcA);
+    const inside = gate(); const done = gate();
+    // Operación protegida de A: la fila del lock queda bloqueada hasta el final de su transacción. Dentro, A deja
+    // caducar su propio lease (simula que su tiempo se agota mientras trabaja).
+    const pA = svcA.withLease(la, async (tx) => {
+      inside.open();
+      await done.wait;
+      await tx.$executeRaw`UPDATE "MediaReconcileLock" SET "heartbeatAt" = (clock_timestamp() AT TIME ZONE 'UTC') - interval '2 seconds',
+        "leaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') - interval '1 second' WHERE "name" = 'media-reconcile'`;
+      return "A";
+    }, OPTS);
+    await reached(inside, pA);
+    const pB = svcB.acquire(OPTS);
+    await waitForLockWaiters(1); // B espera de verdad (pg_stat_activity)
+    expect(await settled(pB)).toBe(false);
+    done.open();
+    expect(await pA).toMatchObject({ ok: true, value: "A" });
+    const rb = await pB;
+    expect(rb).toMatchObject({ status: "ACQUIRED", abandoned: 1 });
+    if (rb.status !== "ACQUIRED") return;
+    expect(rb.lease.fencingToken).toBe(la.fencingToken + 1);
+    const held = await lockRow();
+    expect(held).toMatchObject({ holderRunId: rb.lease.runId, fencingToken: rb.lease.fencingToken });
+    const fn = vi.fn(async () => "no");
+    expect(await svcA.renew(la, OPTS)).toEqual({ ok: false, reason: "LEASE_LOST" });
+    expect(await svcA.withLease(la, fn, OPTS)).toEqual({ ok: false, reason: "LEASE_LOST" });
+    expect(fn).not.toHaveBeenCalled();
+    expect(await svcA.release(la, COMPLETED, OPTS)).toEqual({ released: false, reason: "LEASE_LOST" });
+    expect(await lockRow()).toEqual(held); // A nunca modifica el lease de B
+    expect(await runStatus(la.runId)).toBe("ABANDONED");
+    expect(await svcB.renew(rb.lease, OPTS)).toMatchObject({ ok: true });
+  });
+
+  it("I1: la renovación de A espera tras una transacción que solo RETIENE el lock (como recoverAbandoned); si el lease caduca durante la espera, falla", async () => {
+    const { a: svcA } = await leaseSvc();
+    const la = await acquiredBy(svcA);
+    await app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "heartbeatAt" = (clock_timestamp() AT TIME ZONE 'UTC'),
+      "leaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + interval '1500 milliseconds'`); // vence en 1,5 s
+    const h = await hold();
+    const pRenew = svcA.renew(la, OPTS);
+    await waitForLockWaiters(1);
+    // Se espera (condición, no un sleep fijo) a que el reloj de PostgreSQL supere la expiración mientras A espera.
+    for (let end = Date.now() + 10_000; ; ) {
+      const [r] = await monitor.$queryRaw<{ expired: boolean }[]>`SELECT "leaseExpiresAt" <= (clock_timestamp() AT TIME ZONE 'UTC') AS expired FROM "MediaReconcileLock"`;
+      if (r!.expired) break;
+      if (Date.now() > end) throw new Error("el lease no llegó a caducar");
+      await new Promise((r2) => setTimeout(r2, 50));
+    }
+    expect(await settled(pRenew)).toBe(false); // sigue esperando el bloqueo
+    const before = await lockRow();
+    await h.release();
+    expect(await pRenew).toEqual({ ok: false, reason: "LEASE_LOST" }); // la vigencia se comprobó DESPUÉS de obtener el bloqueo
+    expect(await lockRow()).toEqual(before);
+    expect(await runStatus(la.runId)).toBe("RUNNING");
+  });
+
+  it("adquisición de B y renovación de A concurrentes tras la caducidad: se serializan; B adquiere y A no renueva (en cualquier orden)", async () => {
+    const { a: svcA, b: svcB } = await leaseSvc();
+    const la = await acquiredBy(svcA);
+    await expireNow();
+    const h = await hold();
+    const pB = svcB.acquire(OPTS);
+    await waitForLockWaiters(1);
+    const pA = svcA.renew(la, OPTS);
+    await waitForLockWaiters(2); // las dos esperan a la vez la misma fila
+    await h.release();
+    const [rb, ra] = await Promise.all([pB, pA]);
+    expect(rb).toMatchObject({ status: "ACQUIRED" });
+    expect(ra).toEqual({ ok: false, reason: "LEASE_LOST" });
+    if (rb.status !== "ACQUIRED") return;
+    expect(await lockRow()).toMatchObject({ holderRunId: rb.lease.runId, fencingToken: la.fencingToken + 1 });
+    expect(await runStatus(la.runId)).toBe("ABANDONED");
+  });
+
+  it("recoverAbandoned concurrente con acquire: nunca abandona la ejecución recién adquirida (en cualquier orden)", async () => {
+    const { a: svcA, b: svcB } = await leaseSvc();
+    const la = await acquiredBy(svcA);
+    await expireNow();
+    const h = await hold();
+    const pB = svcB.acquire(OPTS);
+    await waitForLockWaiters(1);
+    const pR = svcA.recoverAbandoned(OPTS);
+    await waitForLockWaiters(2);
+    await h.release();
+    const [rb] = await Promise.all([pB, pR]);
+    expect(rb).toMatchObject({ status: "ACQUIRED" });
+    if (rb.status !== "ACQUIRED") return;
+    expect(await runStatus(rb.lease.runId)).toBe("RUNNING"); // la nueva dueña sigue RUNNING
+    expect(await runStatus(la.runId)).toBe("ABANDONED");
+    expect(await lockRow()).toMatchObject({ holderRunId: rb.lease.runId });
+    expect(await monitor.mediaReconcileRun.count({ where: { status: "RUNNING" } })).toBe(1);
+    expect(await svcB.renew(rb.lease, OPTS)).toMatchObject({ ok: true });
+  });
+
+  it.each([
+    ["vigente", false],
+    ["caducado", true],
+  ])("release concurrente con acquire (lease %s): el lock y las ejecuciones quedan siempre coherentes", async (_n, expired) => {
+    const { a: svcA, b: svcB } = await leaseSvc();
+    const la = await acquiredBy(svcA);
+    if (expired) await expireNow();
+    const h = await hold();
+    const pRel = svcA.release(la, COMPLETED, OPTS);
+    await waitForLockWaiters(1);
+    const pB = svcB.acquire(OPTS);
+    await waitForLockWaiters(2);
+    await h.release();
+    const [rel, rb] = await Promise.all([pRel, pB]);
+    const lk = await lockRow();
+    const aStatus = await runStatus(la.runId);
+    if (rel.released) {
+      expect(aStatus).toBe("COMPLETED"); // liberación y cierre juntos
+    } else {
+      expect(rel).toEqual({ released: false, reason: "LEASE_LOST" }); // B entró antes con el lease caducado
+      expect(expired).toBe(true);
+      expect(aStatus).toBe("ABANDONED");
+    }
+    if (rb.status === "ACQUIRED") {
+      expect(lk).toMatchObject({ holderRunId: rb.lease.runId, fencingToken: la.fencingToken + 1 });
+      expect(await runStatus(rb.lease.runId)).toBe("RUNNING");
+    } else {
+      expect(rb).toEqual({ status: "BUSY", reason: "LEASE_HELD" }); // B entró antes con el lease vigente
+      expect(lk).toMatchObject({ holderRunId: null, leaseExpiresAt: null });
+    }
+    const running = await monitor.mediaReconcileRun.findMany({ where: { status: "RUNNING" }, select: { id: true } });
+    expect(running.map((r) => r.id)).toEqual(lk.holderRunId ? [lk.holderRunId] : []); // ninguna RUNNING sin lease
+  });
+
+  it("dos adquisiciones que esperan A LA VEZ la fila del lock libre: exactamente una lo obtiene (10 rondas con solapamiento garantizado)", async () => {
+    const { a: svcA, b: svcB } = await leaseSvc();
+    for (let round = 0; round < 10; round++) {
+      await app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "holderRunId" = NULL, "leaseExpiresAt" = NULL`);
+      const h = await hold();
+      const pa = svcA.acquire(OPTS);
+      const pb = svcB.acquire(OPTS);
+      await waitForLockWaiters(2); // solapamiento demostrado: ambas esperan la fila
+      await h.release();
+      const rs = await Promise.all([pa, pb]);
+      expect(rs.filter((r) => r.status === "ACQUIRED")).toHaveLength(1);
+      expect(rs.filter((r) => r.status === "BUSY")).toEqual([{ status: "BUSY", reason: "LEASE_HELD" }]);
+      const won = rs.find((r) => r.status === "ACQUIRED")!;
+      if (won.status !== "ACQUIRED") return;
+      expect(await lockRow()).toMatchObject({ holderRunId: won.lease.runId, fencingToken: round + 1 });
+    }
+    expect(await monitor.mediaReconcileRun.count({ where: { status: "RUNNING" } })).toBe(1);
+  });
+
+  it("mientras A retiene el lock con su lease VIGENTE, B espera y, al entrar, obtiene BUSY (el lease sigue siendo de A)", async () => {
+    const { a: svcA, b: svcB } = await leaseSvc();
+    const la = await acquiredBy(svcA);
+    const inside = gate(); const done = gate();
+    const pA = svcA.withLease(la, async () => { inside.open(); await done.wait; return "A"; }, OPTS);
+    await reached(inside, pA);
+    const pB = svcB.acquire(OPTS);
+    await waitForLockWaiters(1);
+    expect(await settled(pB)).toBe(false);
+    done.open();
+    await pA;
+    expect(await pB).toEqual({ status: "BUSY", reason: "LEASE_HELD" });
+    expect(await lockRow()).toMatchObject({ holderRunId: la.runId, fencingToken: la.fencingToken });
+    expect(await monitor.mediaReconcileRun.count()).toBe(1);
+  });
+
+  describe("tiempos de espera: LOCK_TIMEOUT, nunca un falso LEASE_LOST", () => {
+    it("acquire, renew y release esperando la fila del lock más que su lock_timeout → LOCK_TIMEOUT y nada cambia", async () => {
+      const { a: svcA, b: svcB } = await leaseSvc();
+      const la = await acquiredBy(svcA);
+      const h = await hold();
+      const before = await lockRow();
+      const short = { ...OPTS, lockTimeoutMs: 300 };
+      expect(await svcB.acquire(short)).toEqual({ status: "BUSY", reason: "LOCK_TIMEOUT" });
+      expect(await svcA.renew(la, short)).toEqual({ ok: false, reason: "LOCK_TIMEOUT" });
+      expect(await svcA.release(la, COMPLETED, short)).toEqual({ released: false, reason: "LOCK_TIMEOUT" });
+      await expect(svcA.recoverAbandoned(short)).rejects.toMatchObject({ name: "MediaLeaseError", code: "LOCK_TIMEOUT" });
+      await h.release();
+      expect(await lockRow()).toEqual(before);
+      expect(await runStatus(la.runId)).toBe("RUNNING");
+      expect(await svcA.renew(la, OPTS)).toMatchObject({ ok: true }); // el lease no se había perdido
+    });
+
+    it("un lock_timeout DENTRO de la operación protegida no es LEASE_LOST: error controlado y la renovación se deshace", async () => {
+      const { a: svcA } = await leaseSvc();
+      const la = await acquiredBy(svcA);
+      const u = await newUser();
+      const h = await hold(`SELECT 1 FROM "User" WHERE "id" = '${u.id}' FOR UPDATE`); // fila de datos ocupada por otro
+      const before = await lockRow();
+      const err = await svcA.withLease(la, async (tx) => tx.$queryRaw`SELECT 1 FROM "User" WHERE "id" = ${u.id} FOR UPDATE`, { ...OPTS, lockTimeoutMs: 300 })
+        .then(() => null, (e: Error) => e);
+      await h.release();
+      expect(err).toMatchObject({ name: "MediaLeaseError", code: "LOCK_TIMEOUT", message: "Lease del reconciliador: LOCK_TIMEOUT" });
+      expect(await lockRow()).toEqual(before); // la renovación de esa transacción se deshizo
+      expect(await svcA.renew(la, OPTS)).toMatchObject({ ok: true }); // el lease sigue siendo de A
+    });
+  });
+
+  it("no usa el reloj de Node: con la hora del sistema en 2099, el lease se calcula con el reloj de PostgreSQL", async () => {
+    const { a: svcA } = await leaseSvc();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2099-01-01T00:00:00Z"));
+    let r: Awaited<ReturnType<typeof svcA.acquire>>;
+    try { r = await svcA.acquire(OPTS); } finally { vi.useRealTimers(); }
+    if (r.status !== "ACQUIRED") throw new Error("no adquirió");
+    const [row] = await monitor.$queryRaw<{ now: Date }[]>`SELECT (clock_timestamp() AT TIME ZONE 'UTC') AS now`;
+    const now = row!.now;
+    expect(r.lease.leaseExpiresAt.getUTCFullYear()).not.toBe(2099);
+    expect(Math.abs(r.lease.leaseExpiresAt.getTime() - (now.getTime() + 60_000))).toBeLessThan(10_000);
+  });
+});
