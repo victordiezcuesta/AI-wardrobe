@@ -1,10 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
-import path from "node:path";
 import pg from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/generated/prisma/client";
 import { prismaProxy, setTestEnv } from "../helpers/mock-prisma";
+import { applyMigrations, listMigrations } from "../helpers/migrations";
 
 /**
  * Concurrencia REAL entre transacciones: PostgreSQL de verdad con varias conexiones independientes (PGlite no sirve:
@@ -65,8 +64,7 @@ beforeAll(async () => {
   url.pathname = `/${dbName}`;
   const setup = new pg.Client({ connectionString: url.toString() });
   await setup.connect();
-  await setup.query(readFileSync(path.join(process.cwd(), "prisma/migrations/0001_init/migration.sql"), "utf8"));
-  await setup.end();
+  try { await applyMigrations((sql) => setup.query(sql), listMigrations()); } finally { await setup.end(); }
   app = client(url.toString(), 4);
   other = client(url.toString(), 1);
   monitor = client(url.toString(), 1);
