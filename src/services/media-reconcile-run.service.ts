@@ -6,6 +6,7 @@ import { MediaLeaseError, mediaLeaseService, type AcquiredLease, type Finished, 
 import {
   DEFAULT_GRACE_MS, detectOrphanMediaDetailed, type DetailedDetection, type MediaReconcileReport,
 } from "@/services/media-reconcile.service";
+import { createMediaRetention, emptyRetentionResult, type MediaRetention, type RetentionResult } from "@/services/media-retention.service";
 
 /**
  * Fase 19.7 — orquestador de la reconciliación de medios: lease → detección detallada → persistencia atómica → cierre.
@@ -65,6 +66,15 @@ export const LEASE_OP_SLACK_MS = 2_000;
 export const LEASE_OP_MAX_MS = LEASE_TX_MAX_WAIT_MS + LEASE_TX_TIMEOUT_MS + LEASE_OP_SLACK_MS;
 export const DETECT_OVERRUN_MS = 5_000;
 export const TIME_EXHAUSTED = "budget/TIME_EXHAUSTED";
+/**
+ * Retención (fase 19.8a, DRY_RUN) justo tras acquire, SOLO con el tiempo que sobra: presupuesto
+ * R = min(20 s, HARD_DEADLINE − transcurrido − (DETECT_BUDGET + DETECT_OVERRUN) − 2 · LEASE_OP_MAX). Con acquire
+ * normal, R ≈ 20 s (290 − 185 − 84 = 21) y la detección conserva sus 180 s; si acquire tardó más de ~9 s, R < 12 s (un
+ * lote no cabe) y la retención se omite. Nunca consume lo reservado para la detección ni para el cierre.
+ * Cada lote renueva el lease (TTL 360 s): si la función muere, la recuperación puede tardar hasta 360 s desde la ÚLTIMA
+ * renovación (C8).
+ */
+export const RETENTION_MAX_BUDGET_MS = 20_000;
 /** Restricciones de errorCodes en media-lease.service (checkCodes). */
 export const MAX_ERROR_CODES = 64;
 export const MAX_ERROR_CODE_LENGTH = 120;
@@ -87,7 +97,9 @@ export interface RunnerDeps {
   lease: Pick<MediaLeaseService, "acquire" | "finishWith" | "release">;
   detect: (opts: { now: Date; graceMs: number; budgetMs: number; queryBudgetMs: number }) => Promise<DetailedDetection>;
   persist: typeof persistMediaCandidates;
-  /** Reloj LOCAL solo para el presupuesto de reintentos (inyectable en pruebas). */
+  /** Retención DRY_RUN (opcional: sin ella no se ejecuta). */
+  retention?: Pick<MediaRetention, "run">;
+  /** Reloj LOCAL solo para el presupuesto (inyectable en pruebas). */
   clock?: () => number;
   codeVersion?: string | null;
 }
@@ -131,7 +143,9 @@ export function classifyFailure(err: unknown, stage: "detect" | "persist"): stri
   return `${stage}/INTERNAL`;
 }
 
-const summaryOf = (report: MediaReconcileReport | null) => (report ? { report } : {}) as unknown as Prisma.InputJsonValue;
+/** Summary AGREGADO de la ejecución: informe del detector y recuentos de retención (sin identificadores). */
+const summaryOf = (report: MediaReconcileReport | null, retention: RetentionResult | null) =>
+  ({ ...(report ? { report } : {}), ...(retention ? { retention } : {}) }) as unknown as Prisma.InputJsonValue;
 
 export function createMediaReconcileRunner(deps: RunnerDeps) {
   const clock = deps.clock ?? (() => Date.now());
@@ -147,14 +161,15 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
       if (acquired.status === "BUSY") return { outcome: "BUSY", reason: acquired.reason };
       const lease: AcquiredLease = acquired.lease;
       const startedAt = lease.startedAt; // reloj de PostgreSQL: el único instante de referencia de esta ejecución
+      let retention: RetentionResult | null = null;
 
       /**
        * Cierre sin persistencia (INCOMPLETE/FAILED): como máximo un reintento acotado si release no lo consigue. Ningún
        * intento empieza si su cota no cabe antes de HARD_DEADLINE_MS (entonces se añade budget/TIME_EXHAUSTED).
        */
       const close = async (kind: RunOutcomeKind, outcome: RunOutcome, report: MediaReconcileReport | null): Promise<MediaReconcileRunResult> => {
-        let codes = normalizeErrorCodes(outcome.errorCodes ?? []);
-        const args: RunOutcome = { ...outcome, errorCodes: codes, summary: summaryOf(report) };
+        let codes = normalizeErrorCodes([...(outcome.errorCodes ?? []), ...(retention?.errorCodes ?? [])]);
+        const args: RunOutcome = { ...outcome, errorCodes: codes, summary: summaryOf(report, retention) };
         let finalized = false;
         for (let attempt = 0; attempt < 2; attempt++) {
           if (!fits(LEASE_OP_MAX_MS)) { codes = normalizeErrorCodes([...codes, TIME_EXHAUSTED]); break; }
@@ -168,7 +183,22 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
         return { outcome: kind, finalized, report, persisted: null, errorCodes: codes };
       };
 
-      // ── 2. Detección (inventario + lecturas acotados) ────────────────────────────────────────────────────────────
+      // ── 2. Retención DRY_RUN (solo el tiempo sobrante; nunca el de la detección ni el del cierre) ──────────────────
+      if (deps.retention) {
+        const budgetMs = Math.min(RETENTION_MAX_BUDGET_MS,
+          HARD_DEADLINE_MS - (clock() - t0) - DETECT_BUDGET_MS - DETECT_OVERRUN_MS - 2 * LEASE_OP_MAX_MS);
+        try {
+          retention = await deps.retention.run(lease, { budgetMs: Math.max(0, budgetMs), ttlMs: LEASE_TTL_MS, graceHours: GRACE_HOURS, clock });
+        } catch {
+          retention = emptyRetentionResult("STOPPED", ["retention/INTERNAL"]); // nunca detiene la reconciliación
+        }
+        // Lease perdido: finishWith fallaría igual; se detiene toda la ejecución protegida sin detectar.
+        if (retention.status === "LEASE_LOST") {
+          return close("LEASE_LOST", { status: "FAILED", inventoryComplete: false, errorCodes: ["lease/LEASE_LOST"] }, null);
+        }
+      }
+
+      // ── 3. Detección (inventario + lecturas acotados) ────────────────────────────────────────────────────────────
       // Se reserva el tiempo del cierre (finishWith + un release tras su posible fallo). Si acquire tardó, el inventario
       // se acorta; las lecturas conservan sus 30 s. Sin un inventario mínimo, no se empieza.
       const detectAvailable = HARD_DEADLINE_MS - (clock() - t0) - 2 * LEASE_OP_MAX_MS - DETECT_OVERRUN_MS;
@@ -184,7 +214,7 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
       }
       const { report } = detection;
 
-      // ── 3. Incompleta: nunca se persiste ─────────────────────────────────────────────────────────────────────────
+      // ── 4. Incompleta: nunca se persiste ─────────────────────────────────────────────────────────────────────────
       if (report.complete !== true) {
         return close("INCOMPLETE", { status: "INCOMPLETE", inventoryComplete: report.inventoryStatus === "COMPLETE", errorCodes: reportErrorCodes(report) }, report);
       }
@@ -192,8 +222,9 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
         return close("FAILED", { status: "FAILED", inventoryComplete: true, errorCodes: ["persist/TOO_MANY_CANDIDATES"] }, report);
       }
 
-      // ── 4. Persistencia + cierre COMPLETED atómicos ─────────────────────────────────────────────────────────────
+      // ── 5. Persistencia + cierre COMPLETED atómicos ─────────────────────────────────────────────────────────────
       const persistIn = (tx: Prisma.TransactionClient) => deps.persist(tx, { runId: lease.runId, startedAt, detection });
+      const retentionCodes = normalizeErrorCodes(retention?.errorCodes ?? []);
       let lockTimeouts = 0;
       for (;;) {
         // finishWith solo empieza si, además, cabe el release que lo seguiría si falla.
@@ -202,12 +233,12 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
         }
         let finished: Finished<PersistSummary>;
         try {
-          finished = await deps.lease.finishWith(lease, { summary: summaryOf(report), errorCodes: [] }, persistIn, { lockTimeoutMs: LOCK_TIMEOUT_MS });
+          finished = await deps.lease.finishWith(lease, { summary: summaryOf(report, retention), errorCodes: retentionCodes }, persistIn, { lockTimeoutMs: LOCK_TIMEOUT_MS });
         } catch (err) {
           // La transacción de finishWith ya se deshizo entera (ni filas, ni cierre, ni liberación).
           return close("FAILED", { status: "FAILED", inventoryComplete: true, errorCodes: [classifyFailure(err, "persist")] }, report);
         }
-        if (finished.ok) return { outcome: "COMPLETED", finalized: true, report, persisted: finished.value, errorCodes: [] };
+        if (finished.ok) return { outcome: "COMPLETED", finalized: true, report, persisted: finished.value, errorCodes: retentionCodes };
         if (finished.reason === "LEASE_LOST") {
           return close("LEASE_LOST", { status: "FAILED", inventoryComplete: true, errorCodes: ["lease/LEASE_LOST"] }, report);
         }
@@ -227,5 +258,6 @@ export const mediaReconcileRunner: MediaReconcileRunner = createMediaReconcileRu
   lease: mediaLeaseService,
   detect: (opts) => detectOrphanMediaDetailed(opts),
   persist: persistMediaCandidates,
+  retention: createMediaRetention({ lease: mediaLeaseService }),
   codeVersion: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 64) || null,
 });

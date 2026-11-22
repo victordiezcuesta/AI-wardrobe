@@ -76,6 +76,11 @@ export type Finished<T> = { ok: true; value: T; finishedAt: Date } | LeaseLost |
 type Tx = Prisma.TransactionClient;
 type Db = PrismaClient;
 interface Opts { ttlMs?: number; lockTimeoutMs?: number }
+/**
+ * Solo withLease/renew (fase 19.8a): espera máxima para empezar la transacción y duración máxima de la transacción de
+ * Prisma. Opcionales y acotados por los valores de TX; sin ellos, exactamente TX (comportamiento anterior).
+ */
+interface TxOpts { maxWaitMs?: number; timeoutMs?: number }
 
 const LOST: LeaseLost = { ok: false, reason: "LEASE_LOST" };
 const LOCK_TIMEOUT: LockTimeout = { ok: false, reason: "LOCK_TIMEOUT" };
@@ -120,6 +125,16 @@ const isLockTimeout = (e: unknown): boolean => {
   return cause?.kind === "postgres" && (cause.originalCode === "55P03" || cause.code === "55P03");
 };
 const TX = { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10_000, timeout: 30_000 } as const;
+/** Opciones de transacción de withLease: TX, o valores menores validados (1 ms … el de TX). */
+function txOf(opts: TxOpts): typeof TX | { isolationLevel: typeof TX.isolationLevel; maxWait: number; timeout: number } {
+  if (opts.maxWaitMs === undefined && opts.timeoutMs === undefined) return TX;
+  const bounded = (v: number | undefined, max: number) => {
+    if (v === undefined) return max;
+    if (!Number.isSafeInteger(v) || v < 1 || v > max) throw new MediaLeaseError("INVALID_ARGUMENT");
+    return v;
+  };
+  return { isolationLevel: TX.isolationLevel, maxWait: bounded(opts.maxWaitMs, TX.maxWait), timeout: bounded(opts.timeoutMs, TX.timeout) };
+}
 
 export function createMediaLease(db: Db) {
   /** Bloquea la fila del lock hasta el final de `tx` (aquí es donde se espera). false si la fila no existe. */
@@ -165,10 +180,11 @@ export function createMediaLease(db: Db) {
    * siendo suyo, ejecuta `fn` con esa misma transacción. La fila del lock queda bloqueada hasta el final: ninguna
    * adquisición puede colarse entre la comprobación y las escrituras. Orden: lock → filas de datos.
    */
-  async function withLease<T>(lease: MediaLease, fn: (tx: Tx) => Promise<T>, opts: Opts = {}): Promise<Protected<T>> {
+  async function withLease<T>(lease: MediaLease, fn: (tx: Tx) => Promise<T>, opts: Opts & TxOpts = {}): Promise<Protected<T>> {
     checkLease(lease);
     const ttlMs = ttlOf(opts.ttlMs);
     const lockTimeoutMs = lockTimeoutOf(opts.lockTimeoutMs);
+    const txOpts = txOf(opts);
     let phase: "lock" | "fn" = "lock";
     try {
       return await db.$transaction(async (tx) => {
@@ -177,7 +193,7 @@ export function createMediaLease(db: Db) {
         if (!leaseExpiresAt) throw new LeaseLostSignal();
         phase = "fn";
         return { ok: true as const, value: await fn(tx), leaseExpiresAt };
-      }, TX);
+      }, txOpts);
     } catch (e) {
       if (e instanceof LeaseLostSignal) return LOST;
       if (isLockTimeout(e)) {

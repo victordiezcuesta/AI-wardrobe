@@ -285,3 +285,40 @@ describe("ruta /api/cron/media-reconcile/run y contrato del endpoint antiguo", (
     expect(await lock()).toMatchObject({ holderRunId: null, fencingToken: 0 });
   });
 });
+
+describe("retención DRY_RUN (19.8a) en la orquestación real", () => {
+  /** Fila CLEARED de hace 60 días (eliminable por la regla de 30 d) con su ejecución terminada hace 400 días. */
+  async function oldCleared() {
+    const [r] = await t.prisma.$queryRawUnsafe<{ id: string }[]>(`INSERT INTO "MediaReconcileRun"
+      ("id", "status", "fencingToken", "startedAt", "heartbeatAt", "finishedAt", "complete", "inventoryComplete", "graceHours", "updatedAt")
+      VALUES (gen_random_uuid()::text, 'COMPLETED', 1, now() - interval '401 days', now() - interval '401 days', now() - interval '400 days', true, true, 24, now())
+      RETURNING "id"`);
+    await t.prisma.$executeRawUnsafe(`INSERT INTO "MediaAsset" ("id", "publicId", "delivery", "kind", "ownerUserId", "assetId", "resourceCreatedAt",
+        "state", "firstCandidateAt", "lastCandidateAt", "firstCandidateRunId", "lastCandidateRunId", "sightings", "ownerMissing", "createdAt", "updatedAt")
+      VALUES ('viejo', 'ai-wardrobe/antiguo/wardrobe/v', 'UPLOAD', 'WARDROBE', 'antiguo', 'as-v', now() - interval '400 days',
+        'CLEARED', now() - interval '60 days', now() - interval '60 days', '${r!.id}', '${r!.id}', 1, false, now(), now())`);
+  }
+  const summaryOf = async (outcome: string) => ((await runs()).filter((r) => r.status === outcome).at(-1)!.summary as { retention?: Record<string, unknown> });
+
+  it("COMPLETED: los recuentos DRY_RUN se guardan en el summary; NADA se borra; la respuesta HTTP mantiene sus claves", async () => {
+    await oldCleared();
+    await scenario();
+    const r = await call(`Bearer ${CRON_SECRET}`);
+    expect(r.status).toBe(200);
+    expect(Object.keys(await r.json() as object).sort()).toEqual(["errorCodes", "finalized", "outcome", "persisted", "report"]);
+    const s = await summaryOf("COMPLETED");
+    expect(s.retention).toMatchObject({ mode: "DRY_RUN", status: "DONE", assets: { eligible: 1, byRule: { CLEARED: 1 } }, errorCodes: [] });
+    expect(JSON.stringify(s.retention)).not.toMatch(/ai-wardrobe|antiguo|viejo/);
+    expect(await t.prisma.mediaAsset.findUnique({ where: { id: "viejo" } })).not.toBeNull(); // DRY_RUN: no se borra
+    expect(await t.prisma.mediaReconcileRun.count()).toBe(2);
+  });
+
+  it("detección INCOMPLETE → los recuentos de retención se conservan en el summary del cierre", async () => {
+    await oldCleared();
+    await scenario();
+    admin.pages.authenticated = [new Error("fallo")];
+    expect(await (await runner()).run()).toMatchObject({ outcome: "INCOMPLETE", finalized: true });
+    expect((await summaryOf("INCOMPLETE")).retention).toMatchObject({ mode: "DRY_RUN", status: "DONE", assets: { eligible: 1 } });
+    expect(await t.prisma.mediaAsset.findUnique({ where: { id: "viejo" } })).not.toBeNull();
+  });
+});

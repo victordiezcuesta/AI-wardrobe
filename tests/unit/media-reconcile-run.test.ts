@@ -39,9 +39,14 @@ function report(over: Record<string, unknown> = {}) {
 }
 const candidate = { publicId: SECRET_PUBLIC_ID, delivery: "upload", kind: "wardrobe", ownerUserId: "user-secret-42", ownerMissing: false,
   assetId: "asset-secreto", version: 1, bytes: 1, format: "jpg", resourceCreatedAt: new Date("2026-01-01T00:00:00Z") } as const;
+const RETENTION_DONE = {
+  mode: "DRY_RUN", status: "DONE", errorCodes: [] as string[],
+  assets: { eligible: 3, batches: 1, complete: true, byRule: { CLEARED: 3, CLEARED_OWNER_MISSING: 0, ACTIVE_OWNER_MISSING: 0, ACTIVE: 0 } },
+  runs: { eligible: 1, batches: 1, complete: true, byStatus: { COMPLETED: 1, INCOMPLETE: 0, FAILED: 0, ABANDONED: 0 } },
+};
 const SUMMARY = { created: 1, reset: 0, observed: 0, confirmed: 0, unchanged: 0, cleared: 0, ownerMissing: 0, skippedOwnerDeleted: 0 };
 
-function setup(over: { detection?: unknown; finish?: unknown[]; release?: unknown[]; acquire?: unknown; detectError?: unknown; clock?: () => number } = {}) {
+function setup(over: { detection?: unknown; finish?: unknown[]; release?: unknown[]; acquire?: unknown; detectError?: unknown; clock?: () => number; retention?: unknown } = {}) {
   const tx = { marker: "tx" };
   const finishQueue = [...(over.finish ?? [{ ok: true, value: SUMMARY, finishedAt: new Date() }])];
   const releaseQueue = [...(over.release ?? [{ released: true, runFinalized: true }])];
@@ -65,6 +70,7 @@ function setup(over: { detection?: unknown; finish?: unknown[]; release?: unknow
     }),
     persist: vi.fn(async (t: unknown, input: unknown) => { calls.persist.push({ t, input }); return SUMMARY; }) as never,
     clock: over.clock,
+    retention: over.retention as never,
   };
   return { runner: m.createMediaReconcileRunner(deps as never), deps, calls, tx };
 }
@@ -221,7 +227,7 @@ describe("M1: presupuesto temporal con reloj simulado (ninguna operación empiez
    * Banco determinista: cada dependencia avanza un reloj simulado lo que se le indica (por defecto, su cota máxima) y
    * registra cuándo empezó y terminó. Nada espera de verdad.
    */
-  function timed(o: { acquireMs?: number; detect?: "complete" | "incomplete" | "throw"; finish?: Step[]; release?: Step[] }) {
+  function timed(o: { acquireMs?: number; detect?: "complete" | "incomplete" | "throw"; finish?: Step[]; release?: Step[]; retention?: boolean }) {
     let now = 1_000_000; const t0 = now;
     const ops: { op: string; start: number; end: number }[] = [];
     const take = async <T,>(op: string, ms: number, v: () => T | Promise<T>) => {
@@ -231,6 +237,7 @@ describe("M1: presupuesto temporal con reloj simulado (ninguna operación empiez
     const nextFinish = queue(o.finish ?? [{ res: { ok: true, value: SUMMARY, finishedAt: new Date() }, ms: m.LEASE_OP_MAX_MS }]);
     const nextRelease = queue(o.release ?? [{ res: { released: true, runFinalized: true }, ms: m.LEASE_OP_MAX_MS }]);
     const budgets: { budgetMs: number; queryBudgetMs: number }[] = [];
+    const retentionBudgets: number[] = [];
     const deps = {
       clock: () => now,
       lease: {
@@ -247,8 +254,15 @@ describe("M1: presupuesto temporal con reloj simulado (ninguna operación empiez
         });
       },
       persist: async () => SUMMARY,
+      // Peor caso de la retención: consume TODO su presupuesto si cabe un lote (12 s); si no, se omite al instante.
+      retention: o.retention ? {
+        run: async (_l: unknown, opts: { budgetMs: number }) => {
+          retentionBudgets.push(opts.budgetMs);
+          return take("retention", opts.budgetMs >= 12_000 ? opts.budgetMs : 0, () => RETENTION_DONE);
+        },
+      } : undefined,
     };
-    return { runner: m.createMediaReconcileRunner(deps as never), ops, budgets };
+    return { runner: m.createMediaReconcileRunner(deps as never), ops, budgets, retentionBudgets };
   }
   const LT = (ms = m.LEASE_OP_MAX_MS) => ({ res: { ok: false, reason: "LOCK_TIMEOUT" }, ms });
   const RLT = (ms = m.LEASE_OP_MAX_MS) => ({ res: { released: false, reason: "LOCK_TIMEOUT" }, ms });
@@ -322,6 +336,109 @@ describe("M1: presupuesto temporal con reloj simulado (ninguna operación empiez
     }
     expect(combos).toBe(5 * 3 * 6 * 4);
   });
+
+  it("retención: con acquire normal recibe 20 s y aun consumiéndolos enteros la detección conserva 150 s de inventario", async () => {
+    const { runner, ops, budgets, retentionBudgets } = timed({ acquireMs: 100, retention: true });
+    expect(await runner.run()).toMatchObject({ outcome: "COMPLETED" });
+    expect(retentionBudgets).toEqual([m.RETENTION_MAX_BUDGET_MS]);
+    expect(budgets[0]).toMatchObject({ budgetMs: m.INVENTORY_BUDGET_MS, queryBudgetMs: m.QUERY_BUDGET_MS });
+    expect(ops.map((x) => x.op)).toEqual(["acquire", "retention", "detect", "finishWith"]);
+    expectWithinBudget(ops);
+  });
+
+  it("retención: solo recibe el tiempo sobrante (acquire de 5 s → 16 s; de 10 s → 11 s, no cabe un lote y no consume nada)", async () => {
+    const five = timed({ acquireMs: 5_000, retention: true });
+    await five.runner.run();
+    expect(five.retentionBudgets).toEqual([290_000 - 5_000 - 185_000 - 84_000]);
+    expect(five.budgets[0]).toMatchObject({ budgetMs: m.INVENTORY_BUDGET_MS }); // la detección no se recorta
+    const ten = timed({ acquireMs: 10_000, retention: true });
+    await ten.runner.run();
+    expect(ten.retentionBudgets).toEqual([11_000]);
+    expect(ten.ops.find((x) => x.op === "retention")).toMatchObject({ start: 10_000, end: 10_000 });
+    expect(ten.budgets[0]).toMatchObject({ budgetMs: m.INVENTORY_BUDGET_MS });
+  });
+
+  it("con la retención agotando su presupuesto, todas las combinaciones siguen terminando antes de 290 s", async () => {
+    const OK_F = { res: { ok: true, value: SUMMARY, finishedAt: new Date() }, ms: m.LEASE_OP_MAX_MS };
+    let combos = 0;
+    for (const acquireMs of [0, 5_000, 9_000, 20_000, 42_000]) {
+      for (const detect of ["complete", "incomplete", "throw"] as const) {
+        for (const finish of [[OK_F], [LT(12_000), OK_F], [{ res: new Error("x"), ms: m.LEASE_OP_MAX_MS }]] as Step[][]) {
+          for (const release of [[RLT(), RLT()], [{ res: { released: true, runFinalized: true }, ms: m.LEASE_OP_MAX_MS }]] as Step[][]) {
+            const { runner, ops } = timed({ acquireMs, detect, finish, release, retention: true });
+            await runner.run();
+            expectWithinBudget(ops);
+            const ret = ops.find((x) => x.op === "retention")!;
+            expect(ret.end - ret.start).toBeLessThanOrEqual(m.RETENTION_MAX_BUDGET_MS);
+            combos++;
+          }
+        }
+      }
+    }
+    expect(combos).toBe(5 * 3 * 3 * 2);
+  });
+});
+
+describe("retención DRY_RUN (19.8a) dentro del orquestador", () => {
+  const retentionOf = (result: unknown) => {
+    const calls: unknown[][] = [];
+    return { calls, dep: { run: vi.fn(async (...a: unknown[]) => { calls.push(a); if (result instanceof Error) throw result; return result; }) } };
+  };
+  const summaryArg = (args: unknown[]) => (args[1] as { summary: { retention?: unknown; report?: unknown } }).summary;
+
+  it("se ejecuta tras acquire y ANTES de la detección, con el lease, 20 s, TTL 360 s y GRACE_HOURS; el resultado va al summary", async () => {
+    const r = retentionOf(RETENTION_DONE);
+    const order: string[] = [];
+    const { runner, deps, calls } = setup({ retention: r.dep });
+    deps.detect.mockImplementationOnce(async () => { order.push("detect"); return { report: report(), candidates: [candidate] } as never; });
+    r.dep.run.mockImplementationOnce(async (...a: unknown[]) => { order.push("retention"); r.calls.push(a); return RETENTION_DONE; });
+    const res = await runner.run();
+    expect(order).toEqual(["retention", "detect"]);
+    expect(r.calls[0]![0]).toBe(LEASE);
+    expect(r.calls[0]![1]).toMatchObject({ budgetMs: m.RETENTION_MAX_BUDGET_MS, ttlMs: 360_000, graceHours: m.GRACE_HOURS });
+    expect(res).toMatchObject({ outcome: "COMPLETED", errorCodes: [] });
+    expect(summaryArg(calls.finish[0]!)).toEqual({ report: report(), retention: RETENTION_DONE });
+    expect(calls.finish[0]![1]).toMatchObject({ errorCodes: [] });
+  });
+
+  it("error de retención (STOPPED) → la detección continúa; el código queda en errorCodes de la ejecución y del resultado", async () => {
+    const stopped = { ...RETENTION_DONE, status: "STOPPED", errorCodes: ["retention/DEADLOCK"] };
+    const { runner, deps, calls } = setup({ retention: retentionOf(stopped).dep });
+    const res = await runner.run();
+    expect(deps.detect).toHaveBeenCalledTimes(1);
+    expect(res).toMatchObject({ outcome: "COMPLETED", finalized: true, errorCodes: ["retention/DEADLOCK"] });
+    expect(calls.finish[0]![1]).toMatchObject({ errorCodes: ["retention/DEADLOCK"], summary: { retention: stopped } });
+  });
+
+  it("la retención lanza (inesperado) → STOPPED retention/INTERNAL y la detección continúa", async () => {
+    const { runner, deps } = setup({ retention: retentionOf(new Error("ai-wardrobe/u/x")).dep });
+    const res = await runner.run();
+    expect(deps.detect).toHaveBeenCalledTimes(1);
+    expect(res).toMatchObject({ outcome: "COMPLETED", errorCodes: ["retention/INTERNAL"] });
+    expect(JSON.stringify(res)).not.toMatch(/ai-wardrobe/);
+  });
+
+  it("LEASE_LOST en la retención → se detiene TODA la ejecución: sin detección ni finishWith; cierre FAILED con los dos códigos", async () => {
+    const lost = { ...RETENTION_DONE, status: "LEASE_LOST", errorCodes: ["retention/LEASE_LOST"] };
+    const { runner, deps, calls } = setup({ retention: retentionOf(lost).dep, release: [{ released: false, reason: "LEASE_LOST" }] });
+    const res = await runner.run();
+    expect(res).toMatchObject({ outcome: "LEASE_LOST", finalized: false, errorCodes: ["lease/LEASE_LOST", "retention/LEASE_LOST"] });
+    expect(deps.detect).not.toHaveBeenCalled();
+    expect(deps.lease.finishWith).not.toHaveBeenCalled();
+    expect(calls.release[0]![1]).toMatchObject({ status: "FAILED", summary: { retention: lost } });
+  });
+
+  it.each([
+    ["detección INCOMPLETE", { detection: { report: report({ complete: false, inventoryStatus: "INCOMPLETE", errors: [{ stage: "inventory", scope: "upload", code: "X" }] }), candidates: [] } }],
+    ["el detector lanza", { detectError: new Error("x") }],
+    ["finishWith lanza (persistencia)", { finish: [new Error("x")] }],
+    ["finishWith LEASE_LOST", { finish: [{ ok: false, reason: "LEASE_LOST" }] }],
+  ])("%s → los recuentos de retención se conservan en el summary del cierre", async (_n, over) => {
+    const { runner, calls } = setup({ retention: retentionOf(RETENTION_DONE).dep, ...over });
+    await runner.run();
+    expect(summaryArg(calls.release[0]!)).toMatchObject({ retention: RETENTION_DONE });
+  });
+
 });
 
 describe("códigos de error", () => {

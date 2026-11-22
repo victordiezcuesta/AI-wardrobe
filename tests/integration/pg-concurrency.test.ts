@@ -1057,6 +1057,150 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
     });
   });
 
+  describe("retención DRY_RUN 19.8a con conexiones reales", () => {
+    const tracked = <R,>(p: Promise<R>): Promise<R> => { T.registry().ops.push(p); return p; };
+    type LeaseLike = Awaited<ReturnType<typeof leaseSvc>>["a"];
+    /** Ejecución terminada hace 400 días (token siguiente según la base de datos). */
+    async function oldRun() {
+      const [r] = await app.$queryRawUnsafe<{ id: string }[]>(`INSERT INTO "MediaReconcileRun"
+        ("id", "status", "fencingToken", "startedAt", "heartbeatAt", "finishedAt", "complete", "inventoryComplete", "graceHours", "updatedAt")
+        SELECT gen_random_uuid()::text, 'COMPLETED', GREATEST(COALESCE(MAX("fencingToken"), 0), (SELECT "fencingToken" FROM "MediaReconcileLock")) + 1,
+          now() - interval '401 days', now() - interval '401 days', now() - interval '400 days', true, true, 24, now() FROM "MediaReconcileRun"
+        RETURNING "id"`);
+      return r!.id;
+    }
+    /** `n` filas CLEARED de hace 60 días (eliminables por la regla de 30 d) del propietario `owner`. */
+    async function cleared(owner: string, n: number, runId: string, tag = "c") {
+      await app.$executeRawUnsafe(`INSERT INTO "MediaAsset" ("id", "publicId", "delivery", "kind", "ownerUserId", "assetId", "resourceCreatedAt",
+          "state", "firstCandidateAt", "lastCandidateAt", "firstCandidateRunId", "lastCandidateRunId", "sightings", "ownerMissing", "createdAt", "updatedAt")
+        SELECT gen_random_uuid()::text, 'ai-wardrobe/${owner}/wardrobe/${tag}' || lpad(i::text, 5, '0'), 'UPLOAD', 'WARDROBE', '${owner}', 'as-${tag}' || i,
+          now() - interval '400 days', 'CLEARED', now() - interval '60 days', now() - interval '60 days', '${runId}', '${runId}', 1, false, now(), now()
+        FROM generate_series(1, ${n}) AS i`);
+    }
+    async function retain(lease: Pick<LeaseLike, "withLease">, l: Awaited<ReturnType<typeof acquiredBy>>) {
+      const { createMediaRetention } = await import("@/services/media-retention.service");
+      return tracked(createMediaRetention({ lease }).run(l, { budgetMs: 60_000, ttlMs: 360_000, graceHours: 24 }));
+    }
+    const snapshot = async () => ({
+      assets: await monitor.mediaAsset.findMany({ orderBy: { publicId: "asc" } }),
+      runs: await monitor.mediaReconcileRun.findMany({ where: { status: { not: "RUNNING" } }, orderBy: { fencingToken: "asc" } }),
+    });
+
+    it("retención y borrado de la cuenta sobre las MISMAS filas: el borrado espera al lote, sin interbloqueo; la cuenta se borra entera", async () => {
+      const { a } = await leaseSvc();
+      const { accountService } = await import("@/services/account.service");
+      const u = await newUser();
+      await cleared(u.id, 3, await oldRun());
+      const l = await acquiredBy(a);
+      const inside = gate(); const done = doneGate();
+      let first = true;
+      // El primer lote se detiene DESPUÉS de seleccionar (filas de u bloqueadas FOR UPDATE), dentro de su transacción.
+      const paused = { withLease: ((ls: never, fn: (tx: never) => Promise<unknown>, o: never) => a.withLease(ls, async (tx) => {
+        const v = await fn(tx as never);
+        if (first) { first = false; inside.open(); await done.wait; }
+        return v;
+      }, o)) as never };
+      const p = retain(paused, l);
+      await reached(inside, p);
+      const del = tracked(accountService.delete(u.id, ""));
+      await waitForLockWaiters(1); // el borrado de la cuenta espera las filas que tiene el lote
+      done.open();
+      expect(await p).toMatchObject({ status: "DONE", assets: { eligible: 3 }, errorCodes: [] });
+      await del;
+      expect(await monitor.user.count({ where: { id: u.id } })).toBe(0);
+      expect(await monitor.mediaAsset.count({ where: { ownerUserId: u.id } })).toBe(0);
+    });
+
+    it("filas bloqueadas por otra sesión (p. ej. un borrado de cuenta en curso): SKIP LOCKED → no espera y no las cuenta", async () => {
+      const { a } = await leaseSvc();
+      const u1 = await newUser(); const u2 = await newUser();
+      const r = await oldRun();
+      await cleared(u1.id, 5, r, "x"); await cleared(u2.id, 3, r, "y");
+      const l = await acquiredBy(a);
+      const h = await hold(`SELECT 1 FROM "MediaAsset" WHERE "ownerUserId" = '${u1.id}' FOR UPDATE`);
+      const t0 = Date.now();
+      const res = await retain(a, l);
+      expect(Date.now() - t0).toBeLessThan(1_500); // nunca esperó a lock_timeout
+      expect(res).toMatchObject({ status: "DONE", assets: { eligible: 3 } });
+      await h.release();
+      expect(await monitor.mediaAsset.count({ where: { ownerUserId: u1.id } })).toBe(5);
+    });
+
+    it("450 elegibles con la fila 150 bloqueada por otra sesión: 449 filas en 3 lotes, sin duplicados, sin esperas y completa", async () => {
+      const { a } = await leaseSvc();
+      const u = await newUser();
+      await cleared(u.id, 450, await oldRun());
+      const locked = `ai-wardrobe/${u.id}/wardrobe/c00150`; // posición 150 en el orden (delivery, publicId)
+      const l = await acquiredBy(a);
+      const h = await hold(`SELECT 1 FROM "MediaAsset" WHERE "publicId" = '${locked}' FOR UPDATE`);
+      const seen: string[] = [];
+      const spy = { withLease: ((ls: never, fn: (tx: never) => Promise<unknown>, o: never) => a.withLease(ls, async (tx) => {
+        const v = await fn(tx as never);
+        for (const row of v as { publicId?: string }[]) if (row.publicId) seen.push(row.publicId);
+        return v;
+      }, o)) as never };
+      const t0 = Date.now();
+      const res = await retain(spy, l);
+      const elapsed = Date.now() - t0;
+      await h.release();
+      expect(res).toMatchObject({ status: "DONE", errorCodes: [], assets: { eligible: 449, batches: 3, complete: true } });
+      expect(seen).toHaveLength(449);
+      expect(new Set(seen).size).toBe(449); // sin duplicados entre lotes
+      expect(seen).not.toContain(locked);
+      expect([...seen].sort((x, y) => Buffer.compare(Buffer.from(x), Buffer.from(y)))).toEqual(seen); // orden estrictamente creciente
+      expect(elapsed).toBeLessThan(1_500); // SKIP LOCKED: nunca esperó la fila bloqueada
+    });
+
+    it("fila del lock retenida por otra sesión → el lote no empieza: LOCK_TIMEOUT en ~2 s y STOPPED, sin reintentos", async () => {
+      const { a } = await leaseSvc();
+      await cleared((await newUser()).id, 2, await oldRun());
+      const l = await acquiredBy(a);
+      const h = await hold(LOCK_STMT);
+      const t0 = Date.now();
+      const res = await retain(a, l);
+      const elapsed = Date.now() - t0;
+      await h.release();
+      expect(res).toMatchObject({ status: "STOPPED", errorCodes: ["retention/LOCK_TIMEOUT"], assets: { batches: 0 } });
+      expect(elapsed).toBeGreaterThanOrEqual(1_500);
+      expect(elapsed).toBeLessThan(5_000);
+    });
+
+    it("lease perdido entre lotes y adquirido por otra conexión → LEASE_LOST; la antigua queda ABANDONED", async () => {
+      const { a, b } = await leaseSvc();
+      await cleared((await newUser()).id, 450, await oldRun());
+      const l = await acquiredBy(a);
+      let n = 0;
+      const wrapped = { withLease: (async (...args: Parameters<LeaseLike["withLease"]>) => {
+        const r = await a.withLease(...args);
+        if (++n === 1) { await expireNow(); await acquiredBy(b); }
+        return r;
+      }) as never };
+      const res = await retain(wrapped, l);
+      expect(res).toMatchObject({ status: "LEASE_LOST", errorCodes: ["retention/LEASE_LOST"], assets: { batches: 1, eligible: 200 } });
+      expect(await runStatus(l.runId)).toBe("ABANDONED");
+    });
+
+    it("DRY_RUN con PostgreSQL real: ninguna fila cambia; statement_timeout 5 s y lock_timeout 2 s dentro de cada lote; lease renovado", async () => {
+      const { a } = await leaseSvc();
+      await cleared((await newUser()).id, 250, await oldRun());
+      const l = await acquiredBy(a);
+      await app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "leaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + interval '20 seconds'`);
+      const before = await snapshot();
+      const seen: { st: string; lt: string }[] = [];
+      const spy = { withLease: ((ls: never, fn: (tx: never) => Promise<unknown>, o: never) => a.withLease(ls, async (tx) => {
+        const v = await fn(tx as never);
+        seen.push((await tx.$queryRawUnsafe<{ st: string; lt: string }[]>(`SELECT current_setting('statement_timeout') AS st, current_setting('lock_timeout') AS lt`))[0]!);
+        return v;
+      }, o)) as never };
+      const res = await retain(spy, l);
+      expect(res).toMatchObject({ mode: "DRY_RUN", status: "DONE", assets: { eligible: 250, batches: 2 } });
+      expect(seen).toEqual([{ st: "5s", lt: "2s" }, { st: "5s", lt: "2s" }, { st: "5s", lt: "2s" }]);
+      expect(await snapshot()).toEqual(before);
+      const [row] = await monitor.$queryRaw<{ left: number }[]>`SELECT EXTRACT(EPOCH FROM ("leaseExpiresAt" - (clock_timestamp() AT TIME ZONE 'UTC')))::float8 AS "left" FROM "MediaReconcileLock"`;
+      expect(row!.left).toBeGreaterThan(340); // renovación confirmada y visible desde otra conexión
+    });
+  });
+
   describe("limpieza de las pruebas: retenciones acotadas, terminación forzosa y suite contaminada", () => {
     const dbUrl = () => { const u = new URL(ADMIN_URL!); u.pathname = `/${dbName}`; return u.toString(); };
     /** Sesión AJENA a la suite (otro application_name): nunca debe terminarse. */
