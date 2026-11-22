@@ -43,6 +43,7 @@ vi.mock("@/lib/cloudinary", () => {
     deleteImage: async (id: string | null | undefined) => { if (id) await remove([id]); },
     deleteImages: remove,
     deleteAllUserAssets: async () => undefined, // borrado de cuentas (fase 19.6.3): Cloudinary simulado
+    APP_ROOT_PREFIX: "ai-wardrobe/", // detector (fase 19.7): el inventario se inyecta en cada prueba (listPage)
   };
 });
 
@@ -897,6 +898,162 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
       expect(await exists(u.id)).toBe(false);
       expect(await assets(u.id)).toBe(0);
       expect(await runStatus(l.runId)).toBe("COMPLETED");
+    });
+  });
+
+  describe("orquestador 19.7 (lease → detección acotada → persistencia) con conexiones reales", () => {
+    type ListPage = import("@/services/media-reconcile.service").ListPage;
+    type LeaseLike = Awaited<ReturnType<typeof leaseSvc>>["a"];
+    const rawRes = (public_id: string) => ({ public_id, type: "upload", created_at: "2020-01-01T00:00:00Z",
+      asset_id: `a${Buffer.from(public_id).toString("hex").slice(-31)}`, version: 1, bytes: 10, format: "jpg", resource_type: "image" });
+    /** Inventario simulado (sin Cloudinary real): `upload` con esos recursos; `before` se espera antes de devolverlo. */
+    const pagesOf = (ids: string[], before?: () => Promise<void>): ListPage => async (type) => {
+      if (type === "upload") await before?.();
+      return { resources: type === "upload" ? ids.map(rawRes) : [] } as never;
+    };
+    async function runnerOf(lease: LeaseLike, listPage: ListPage, persist?: typeof import("@/services/media-asset.service").persistMediaCandidates) {
+      const { createMediaReconcileRunner } = await import("@/services/media-reconcile-run.service");
+      const { detectOrphanMediaDetailed } = await import("@/services/media-reconcile.service");
+      const { persistMediaCandidates } = await import("@/services/media-asset.service");
+      return createMediaReconcileRunner({ lease, detect: (o) => detectOrphanMediaDetailed({ ...o, listPage }), persist: persist ?? persistMediaCandidates });
+    }
+    const tracked = <R,>(p: Promise<R>): Promise<R> => { T.registry().ops.push(p); return p; };
+    const allRuns = () => monitor.mediaReconcileRun.findMany({ orderBy: { fencingToken: "asc" } });
+
+    it("D3: la lectura del detector llega a PostgreSQL, espera el bloqueo, la CANCELA statement_timeout y la conexión queda libre", async () => {
+      const { detectOrphanMediaDetailed } = await import("@/services/media-reconcile.service");
+      const u = await newUser();
+      const LOCK_CATALOG = `LOCK TABLE "CatalogProduct" IN ACCESS EXCLUSIVE MODE`;
+      type Session = { pid: number; state: string | null; waitType: string | null; xactOpen: boolean; query: string; blockedBy: number[] };
+      /** Sesiones de ESTA suite en ESTA base (nunca ajenas, nunca la conexión monitor). */
+      const suiteSessions = () => monitor.$queryRaw<Session[]>`
+        SELECT pid, state, wait_event_type AS "waitType", xact_start IS NOT NULL AS "xactOpen", query, pg_blocking_pids(pid) AS "blockedBy"
+          FROM pg_stat_activity WHERE datname = ${dbName} AND application_name = ${SUITE_APP} AND pid <> pg_backend_pid()`;
+      const poll = async <R,>(f: () => Promise<R | null>, ms: number, stop?: () => Promise<boolean>): Promise<R | null> => {
+        const end = Date.now() + ms;
+        for (;;) {
+          const v = await f(); if (v !== null) return v;
+          if (Date.now() > end || (stop && await stop())) return null;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      };
+
+      // 1. Otra sesión de la suite retiene la tabla en exclusiva (transacción abierta, sin soltarla).
+      const h = await hold(LOCK_CATALOG);
+      const holders = (await suiteSessions()).filter((x) => x.query === LOCK_CATALOG && x.state === "idle in transaction");
+      expect(holders).toHaveLength(1);
+      const holderPid = holders[0]!.pid;
+
+      // 2. Detección con lecturas acotadas: inventario inmediato y 3 s para las lecturas de PostgreSQL.
+      const BUDGET = 1_000; const QUERY_BUDGET = 3_000;
+      const t0 = Date.now();
+      const p = tracked(detectOrphanMediaDetailed({ now: new Date(), budgetMs: BUDGET, queryBudgetMs: QUERY_BUDGET, listPage: pagesOf([`ai-wardrobe/${u.id}/wardrobe/x`]) }));
+
+      // 3. La lectura de catálogo LLEGA a PostgreSQL y queda esperando el bloqueo de esa sesión, ANTES del plazo y con la
+      //    detección todavía en curso (si el límite saltara antes de llegar a PostgreSQL, nunca se vería esta espera).
+      const waiter = await poll(async () => (await suiteSessions()).find((x) =>
+        x.waitType === "Lock" && x.blockedBy.includes(holderPid) && /"CatalogProduct"/.test(x.query) && !x.query.startsWith("LOCK TABLE")) ?? null,
+      QUERY_BUDGET, async () => (await settled(p)) === true);
+      expect(waiter, "la lectura del detector nunca llegó a esperar el bloqueo en PostgreSQL").not.toBeNull();
+      expect(Date.now() - t0).toBeLessThan(BUDGET + QUERY_BUDGET);
+      expect(await settled(p)).toBe(false);
+      expect(waiter!.xactOpen).toBe(true); // dentro de su transacción acotada
+
+      // 4. Vence el plazo: detección incompleta, sin candidatas, con el error genérico de la lectura de URLs.
+      const { report, candidates } = await p;
+      expect(Date.now() - t0).toBeLessThan(BUDGET + QUERY_BUDGET + 2_000);
+      expect(report.inventoryStatus).toBe("COMPLETE");
+      expect(report.complete).toBe(false);
+      expect(candidates).toEqual([]);
+      expect(report.byCategory.ORPHAN_CANDIDATE).toBe(0);
+      expect(report.errors).toContainEqual({ stage: "database", scope: "urls", code: "QUERY_TIMEOUT" });
+
+      // 5. La MISMA sesión deja de esperar y su transacción termina (ROLLBACK) mientras el bloqueo SIGUE retenido: solo
+      //    puede deberse a la cancelación de la sentencia en el servidor (statement_timeout). Si la conexión se hubiera
+      //    cerrado, el pid habría desaparecido; si solo hubiera vencido JavaScript, seguiría esperando.
+      const after = await poll(async () => {
+        const me = (await suiteSessions()).find((x) => x.pid === waiter!.pid);
+        return me && me.waitType !== "Lock" && me.state === "idle" && !me.xactOpen ? me : null;
+      }, 3_000);
+      expect(after, "la sesión siguió esperando o con la transacción abierta tras el plazo").not.toBeNull();
+      expect(after!.blockedBy).toEqual([]);
+      const stillHeld = (await suiteSessions()).find((x) => x.pid === holderPid);
+      expect(stillHeld).toMatchObject({ state: "idle in transaction", query: LOCK_CATALOG }); // el bloqueo no se soltó
+
+      // 6. Ninguna otra sesión de la suite queda esperando ni con una transacción abierta (salvo la retención).
+      const others = (await suiteSessions()).filter((x) => x.pid !== holderPid);
+      expect(others.filter((x) => x.waitType === "Lock")).toEqual([]);
+      expect(others.filter((x) => x.state === "idle in transaction" || x.xactOpen)).toEqual([]);
+
+      await h.release();
+      expect((await suiteSessions()).filter((x) => x.state === "idle in transaction" || x.xactOpen)).toEqual([]);
+      // 7. La conexión volvió al pool: sin bloqueo, las mismas lecturas acotadas funcionan y la detección es completa.
+      const ok = await detectOrphanMediaDetailed({ now: new Date(), budgetMs: 1_000, queryBudgetMs: 5_000, listPage: pagesOf([]) });
+      expect(ok.report.complete).toBe(true);
+    }, 20_000); // plazo de 4 s + sondeos acotados: un fallo se debe ver en su aserción, no por el límite de la prueba
+
+    it("dos ejecuciones simultáneas (conexiones distintas): solo una adquiere el lease; la otra BUSY sin crear ejecución", async () => {
+      const { a, b } = await leaseSvc();
+      const u = await newUser();
+      const inside = gate(); const done = doneGate();
+      const wait = async () => { inside.open(); await done.wait; };
+      const ids = [`ai-wardrobe/${u.id}/wardrobe/o1`];
+      const [ra, rb] = [await runnerOf(a, pagesOf(ids, wait)), await runnerOf(b, pagesOf(ids, wait))];
+      const pa = tracked(ra.run()); const pb = tracked(rb.run());
+      const first = await Promise.race([pa.then((r) => ({ who: "a", r })), pb.then((r) => ({ who: "b", r }))]);
+      expect(first.r).toEqual({ outcome: "BUSY", reason: expect.stringMatching(/^(LEASE_HELD|LOCK_TIMEOUT)$/) });
+      await inside.wait;
+      expect(await allRuns()).toHaveLength(1);
+      done.open();
+      const winner = await (first.who === "a" ? pb : pa);
+      expect(winner).toMatchObject({ outcome: "COMPLETED", persisted: { created: 1 } });
+      expect((await allRuns()).map((r) => r.status)).toEqual(["COMPLETED"]);
+      expect((await lockRow()).holderRunId).toBeNull();
+    });
+
+    it("lease perdido durante la detección y adquirido por otra: la antigua no persiste nada (LEASE_LOST) y queda ABANDONED", async () => {
+      const { a, b } = await leaseSvc();
+      const u = await newUser();
+      const shared = `ai-wardrobe/${u.id}/wardrobe/comun`; const onlyA = `ai-wardrobe/${u.id}/wardrobe/solo-a`;
+      const inside = gate(); const done = doneGate();
+      const ra = await runnerOf(a, pagesOf([shared, onlyA], async () => { inside.open(); await done.wait; }));
+      const pa = tracked(ra.run());
+      await reached(inside, pa);
+      await expireNow(); // el lease de A caduca mientras A sigue detectando
+      const rb = await runnerOf(b, pagesOf([shared]));
+      expect(await tracked(rb.run())).toMatchObject({ outcome: "COMPLETED", persisted: { created: 1 } });
+      done.open();
+      const resA = await pa;
+      expect(resA).toMatchObject({ outcome: "LEASE_LOST", persisted: null, errorCodes: ["lease/LEASE_LOST"], finalized: false });
+      const [runA, runB] = await allRuns();
+      expect([runA!.status, runB!.status]).toEqual(["ABANDONED", "COMPLETED"]);
+      const rows = await monitor.mediaAsset.findMany();
+      expect(rows.map((r) => r.publicId)).toEqual([shared]); // nada de `solo-a`
+      expect(rows.every((r) => r.firstCandidateRunId === runB!.id && r.lastCandidateRunId === runB!.id)).toBe(true);
+      expect((await lockRow()).holderRunId).toBeNull();
+    });
+
+    it("borrado de cuenta durante la persistencia orquestada: espera, sin interbloqueos, y elimina también las filas nuevas", async () => {
+      const { a } = await leaseSvc();
+      const { persistMediaCandidates } = await import("@/services/media-asset.service");
+      const { accountService } = await import("@/services/account.service");
+      const u = await newUser();
+      const inside = gate(); const done = doneGate();
+      const r = await runnerOf(a, pagesOf([`ai-wardrobe/${u.id}/wardrobe/n`]), async (tx, input) => {
+        const s = await persistMediaCandidates(tx, input); // con FOR KEY SHARE sobre u
+        inside.open(); await done.wait; return s;
+      });
+      const p = tracked(r.run());
+      await reached(inside, p);
+      const del = tracked(accountService.delete(u.id, ""));
+      await waitForLockWaiters(1); // el borrado espera la fila del usuario
+      expect(await monitor.user.count({ where: { id: u.id } })).toBe(1);
+      done.open();
+      expect(await p).toMatchObject({ outcome: "COMPLETED", persisted: { created: 1 } });
+      await del;
+      expect(await monitor.user.count({ where: { id: u.id } })).toBe(0);
+      expect(await monitor.mediaAsset.count({ where: { ownerUserId: u.id } })).toBe(0);
+      expect((await allRuns()).map((x) => x.status)).toEqual(["COMPLETED"]);
     });
   });
 

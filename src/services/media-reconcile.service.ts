@@ -1,3 +1,4 @@
+import { Prisma } from "@/generated/prisma/client";
 import { APP_ROOT_PREFIX, listAppResourcesPage, type DeliveryType, type ResourcePage } from "@/lib/cloudinary";
 import { parseImageUrl } from "@/lib/cloudinary/url";
 import { env } from "@/lib/env";
@@ -269,9 +270,60 @@ async function inventory(type: DeliveryType, listPage: ListPage, opts: { maxPage
   }
 }
 
-/** Ejecuta una consulta de solo lectura; si falla, lo registra (saneado) y devuelve null (= no verificable). */
-async function readOrNull<T>(scope: string, report: MediaReconcileReport, query: () => Promise<T>): Promise<T | null> {
+/** Cliente con el que se hace UNA lectura del detector: el global, o la transacción acotada de esa lectura. */
+type ReadDb = Prisma.TransactionClient;
+/** Ejecuta una lectura con el cliente adecuado (sin límite: el global, como siempre; con límite: ver boundedReader). */
+type Reader = <T>(query: (db: ReadDb) => Promise<T>) => Promise<T>;
+/** Se agotó el presupuesto de las lecturas de PostgreSQL (antes de empezar o mientras se esperaba la respuesta). */
+class QueryBudgetExceeded extends Error {}
+const unboundedReader: Reader = (query) => query(prisma);
+
+/**
+ * Lecturas con límite EFECTIVO en PostgreSQL (solo si se pide `queryBudgetMs`): cada lectura va en su propia transacción
+ * corta, de solo lectura (`transaction_read_only`), con `statement_timeout` local igual al tiempo que queda hasta
+ * `deadline`: al vencer, PostgreSQL cancela la sentencia (SQLSTATE 57014) y libera la conexión. Además, la espera de
+ * conexión (`maxWait`) y la transacción (`timeout`) de Prisma quedan acotadas a ese mismo tiempo, y la promesa deja de
+ * esperarse al vencer el plazo. Cada lectura sigue siendo una única sentencia independiente (READ COMMITTED), igual que
+ * sin límite: no hay ninguna transacción global ni cambia la semántica.
+ */
+function boundedReader(deadline: number): Reader {
+  return async (query) => {
+    const ms = deadline - Date.now();
+    if (ms <= 0) throw new QueryBudgetExceeded();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new QueryBudgetExceeded()), ms); });
+    const run = prisma.$transaction(async (tx) => {
+      const left = Math.max(1, Math.floor(deadline - Date.now())); // lo que queda tras esperar la conexión
+      await tx.$queryRaw`SELECT set_config('statement_timeout', ${`${left}ms`}, true), set_config('transaction_read_only', 'on', true)`;
+      return query(tx);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: Math.ceil(ms), timeout: Math.ceil(ms) });
+    run.catch(() => undefined); // si vence antes, su rechazo posterior no debe quedar sin capturar
+    let result: Awaited<typeof run>;
+    try { result = await Promise.race([run, expired]); } finally { clearTimeout(timer); }
+    // Una respuesta que llega después del plazo tampoco vale (la ejecución no puede salir completa con ella).
+    if (Date.now() > deadline) throw new QueryBudgetExceeded();
+    return result;
+  };
+}
+
+/** Cancelación de PostgreSQL por statement_timeout (57014) o fin de la transacción de Prisma por su límite (P2028). */
+function isQueryTimeout(err: unknown): boolean {
+  if (err instanceof QueryBudgetExceeded) return true;
+  const e = err as { code?: unknown; meta?: { driverAdapterError?: { cause?: { originalCode?: unknown; code?: unknown } } } } | null;
+  const cause = e?.meta?.driverAdapterError?.cause;
+  return e?.code === "P2028" || cause?.originalCode === "57014" || cause?.code === "57014";
+}
+
+/**
+ * Ejecuta una consulta de solo lectura; si falla, lo registra (saneado) y devuelve null (= no verificable). Con límite,
+ * una lectura que lo agota (o falla después de agotarlo) se registra como QUERY_TIMEOUT: la ejecución nunca es completa.
+ */
+async function readOrNull<T>(scope: string, report: MediaReconcileReport, query: () => Promise<T>, deadline: number | null = null): Promise<T | null> {
   try { return await query(); } catch (err) {
+    if (deadline !== null && (isQueryTimeout(err) || Date.now() >= deadline)) {
+      report.errors.push({ stage: "database", scope, code: "QUERY_TIMEOUT" });
+      return null;
+    }
     const safe = safeDbError(err) as Error;
     report.errors.push({ stage: "database", scope, code: /\((P\d{4})\)/.exec(safe.message ?? "")?.[1] ?? "DB_ERROR" });
     return null;
@@ -283,13 +335,13 @@ async function readOrNull<T>(scope: string, report: MediaReconcileReport, query:
  * fuera variantes que el intérprete sí reconoce (host o carpeta con codificación %). En compras y catálogo se leen
  * valores distintos para no repetir la misma URL de producto.
  */
-async function storedImageUrls(): Promise<(string | null)[]> {
+async function storedImageUrls(read: Reader): Promise<(string | null)[]> {
   const [items, generated, users, shopping, catalog] = await Promise.all([
-    prisma.wardrobeItem.findMany({ where: { OR: [{ imageUrl: { not: null } }, { thumbUrl: { not: null } }] }, select: { imageUrl: true, thumbUrl: true } }),
-    prisma.generatedImage.findMany({ where: { imageUrl: { not: null } }, select: { imageUrl: true } }),
-    prisma.user.findMany({ where: { image: { not: null } }, select: { image: true } }),
-    prisma.shoppingProduct.findMany({ where: { imageUrl: { not: null } }, select: { imageUrl: true }, distinct: ["imageUrl"] }),
-    prisma.catalogProduct.findMany({ select: { imageUrl: true }, distinct: ["imageUrl"] }),
+    read((db) => db.wardrobeItem.findMany({ where: { OR: [{ imageUrl: { not: null } }, { thumbUrl: { not: null } }] }, select: { imageUrl: true, thumbUrl: true } })),
+    read((db) => db.generatedImage.findMany({ where: { imageUrl: { not: null } }, select: { imageUrl: true } })),
+    read((db) => db.user.findMany({ where: { image: { not: null } }, select: { image: true } })),
+    read((db) => db.shoppingProduct.findMany({ where: { imageUrl: { not: null } }, select: { imageUrl: true }, distinct: ["imageUrl"] })),
+    read((db) => db.catalogProduct.findMany({ select: { imageUrl: true }, distinct: ["imageUrl"] })),
   ]);
   return [
     ...items.flatMap((i) => [i.imageUrl, i.thumbUrl]), ...generated.map((g) => g.imageUrl), ...users.map((u) => u.image),
@@ -335,7 +387,12 @@ export interface MediaCandidate {
   resourceCreatedAt: Date;
 }
 export interface DetailedDetection { report: MediaReconcileReport; candidates: readonly Readonly<MediaCandidate>[] }
-type DetectOpts = { now?: Date; graceMs?: number; maxPagesPerType?: number; budgetMs?: number; listPage?: ListPage };
+/**
+ * `queryBudgetMs` (opcional): activa el límite efectivo de las lecturas de PostgreSQL (ver boundedReader). Todas deben
+ * terminar antes de `inicio + budgetMs + queryBudgetMs`, así que inventario y lecturas juntos nunca superan esa suma.
+ * Sin él, las lecturas se hacen como siempre (cliente global, sin límite propio).
+ */
+type DetectOpts = { now?: Date; graceMs?: number; maxPagesPerType?: number; budgetMs?: number; queryBudgetMs?: number; listPage?: ListPage };
 
 /** Informe AGREGADO (contrato público del endpoint): sin identificadores, URLs ni datos personales. */
 export async function detectOrphanMedia(opts: DetectOpts = {}): Promise<MediaReconcileReport> {
@@ -375,6 +432,10 @@ async function run(opts: DetectOpts, candidates: MediaCandidate[] | null): Promi
     referencesOutsidePrefix: 0, rateLimit: null, errors: [],
   };
   const inv = { maxPages: opts.maxPagesPerType ?? DEFAULTS.maxPagesPerType, deadline: t0 + (opts.budgetMs ?? DEFAULTS.budgetMs) };
+  const qb = opts.queryBudgetMs;
+  if (qb !== undefined && !(Number.isSafeInteger(qb) && qb >= 1)) throw new TypeError("queryBudgetMs debe ser un entero positivo");
+  const queryDeadline = qb === undefined ? null : inv.deadline + qb;
+  const read: Reader = queryDeadline === null ? unboundedReader : boundedReader(queryDeadline);
 
   // 1) Inventario (dos tipos de entrega, cada uno paginado de forma independiente).
   const pub = await inventory("upload", listPage, inv, report);
@@ -393,12 +454,12 @@ async function run(opts: DetectOpts, candidates: MediaCandidate[] | null): Promi
   const ownerIds = [...new Set(parsed.flatMap((p) => (p.userId && !p.quarantine ? [p.userId] : [])))];
   const cloudName = env().CLOUDINARY_CLOUD_NAME;
   const [wardrobeRefs, personalRefs, tryOnRefs, sourceCites, owners, urls] = await Promise.all([
-    readOrNull("wardrobe", report, async () => new Set((await prisma.wardrobeItem.findMany({ where: { imagePublicId: { not: null } }, select: { imagePublicId: true }, distinct: ["imagePublicId"] })).map((r) => r.imagePublicId!))),
-    readOrNull("personal", report, async () => new Set((await prisma.userProfile.findMany({ select: { photoPublicIds: true } })).flatMap((r) => r.photoPublicIds))),
-    readOrNull("try-on", report, async () => new Set((await prisma.generatedImage.findMany({ where: { publicId: { not: null } }, select: { publicId: true } })).map((r) => r.publicId!))),
-    readOrNull("sourcePhoto", report, async () => new Set((await prisma.generatedImage.findMany({ where: { sourcePhotoId: { not: null } }, select: { sourcePhotoId: true }, distinct: ["sourcePhotoId"] })).map((r) => r.sourcePhotoId!))),
-    readOrNull("owners", report, async () => new Set((await prisma.user.findMany({ where: { id: { in: ownerIds } }, select: { id: true } })).map((u) => u.id))),
-    readOrNull("urls", report, storedImageUrls),
+    readOrNull("wardrobe", report, async () => new Set((await read((db) => db.wardrobeItem.findMany({ where: { imagePublicId: { not: null } }, select: { imagePublicId: true }, distinct: ["imagePublicId"] }))).map((r) => r.imagePublicId!)), queryDeadline),
+    readOrNull("personal", report, async () => new Set((await read((db) => db.userProfile.findMany({ select: { photoPublicIds: true } }))).flatMap((r) => r.photoPublicIds)), queryDeadline),
+    readOrNull("try-on", report, async () => new Set((await read((db) => db.generatedImage.findMany({ where: { publicId: { not: null } }, select: { publicId: true } }))).map((r) => r.publicId!)), queryDeadline),
+    readOrNull("sourcePhoto", report, async () => new Set((await read((db) => db.generatedImage.findMany({ where: { sourcePhotoId: { not: null } }, select: { sourcePhotoId: true }, distinct: ["sourcePhotoId"] }))).map((r) => r.sourcePhotoId!)), queryDeadline),
+    readOrNull("owners", report, async () => new Set((await read((db) => db.user.findMany({ where: { id: { in: ownerIds } }, select: { id: true } }))).map((u) => u.id)), queryDeadline),
+    readOrNull("urls", report, () => storedImageUrls(read), queryDeadline),
   ]);
   const refsByKind: Record<MediaKind, Set<string> | null> = { wardrobe: wardrobeRefs, personal: personalRefs, "try-on": tryOnRefs };
   const byUrl = urls ? urlProtection(urls, cloudName) : null;
