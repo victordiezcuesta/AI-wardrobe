@@ -42,8 +42,16 @@ export class MediaLeaseError extends Error {
   constructor(readonly code: MediaLeaseErrorCode) { super(`Lease del reconciliador: ${code}`); this.name = "MediaLeaseError"; }
 }
 
-export interface MediaLease { runId: string; fencingToken: number; leaseExpiresAt: Date }
-export type AcquireResult = { status: "ACQUIRED"; lease: MediaLease; abandoned: number } | { status: "BUSY"; reason: "LEASE_HELD" | "LOCK_TIMEOUT" };
+export interface MediaLease {
+  runId: string;
+  fencingToken: number;
+  leaseExpiresAt: Date;
+  /** Inicio de la ejecución según PostgreSQL (MediaReconcileRun.startedAt). Solo informativo para las operaciones. */
+  startedAt?: Date;
+}
+/** Lease recién adquirido: siempre lleva el startedAt que PostgreSQL guardó en la ejecución. */
+export type AcquiredLease = MediaLease & { startedAt: Date };
+export type AcquireResult = { status: "ACQUIRED"; lease: AcquiredLease; abandoned: number } | { status: "BUSY"; reason: "LEASE_HELD" | "LOCK_TIMEOUT" };
 export type LeaseLost = { ok: false; reason: "LEASE_LOST" };
 /** No se pudo obtener la fila del lock a tiempo: el lease NO se ha comprobado (ni perdido); no se ejecutó nada. */
 export type LockTimeout = { ok: false; reason: "LOCK_TIMEOUT" };
@@ -57,6 +65,13 @@ export interface RunOutcome {
   errorCodes?: string[];
 }
 export type ReleaseResult = { released: true; runFinalized: boolean } | { released: false; reason: "LEASE_LOST" | "LOCK_TIMEOUT" };
+/** Resultado de una ejecución COMPLETA que se cierra con finishWith (estado COMPLETED e inventario completo implícitos). */
+export interface FinishOutcome {
+  /** Informe agregado (sin identificadores). */
+  summary?: Prisma.InputJsonValue;
+  errorCodes?: string[];
+}
+export type Finished<T> = { ok: true; value: T; finishedAt: Date } | LeaseLost | LockTimeout;
 
 type Tx = Prisma.TransactionClient;
 type Db = PrismaClient;
@@ -75,6 +90,13 @@ function lockTimeoutOf(ms: number | undefined): number {
   const v = ms ?? DEFAULT_LOCK_TIMEOUT_MS;
   if (!Number.isSafeInteger(v) || v < 1 || v > 60_000) throw new MediaLeaseError("INVALID_ARGUMENT");
   return v;
+}
+function checkCodes(codes: unknown): string[] {
+  const list = codes ?? [];
+  if (!Array.isArray(list) || list.length > 64 || !list.every((c) => typeof c === "string" && c.length > 0 && c.length <= 120)) {
+    throw new MediaLeaseError("INVALID_ARGUMENT");
+  }
+  return list as string[];
 }
 function checkLease(lease: MediaLease) {
   if (!lease || typeof lease.runId !== "string" || lease.runId === "" || !Number.isSafeInteger(lease.fencingToken) || lease.fencingToken < 1) {
@@ -166,6 +188,64 @@ export function createMediaLease(db: Db) {
     }
   }
 
+  /**
+   * Cierra una ejecución COMPLETA de forma atómica: en UNA transacción, (1) bloquea la fila del lock y, ya bloqueada,
+   * comprueba token, dueño y lease vigente con clock_timestamp(); (2) bloquea la ejecución y exige que siga RUNNING;
+   * (3) ejecuta `fn` con esa misma transacción (p. ej. la persistencia de MediaAsset); (4) cierra la ejecución como
+   * COMPLETED con su resumen; (5) libera el lock. Orden de bloqueo: lock → ejecución → filas de datos.
+   * Cualquier fallo (de `fn`, del cierre o de la liberación) deshace TODO: ni datos de `fn`, ni cierre, ni liberación.
+   * Lease perdido, ejecución que ya no está RUNNING (ABANDONED, o ya finalizada) → LEASE_LOST sin ejecutar `fn`.
+   */
+  async function finishWith<T>(lease: MediaLease, outcome: FinishOutcome, fn: (tx: Tx) => Promise<T>, opts: Pick<Opts, "lockTimeoutMs"> = {}): Promise<Finished<T>> {
+    checkLease(lease);
+    const lockTimeoutMs = lockTimeoutOf(opts.lockTimeoutMs);
+    if (!outcome || typeof outcome !== "object") throw new MediaLeaseError("INVALID_ARGUMENT");
+    const codes = checkCodes(outcome.errorCodes);
+    const summary = outcome.summary === undefined ? null : JSON.stringify(outcome.summary);
+    let phase: "lock" | "fn" = "lock";
+    try {
+      return await db.$transaction(async (tx): Promise<Finished<T>> => {
+        await boundWaits(tx, lockTimeoutMs);
+        // (1) Lock bloqueado ANTES de mirar la hora; después, comprobación con el reloj real.
+        if (!(await lockRowIn(tx))) throw new LeaseLostSignal();
+        const owned = await tx.$queryRaw<{ one: number }[]>`
+          SELECT 1 AS one FROM "MediaReconcileLock"
+           WHERE "name" = ${MEDIA_RECONCILE_LOCK} AND "fencingToken" = ${lease.fencingToken} AND "holderRunId" = ${lease.runId}
+             AND "leaseExpiresAt" > ${NOW}`;
+        if (owned.length !== 1) throw new LeaseLostSignal();
+        // (2) La ejecución sigue RUNNING (ni ABANDONED ni ya finalizada) y queda bloqueada hasta el final.
+        const running = await tx.$queryRaw<{ one: number }[]>`
+          SELECT 1 AS one FROM "MediaReconcileRun" WHERE "id" = ${lease.runId} AND "status" = 'RUNNING' FOR UPDATE`;
+        if (running.length !== 1) throw new LeaseLostSignal();
+        // (3) Operación protegida.
+        phase = "fn";
+        const value = await fn(tx);
+        // (4) Cierre COMPLETED (inventario completo) con la hora de PostgreSQL.
+        const [closed] = await tx.$queryRaw<{ finishedAt: Date }[]>`
+          UPDATE "MediaReconcileRun"
+             SET "status" = 'COMPLETED', "complete" = true, "inventoryComplete" = true, "summary" = ${summary}::jsonb,
+                 "errorCodes" = ${codes}::text[], "finishedAt" = GREATEST(${NOW}, "startedAt"),
+                 "heartbeatAt" = LEAST("heartbeatAt", GREATEST(${NOW}, "startedAt")), "updatedAt" = ${NOW}
+           WHERE "id" = ${lease.runId} AND "status" = 'RUNNING'
+          RETURNING "finishedAt"`;
+        if (!closed) throw new LeaseLostSignal(); // imposible con la fila bloqueada; por si acaso, se deshace todo
+        // (5) Liberación del lock (sigue bloqueado por esta transacción: token y dueño no han podido cambiar).
+        const freed = await tx.$executeRaw`
+          UPDATE "MediaReconcileLock" SET "holderRunId" = NULL, "leaseExpiresAt" = NULL, "heartbeatAt" = ${NOW}, "updatedAt" = ${NOW}
+           WHERE "name" = ${MEDIA_RECONCILE_LOCK} AND "fencingToken" = ${lease.fencingToken} AND "holderRunId" = ${lease.runId}`;
+        if (freed !== 1) throw new LeaseLostSignal();
+        return { ok: true, value, finishedAt: closed.finishedAt };
+      }, TX);
+    } catch (e) {
+      if (e instanceof LeaseLostSignal) return LOST;
+      if (isLockTimeout(e)) {
+        if (phase === "lock") return LOCK_TIMEOUT; // no se llegó a comprobar el lease: no se ejecutó nada
+        throw new MediaLeaseError("LOCK_TIMEOUT"); // dentro de fn o del cierre: deshecho entero, sin datos internos
+      }
+      throw e;
+    }
+  }
+
   return {
     /**
      * Adquiere el lease y crea su ejecución en UNA transacción: bloquea la fila del lock (FOR UPDATE; una adquisición
@@ -218,7 +298,10 @@ export function createMediaLease(db: Db) {
                    "heartbeatAt" = ${created!.ts}::timestamp, "updatedAt" = ${created!.ts}::timestamp
              WHERE "name" = ${MEDIA_RECONCILE_LOCK}
             RETURNING "leaseExpiresAt"`;
-          return { status: "ACQUIRED", lease: { runId: created!.id, fencingToken: created!.fencingToken, leaseExpiresAt: held!.leaseExpiresAt }, abandoned };
+          return {
+            status: "ACQUIRED", abandoned,
+            lease: { runId: created!.id, fencingToken: created!.fencingToken, leaseExpiresAt: held!.leaseExpiresAt, startedAt: created!.ts },
+          };
         }, TX);
       } catch (e) {
         if (isLockTimeout(e)) return { status: "BUSY", reason: "LOCK_TIMEOUT" };
@@ -227,6 +310,8 @@ export function createMediaLease(db: Db) {
     },
 
     withLease,
+
+    finishWith,
 
     /** Renueva el lease (heartbeat). LEASE_LOST si otro proceso lo tiene, caducó o el token/dueño no coinciden. */
     async renew(lease: MediaLease, opts: Opts = {}): Promise<Protected<undefined>> {
@@ -241,11 +326,10 @@ export function createMediaLease(db: Db) {
       checkLease(lease);
       const lockTimeoutMs = lockTimeoutOf(opts.lockTimeoutMs);
       const statusOk = ["COMPLETED", "INCOMPLETE", "FAILED"].includes(outcome?.status);
-      const codes = outcome?.errorCodes ?? [];
-      if (!statusOk || typeof outcome.inventoryComplete !== "boolean" || (outcome.status === "COMPLETED" && !outcome.inventoryComplete)
-        || !Array.isArray(codes) || codes.length > 64 || !codes.every((c) => typeof c === "string" && c.length > 0 && c.length <= 120)) {
+      if (!statusOk || typeof outcome.inventoryComplete !== "boolean" || (outcome.status === "COMPLETED" && !outcome.inventoryComplete)) {
         throw new MediaLeaseError("INVALID_ARGUMENT");
       }
+      const codes = checkCodes(outcome.errorCodes);
       try {
         return await db.$transaction(async (tx): Promise<ReleaseResult> => {
           await boundWaits(tx, lockTimeoutMs);

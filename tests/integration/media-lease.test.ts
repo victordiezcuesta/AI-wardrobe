@@ -307,6 +307,147 @@ describe("recuperación de ejecuciones abandonadas", () => {
   });
 });
 
+describe("finishWith: persistencia, cierre COMPLETED y liberación en UNA transacción", () => {
+  /** Lo que hará la persistencia futura: un MediaAsset que apunta a la ejecución actual. */
+  const writeAsset = (runId: string, name = "x") => async (tx: Parameters<Parameters<MediaLeaseService["finishWith"]>[2]>[0]) => {
+    const now = new Date("2026-11-20T00:00:00Z");
+    await tx.mediaAsset.create({ data: {
+      publicId: `ai-wardrobe/cmowner/wardrobe/${name}`, delivery: "UPLOAD", kind: "WARDROBE", ownerUserId: "cmowner", assetId: "a1",
+      resourceCreatedAt: now, firstCandidateAt: now, lastCandidateAt: now, firstCandidateRunId: runId, lastCandidateRunId: runId,
+    } });
+    return "escrito";
+  };
+  const SUMMARY = { summary: { byCategory: { ORPHAN_CANDIDATE: 1 } }, errorCodes: [] as string[] };
+  const block = async (sql: string) => { await t.prisma.$executeRawUnsafe(sql); };
+
+  it("acquire devuelve startedAt: el inicio de la ejecución guardado por PostgreSQL", async () => {
+    const a = await acquired();
+    expect(a.startedAt).toBeInstanceOf(Date);
+    expect(a.startedAt).toEqual((await run(a.runId)).startedAt);
+    expect((await lock()).heartbeatAt).toEqual(a.startedAt);
+  });
+
+  it("éxito: fn escribe en la MISMA transacción, la ejecución queda COMPLETED con su resumen y el lock libre", async () => {
+    const a = await acquired();
+    const r = await svc.finishWith(a, SUMMARY, writeAsset(a.runId));
+    expect(r).toMatchObject({ ok: true, value: "escrito" });
+    if (!r.ok) return;
+    expect(await t.prisma.mediaAsset.count({ where: { lastCandidateRunId: a.runId } })).toBe(1);
+    const x = await run(a.runId);
+    expect(x).toMatchObject({ status: "COMPLETED", complete: true, inventoryComplete: true, summary: SUMMARY.summary, errorCodes: [] });
+    expect(x.finishedAt).toEqual(r.finishedAt);
+    expect(x.finishedAt!.getTime()).toBeGreaterThanOrEqual(x.startedAt.getTime());
+    expect(x.heartbeatAt.getTime()).toBeLessThanOrEqual(x.finishedAt!.getTime());
+    expect(await lock()).toMatchObject({ holderRunId: null, leaseExpiresAt: null, fencingToken: a.fencingToken });
+    expect((await svc.acquire(OPTS)).status).toBe("ACQUIRED"); // el lock quedó realmente libre
+  });
+
+  it("fn usa la transacción de finishWith: ve el lock bloqueado por ella y su propia ejecución RUNNING", async () => {
+    const a = await acquired();
+    const r = await svc.finishWith(a, SUMMARY, async (tx) => {
+      const [x] = await tx.$queryRaw<{ status: string }[]>`SELECT "status"::text FROM "MediaReconcileRun" WHERE "id" = ${a.runId}`;
+      const [l] = await tx.$queryRaw<{ holder: string }[]>`SELECT "holderRunId" AS holder FROM "MediaReconcileLock"`;
+      return { status: x!.status, holder: l!.holder };
+    });
+    expect(r).toMatchObject({ ok: true, value: { status: "RUNNING", holder: a.runId } });
+  });
+
+  it("si fn falla, se deshace TODO: ni sus escrituras, ni el cierre, ni la liberación", async () => {
+    const a = await acquired();
+    const before = await lock();
+    const boom = new Error("fallo de la persistencia");
+    const err = await svc.finishWith(a, SUMMARY, async (tx) => { await writeAsset(a.runId)(tx); throw boom; }).then(() => null, (e: unknown) => e);
+    expect(err).toBe(boom);
+    expect(await t.prisma.mediaAsset.count()).toBe(0);
+    expect((await run(a.runId)).status).toBe("RUNNING");
+    expect(await lock()).toEqual(before);
+    expect(await svc.finishWith(a, SUMMARY, writeAsset(a.runId))).toMatchObject({ ok: true }); // se puede reintentar
+  });
+
+  it.each([
+    ["token incorrecto", (l: MediaLease) => ({ ...l, fencingToken: l.fencingToken + 1 })],
+    ["propietario incorrecto", (l: MediaLease) => ({ ...l, runId: "otra" })],
+  ])("con %s → LEASE_LOST, sin ejecutar fn ni cambiar nada", async (_n, alter) => {
+    const a = await acquired();
+    const before = await lock();
+    const fn = vi.fn(async () => "no");
+    expect(await svc.finishWith(alter(a), SUMMARY, fn)).toEqual({ ok: false, reason: "LEASE_LOST" });
+    expect(fn).not.toHaveBeenCalled();
+    expect(await lock()).toEqual(before);
+    expect((await run(a.runId)).status).toBe("RUNNING");
+  });
+
+  it("con el lease caducado (aunque nadie lo haya adquirido) → LEASE_LOST, sin ejecutar fn", async () => {
+    const a = await acquired();
+    await expire();
+    const fn = vi.fn(async () => "no");
+    expect(await svc.finishWith(a, SUMMARY, fn)).toEqual({ ok: false, reason: "LEASE_LOST" });
+    expect(fn).not.toHaveBeenCalled();
+    expect((await run(a.runId)).status).toBe("RUNNING");
+  });
+
+  it("una ejecución ABANDONED no se puede finalizar (aunque el lock siga apuntando a ella con lease vigente)", async () => {
+    const a = await acquired();
+    await block(`UPDATE "MediaReconcileRun" SET "status" = 'ABANDONED', "finishedAt" = (clock_timestamp() AT TIME ZONE 'UTC') WHERE "id" = '${a.runId}'`);
+    const before = await lock();
+    const fn = vi.fn(async () => "no");
+    expect(await svc.finishWith(a, SUMMARY, fn)).toEqual({ ok: false, reason: "LEASE_LOST" });
+    expect(fn).not.toHaveBeenCalled();
+    expect(await lock()).toEqual(before);
+    expect((await run(a.runId)).status).toBe("ABANDONED");
+  });
+
+  it("un segundo intento de finalizar la misma ejecución se rechaza y no vuelve a escribir", async () => {
+    const a = await acquired();
+    expect(await svc.finishWith(a, SUMMARY, writeAsset(a.runId))).toMatchObject({ ok: true });
+    const after = await run(a.runId);
+    const fn = vi.fn(writeAsset(a.runId, "otra"));
+    expect(await svc.finishWith(a, SUMMARY, fn)).toEqual({ ok: false, reason: "LEASE_LOST" });
+    expect(fn).not.toHaveBeenCalled();
+    expect(await run(a.runId)).toEqual(after);
+    expect(await t.prisma.mediaAsset.count()).toBe(1);
+  });
+
+  it.each([
+    ["el cierre de la ejecución", "MediaReconcileRun", `NEW."status" = 'COMPLETED'`],
+    ["la liberación del lock", "MediaReconcileLock", `NEW."holderRunId" IS NULL AND OLD."holderRunId" IS NOT NULL`],
+  ])("si falla %s, se deshace TODO (también lo escrito por fn)", async (_n, table, when) => {
+    const a = await acquired();
+    const before = await lock();
+    await block(`CREATE FUNCTION test_block_finish() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF ${when} THEN RAISE EXCEPTION 'cierre bloqueado por la prueba'; END IF; RETURN NEW; END $$`);
+    await block(`CREATE TRIGGER test_block_finish BEFORE UPDATE ON "${table}" FOR EACH ROW EXECUTE FUNCTION test_block_finish()`);
+    try {
+      await expect(svc.finishWith(a, SUMMARY, writeAsset(a.runId))).rejects.toThrow(/cierre bloqueado por la prueba/);
+      await heal();
+      expect(await t.prisma.mediaAsset.count()).toBe(0);
+      expect((await run(a.runId)).status).toBe("RUNNING");
+      expect(await lock()).toEqual(before);
+    } finally {
+      await heal();
+      await block(`DROP TRIGGER test_block_finish ON "${table}"`);
+      await block(`DROP FUNCTION test_block_finish()`);
+    }
+  });
+
+  it.each([
+    ["códigos de error inválidos", { errorCodes: [""] }],
+    ["más de 64 códigos", { errorCodes: Array.from({ length: 65 }, (_, i) => `E${i}`) }],
+    ["resultado ausente", null],
+  ])("argumentos inválidos (%s) → MediaLeaseError sin tocar nada", async (_n, outcome) => {
+    const a = await acquired();
+    const before = await lock();
+    await expect(svc.finishWith(a, outcome as never, async () => 1)).rejects.toMatchObject({ name: "MediaLeaseError", code: "INVALID_ARGUMENT" });
+    expect(await lock()).toEqual(before);
+  });
+
+  it("se puede desestructurar (sin dependencia de this)", async () => {
+    const { finishWith } = svc;
+    const a = await acquired();
+    expect(await finishWith(a, SUMMARY, async () => "ok")).toMatchObject({ ok: true, value: "ok" });
+  });
+});
+
 describe("API sin dependencia de this", () => {
   it("los métodos se pueden desestructurar: renew, withLease, release, acquire y recoverAbandoned funcionan igual", async () => {
     const { acquire, renew, withLease, release, recoverAbandoned } = svc;

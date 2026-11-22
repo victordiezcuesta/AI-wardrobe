@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/generated/prisma/client";
@@ -49,7 +50,14 @@ let app: PrismaClient; // la que usan los servicios: pool de 4 conexiones, trans
 let other: PrismaClient; // conexión independiente para mantener abierta «la otra» transacción
 let monitor: PrismaClient; // conexión independiente para observar esperas de bloqueo
 
-const client = (url: string, max: number) => new PrismaClient({ adapter: new PrismaPg({ connectionString: url, max }) });
+/**
+ * Identificador EXCLUSIVO de las sesiones de esta ejecución (application_name, que pg aplica a cada conexión del pool).
+ * La conexión monitor lleva otro distinto: la terminación forzosa nunca puede alcanzarla.
+ */
+const SUITE_APP = `aiw-pgc-${randomUUID().slice(0, 8)}`;
+const MONITOR_APP = `${SUITE_APP}-monitor`;
+const client = (url: string, max: number, applicationName = SUITE_APP) =>
+  new PrismaClient({ adapter: new PrismaPg({ connectionString: url, max, application_name: applicationName }) });
 
 beforeAll(async () => {
   if (!ADMIN_URL) return;
@@ -67,7 +75,7 @@ beforeAll(async () => {
   try { await applyMigrations((sql) => setup.query(sql), listMigrations()); } finally { await setup.end(); }
   app = client(url.toString(), 4);
   other = client(url.toString(), 1);
-  monitor = client(url.toString(), 1);
+  monitor = client(url.toString(), 1, MONITOR_APP);
   holder.prisma = app;
 }, 60_000);
 
@@ -88,6 +96,29 @@ afterAll(async () => {
   }
   await Promise.all([app?.$disconnect(), other?.$disconnect(), monitor?.$disconnect()]);
 });
+
+type Termination = { targeted: number[]; remaining: number[] };
+/**
+ * Termina SOLO las sesiones de esta ejecución: base temporal de esta ejecución (race_…), application_name exacto de la
+ * suite y nunca la propia conexión monitor (que además lleva otro nombre y desde la que se ejecuta). Se niega a actuar si
+ * monitor no es quien debe ser. Después espera a que esas sesiones desaparezcan y devuelve las que no lo hicieron.
+ */
+async function terminateSuiteSessions(waitMs = 5_000): Promise<Termination> {
+  if (!TEMP_DB.test(dbName)) throw new Error("Base de datos temporal inesperada: no se termina ninguna sesión");
+  const [me] = await monitor.$queryRaw<{ name: string; db: string }[]>`SELECT current_setting('application_name') AS name, current_database() AS db`;
+  if (me?.name !== MONITOR_APP || me.db !== dbName) throw new Error("La conexión monitor no es la esperada: no se termina ninguna sesión");
+  const killed = await monitor.$queryRaw<{ pid: number; ok: boolean }[]>`SELECT pid, pg_terminate_backend(pid) AS ok FROM pg_stat_activity
+    WHERE datname = ${dbName} AND application_name = ${SUITE_APP} AND pid <> pg_backend_pid()`;
+  const targeted = killed.map((k) => k.pid);
+  let remaining = targeted;
+  const end = Date.now() + waitMs;
+  while (remaining.length > 0 && Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 50));
+    const alive = new Set((await monitor.$queryRaw<{ pid: number }[]>`SELECT pid FROM pg_stat_activity WHERE datname = ${dbName}`).map((a) => a.pid));
+    remaining = targeted.filter((pid) => alive.has(pid));
+  }
+  return { targeted, remaining };
+}
 
 beforeEach(() => {
   if (!ADMIN_URL) return;
@@ -270,25 +301,152 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
     holderDb = client(url.toString(), 1);
   });
   afterAll(async () => { await holderDb?.$disconnect(); });
+  /**
+   * Limpieza garantizada, equivalente a un `finally` por prueba: cada retención (hold), barrera `done` y operación de
+   * los servicios creada en una prueba queda registrada, y el afterEach la cierra SIEMPRE, también si una aserción falló
+   * a mitad: abre las barreras, libera las retenciones (idempotente; acotadas por lock_timeout) y espera a que terminen
+   * todas las operaciones (Promise.allSettled).
+   * - Si no termina en CLEANUP_LIMIT_MS: termina a la fuerza las sesiones de la suite (terminateSuiteSessions), espera a
+   *   que lo registrado se resuelva y marca la suite como CONTAMINADA (también si la terminación falla).
+   * - Si la prueba agotó su tiempo (ctx.signal): su cuerpo puede seguir ejecutándose → suite CONTAMINADA.
+   * - Con la suite contaminada, las pruebas siguientes fallan en el beforeEach, antes de abrir ninguna transacción.
+   * - El registro de cada prueba se cierra al empezar su limpieza: lo que se intente crear después (por una prueba que
+   *   sigue ejecutándose) se rechaza sin ejecutarse y nunca se registra en la prueba siguiente.
+   */
+  type Registry = { closed: boolean; gates: { open: () => void }[]; holds: { reached: boolean; release: () => Promise<void> }[]; ops: Promise<unknown>[] };
+  class CleanupTimeoutError extends Error {
+    constructor(message: string, readonly report: Termination | null, readonly settled: boolean, cause?: unknown) { super(message, { cause }); }
+  }
+  async function within<T>(p: Promise<T>, ms: number): Promise<{ done: true; value: T } | { done: false }> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([p.then((value) => ({ done: true as const, value })), new Promise<{ done: false }>((r) => { timer = setTimeout(() => r({ done: false }), ms); })]);
+    } finally { clearTimeout(timer); }
+  }
+  function createTestTracker(opts: { limitMs: number; terminateMs?: number; settleMs: number; terminate: () => Promise<Termination> }) {
+    const terminateMs = opts.terminateMs ?? 10_000;
+    let current: Registry | null = null;
+    let contaminated: Error | null = null;
+    const blocked = () => new Error(`Suite contaminada: no se ejecuta ninguna operación. Causa: ${contaminated!.message}`, { cause: contaminated });
+    const registry = (): Registry => {
+      if (contaminated) throw blocked();
+      if (!current || current.closed) throw new Error("Recurso creado fuera de una prueba activa (una prueba ya cerrada sigue ejecutándose): no se crea ni se registra");
+      return current;
+    };
+    return {
+      get contaminated() { return contaminated; },
+      registry,
+      /** Para el beforeEach: falla (sin abrir nada) si la suite está contaminada. */
+      begin() { if (contaminated) throw blocked(); current = { closed: false, gates: [], holds: [], ops: [] }; },
+      /** Para el afterEach. */
+      async finish(signal?: AbortSignal) {
+        const reg = current; current = null;
+        if (!reg) return;
+        reg.closed = true;
+        for (const g of reg.gates) g.open();
+        const cleanup = (async () => {
+          const released = await Promise.allSettled(reg.holds.map((h) => h.release()));
+          await Promise.allSettled(reg.ops);
+          // Una retención que no llegó a retener nada ya devolvió su error a la prueba (hold() lo lanza): no es una fuga.
+          return released.flatMap((r, i) => (r.status === "rejected" && reg.holds[i]!.reached ? [r.reason as unknown] : []));
+        })();
+        const first = await within(cleanup, opts.limitMs);
+        if (first.done) {
+          if (first.value.length > 0) throw new Error("Una retención de la prueba terminó con error al liberarla", { cause: first.value[0] });
+          if (signal?.aborted) {
+            contaminated = new Error("Una prueba agotó su tiempo y su cuerpo puede seguir ejecutándose");
+            throw contaminated;
+          }
+          return;
+        }
+        // Contaminada YA, antes de terminar nada: no hay ninguna ventana en la que la suite se considere limpia.
+        contaminated = new Error(`La limpieza de la prueba no terminó en ${opts.limitMs} ms (terminación forzosa en curso)`);
+        let report: Termination | null = null; let termError: unknown; let termTimedOut = false;
+        const term = await within(opts.terminate().then((r) => ({ ok: true as const, r }), (e: unknown) => ({ ok: false as const, e })), terminateMs);
+        if (!term.done) termTimedOut = true;
+        else if (term.value.ok) report = term.value.r;
+        else termError = term.value.e;
+        const after = await within(cleanup, opts.settleMs);
+        const parts = [`La limpieza de la prueba no terminó en ${opts.limitMs} ms`];
+        if (termTimedOut) parts.push(`la terminación forzosa NO se completó en ${terminateMs} ms`);
+        else if (!report) parts.push("la terminación forzosa FALLÓ");
+        else {
+          parts.push(`sesiones de la suite terminadas: [${report.targeted.join(", ")}]`);
+          parts.push(report.remaining.length > 0 ? `NO se pudieron terminar: [${report.remaining.join(", ")}]` : "ninguna sigue abierta");
+        }
+        parts.push(after.done ? "operaciones registradas resueltas" : `quedan operaciones registradas sin resolver tras ${opts.settleMs} ms`);
+        const err = new CleanupTimeoutError(parts.join("; "), report, after.done, termError);
+        contaminated = err; // sustituye a la marca provisional: la suite sigue contaminada en cualquier caso
+        throw err;
+      },
+    };
+  }
+  type Tracker = ReturnType<typeof createTestTracker>;
+  /** Límite de espera de un bloqueo dentro de hold(): menor que el límite de limpieza, para que liberar nunca se cuelgue. */
+  const HOLD_LOCK_TIMEOUT_MS = 15_000;
+  const CLEANUP_LIMIT_MS = 20_000;
+  /** Peor caso del afterEach: 20 s de limpieza + 10 s de terminación + 5 s para resolver lo registrado = 35 s < 45 s. */
+  const TERMINATE_LIMIT_MS = 10_000;
+  const SETTLE_LIMIT_MS = 5_000;
+  const AFTER_EACH_LIMIT_MS = 45_000;
+  const T = createTestTracker({ limitMs: CLEANUP_LIMIT_MS, terminateMs: TERMINATE_LIMIT_MS, settleMs: SETTLE_LIMIT_MS, terminate: () => terminateSuiteSessions() });
+  /** Barrera que el afterEach abre si la prueba no llegó a hacerlo. */
+  const doneGate = (tracker: Tracker = T) => { const reg = tracker.registry(); const g = gate(); reg.gates.push(g); return g; };
+  /**
+   * Registra toda promesa devuelta por los métodos del servicio (no dependen de `this`, así que se pueden envolver). Queda
+   * ligado al registro de la prueba que lo creó: una vez cerrado, o con la suite contaminada, rechaza sin ejecutar nada.
+   */
+  const trackSvc = <S extends object>(svc: S, tracker: Tracker = T): S => {
+    const reg = tracker.registry();
+    return new Proxy(svc, {
+      get(target, key) {
+        const v = Reflect.get(target, key) as unknown;
+        if (typeof v !== "function") return v;
+        return (...args: unknown[]) => {
+          if (tracker.contaminated || reg.closed) return Promise.reject(tracker.contaminated
+            ? new Error(`Suite contaminada: no se ejecuta ninguna operación. Causa: ${tracker.contaminated.message}`)
+            : new Error("Operación iniciada después de cerrar su prueba: no se ejecuta"));
+          const p = (v as (...a: unknown[]) => Promise<unknown>)(...args);
+          reg.ops.push(p);
+          return p;
+        };
+      },
+    });
+  };
+  afterEach(async (ctx) => { await T.finish(ctx.signal); }, AFTER_EACH_LIMIT_MS);
   const leaseSvc = async () => {
     const { createMediaLease } = await import("@/services/media-lease.service");
-    return { a: createMediaLease(app), b: createMediaLease(other) }; // A y B: procesos con conexiones independientes
+    return { a: trackSvc(createMediaLease(app)), b: trackSvc(createMediaLease(other)) }; // A y B: conexiones independientes
   };
   const lockRow = () => monitor.mediaReconcileLock.findUniqueOrThrow({ where: { name: "media-reconcile" } });
   const runStatus = async (id: string) => (await monitor.mediaReconcileRun.findUniqueOrThrow({ where: { id } })).status;
   const LOCK_STMT = `SELECT 1 FROM "MediaReconcileLock" WHERE "name" = 'media-reconcile' FOR UPDATE`;
-  /** Retiene una fila en una transacción de holderDb hasta abrir `done` (sin modificarla). */
-  async function hold(stmt = LOCK_STMT) {
+  /**
+   * Retiene una fila en una transacción de holderDb hasta liberarla (sin modificarla). Su espera por el bloqueo está
+   * acotada (lock_timeout local a la transacción). La liberación es idempotente y queda registrada: si la prueba falla
+   * antes de llamarla, el afterEach la ejecuta.
+   */
+  async function hold(stmt = LOCK_STMT, { lockTimeoutMs = HOLD_LOCK_TIMEOUT_MS, tracker = T }: { lockTimeoutMs?: number; tracker?: Tracker } = {}) {
+    const reg = tracker.registry(); // antes de abrir nada: con la suite contaminada o la prueba cerrada, no se abre
     const inside = gate(); const done = gate();
-    const p = holderDb.$transaction(async (tx) => { await tx.$queryRawUnsafe(stmt); inside.open(); await done.wait; }, { maxWait: 10_000, timeout: 60_000 });
+    const rec = { reached: false, release: async () => undefined as void };
+    const p = holderDb.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT set_config('lock_timeout', ${String(lockTimeoutMs)}, true)`;
+      await tx.$queryRawUnsafe(stmt);
+      rec.reached = true; inside.open(); await done.wait;
+    }, { maxWait: 10_000, timeout: 60_000 });
+    let released: Promise<void> | undefined;
+    rec.release = () => (released ??= (async () => { done.open(); await p; })());
+    reg.holds.push(rec);
     await reached(inside, p);
-    return { release: async () => { done.open(); await p; } };
+    return { release: rec.release };
   }
   /** Simula que el lease vigente caducó (SQL de preparación, fuera de cualquier operación del servicio). */
   const expireNow = () => app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "heartbeatAt" = (clock_timestamp() AT TIME ZONE 'UTC') - interval '2 seconds',
     "leaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') - interval '1 second' WHERE "holderRunId" IS NOT NULL`);
   beforeEach(async () => {
     if (!ADMIN_URL) return;
+    T.begin(); // con la suite contaminada falla AQUÍ, antes de tocar la base de datos
     await app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "holderRunId" = NULL, "leaseExpiresAt" = NULL, "heartbeatAt" = NULL, "fencingToken" = 0`);
     await app.$executeRawUnsafe(`DELETE FROM "MediaAsset"`);
     await app.$executeRawUnsafe(`DELETE FROM "MediaReconcileRun"`);
@@ -302,7 +460,7 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
   it("A retiene la fila del lock en una operación protegida; B espera; al terminar A, B adquiere y A ya no puede renovar, operar ni liberar", async () => {
     const { a: svcA, b: svcB } = await leaseSvc();
     const la = await acquiredBy(svcA);
-    const inside = gate(); const done = gate();
+    const inside = gate(); const done = doneGate();
     // Operación protegida de A: la fila del lock queda bloqueada hasta el final de su transacción. Dentro, A deja
     // caducar su propio lease (simula que su tiempo se agota mientras trabaja).
     const pA = svcA.withLease(la, async (tx) => {
@@ -436,9 +594,15 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
       const h = await hold();
       const pa = svcA.acquire(OPTS);
       const pb = svcB.acquire(OPTS);
-      await waitForLockWaiters(2); // solapamiento demostrado: ambas esperan la fila
-      await h.release();
-      const rs = await Promise.all([pa, pb]);
+      let settledRs: PromiseSettledResult<Awaited<typeof pa>>[] = [];
+      try {
+        await waitForLockWaiters(2); // solapamiento demostrado: ambas esperan la fila
+      } finally {
+        // Pase lo que pase: liberar la fila y esperar a que AMBAS adquisiciones terminen (nada queda en curso).
+        await h.release();
+        settledRs = await Promise.allSettled([pa, pb]);
+      }
+      const rs = settledRs.map((r) => { if (r.status === "rejected") throw r.reason; return r.value; }); // errores originales
       expect(rs.filter((r) => r.status === "ACQUIRED")).toHaveLength(1);
       expect(rs.filter((r) => r.status === "BUSY")).toEqual([{ status: "BUSY", reason: "LEASE_HELD" }]);
       const won = rs.find((r) => r.status === "ACQUIRED")!;
@@ -446,12 +610,12 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
       expect(await lockRow()).toMatchObject({ holderRunId: won.lease.runId, fencingToken: round + 1 });
     }
     expect(await monitor.mediaReconcileRun.count({ where: { status: "RUNNING" } })).toBe(1);
-  });
+  }, 30_000); // 10 rondas con esperas reales: el límite por defecto (5 s) se queda corto
 
   it("mientras A retiene el lock con su lease VIGENTE, B espera y, al entrar, obtiene BUSY (el lease sigue siendo de A)", async () => {
     const { a: svcA, b: svcB } = await leaseSvc();
     const la = await acquiredBy(svcA);
-    const inside = gate(); const done = gate();
+    const inside = gate(); const done = doneGate();
     const pA = svcA.withLease(la, async () => { inside.open(); await done.wait; return "A"; }, OPTS);
     await reached(inside, pA);
     const pB = svcB.acquire(OPTS);
@@ -496,6 +660,291 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
     });
   });
 
+  describe("finishWith: persistencia, cierre y liberación atómicos frente a otras transacciones", () => {
+    const SUMMARY = { summary: { ok: true }, errorCodes: [] as string[] };
+    const NOW0 = new Date("2026-11-20T00:00:00Z");
+    /** Escritura realista de la persistencia futura: un MediaAsset de la ejecución actual. */
+    const writeAsset = (runId: string) => async (tx: Parameters<Parameters<Awaited<ReturnType<typeof leaseSvc>>["a"]["finishWith"]>[2]>[0]) => {
+      await tx.mediaAsset.create({ data: {
+        publicId: `ai-wardrobe/cmowner/wardrobe/${runId.slice(0, 8)}`, delivery: "UPLOAD", kind: "WARDROBE", ownerUserId: "cmowner", assetId: "a1",
+        resourceCreatedAt: NOW0, firstCandidateAt: NOW0, lastCandidateAt: NOW0, firstCandidateRunId: runId, lastCandidateRunId: runId,
+      } });
+      return "escrito";
+    };
+
+    it("frente a una adquisición concurrente: B espera a que A cierre; después adquiere con el token siguiente", async () => {
+      const { a: svcA, b: svcB } = await leaseSvc();
+      const la = await acquiredBy(svcA);
+      const inside = gate(); const done = doneGate();
+      const pA = svcA.finishWith(la, SUMMARY, async (tx) => { const v = await writeAsset(la.runId)(tx); inside.open(); await done.wait; return v; }, OPTS);
+      await reached(inside, pA);
+      const pB = svcB.acquire(OPTS);
+      await waitForLockWaiters(1);
+      expect(await settled(pB)).toBe(false);
+      done.open();
+      expect(await pA).toMatchObject({ ok: true, value: "escrito" });
+      const rb = await pB;
+      expect(rb).toMatchObject({ status: "ACQUIRED", abandoned: 0 });
+      if (rb.status !== "ACQUIRED") return;
+      expect(rb.lease.fencingToken).toBe(la.fencingToken + 1);
+      expect(await runStatus(la.runId)).toBe("COMPLETED");
+      expect(await monitor.mediaAsset.count({ where: { lastCandidateRunId: la.runId } })).toBe(1);
+    });
+
+    it("después de que otro proceso adquiriera un token nuevo: LEASE_LOST, fn no se ejecuta y el lease de B queda intacto", async () => {
+      const { a: svcA, b: svcB } = await leaseSvc();
+      const la = await acquiredBy(svcA);
+      await expireNow();
+      const lb = await acquiredBy(svcB);
+      const held = await lockRow();
+      const fn = vi.fn(writeAsset(la.runId));
+      expect(await svcA.finishWith(la, SUMMARY, fn, OPTS)).toEqual({ ok: false, reason: "LEASE_LOST" });
+      expect(fn).not.toHaveBeenCalled();
+      expect(await lockRow()).toEqual(held);
+      expect(held).toMatchObject({ holderRunId: lb.runId, fencingToken: la.fencingToken + 1 });
+      expect(await runStatus(la.runId)).toBe("ABANDONED");
+      expect(await monitor.mediaAsset.count()).toBe(0);
+    });
+
+    it.each([
+      ["vigente", false],
+      ["caducado", true],
+    ])("frente a recoverAbandoned (lease %s), en cualquier orden: nunca una ejecución COMPLETED y ABANDONED a la vez", async (_n, expired) => {
+      const { a: svcA } = await leaseSvc();
+      const { createMediaLease } = await import("@/services/media-lease.service");
+      const svcR = trackSvc(createMediaLease(other)); // recoverAbandoned desde otra conexión
+      const la = await acquiredBy(svcA);
+      if (expired) await expireNow();
+      const h = await hold();
+      const fn = vi.fn(writeAsset(la.runId));
+      const pF = svcA.finishWith(la, SUMMARY, fn, OPTS);
+      await waitForLockWaiters(1);
+      const pR = svcR.recoverAbandoned(OPTS);
+      await waitForLockWaiters(2);
+      await h.release();
+      const [rf, recovered] = await Promise.all([pF, pR]);
+      if (!expired) {
+        expect(rf).toMatchObject({ ok: true });
+        expect(recovered).toBe(0); // un lease vigente nunca se abandona; tras cerrar, no queda nada RUNNING
+        expect(await runStatus(la.runId)).toBe("COMPLETED");
+        expect(await monitor.mediaAsset.count()).toBe(1);
+        expect(await lockRow()).toMatchObject({ holderRunId: null, leaseExpiresAt: null });
+      } else {
+        expect(rf).toEqual({ ok: false, reason: "LEASE_LOST" }); // caducado: nunca se cierra
+        expect(fn).not.toHaveBeenCalled();
+        expect(recovered).toBe(1);
+        expect(await runStatus(la.runId)).toBe("ABANDONED");
+        expect(await monitor.mediaAsset.count()).toBe(0);
+      }
+    });
+
+    it("una espera por el bloqueo no permite usar una validación obsoleta: si el lease caduca mientras espera, LEASE_LOST", async () => {
+      const { a: svcA } = await leaseSvc();
+      const la = await acquiredBy(svcA);
+      await app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "heartbeatAt" = (clock_timestamp() AT TIME ZONE 'UTC'),
+        "leaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + interval '1500 milliseconds'`);
+      const h = await hold(); // retiene la fila SIN modificarla (como recoverAbandoned)
+      const fn = vi.fn(writeAsset(la.runId));
+      const pF = svcA.finishWith(la, SUMMARY, fn, OPTS);
+      await waitForLockWaiters(1);
+      for (let end = Date.now() + 10_000; ; ) {
+        const [r] = await monitor.$queryRaw<{ expired: boolean }[]>`SELECT "leaseExpiresAt" <= (clock_timestamp() AT TIME ZONE 'UTC') AS expired FROM "MediaReconcileLock"`;
+        if (r!.expired) break;
+        if (Date.now() > end) throw new Error("el lease no llegó a caducar");
+        await new Promise((r2) => setTimeout(r2, 50));
+      }
+      expect(await settled(pF)).toBe(false);
+      await h.release();
+      expect(await pF).toEqual({ ok: false, reason: "LEASE_LOST" });
+      expect(fn).not.toHaveBeenCalled();
+      expect(await runStatus(la.runId)).toBe("RUNNING");
+      expect(await monitor.mediaAsset.count()).toBe(0);
+    });
+
+    it("una transacción fallida (error real de PostgreSQL dentro de fn) no deja cambios parciales y el lease sigue siendo de A", async () => {
+      const { a: svcA, b: svcB } = await leaseSvc();
+      const la = await acquiredBy(svcA);
+      const before = await lockRow();
+      const err = await svcA.finishWith(la, SUMMARY, async (tx) => {
+        await writeAsset(la.runId)(tx);
+        // Viola MediaAsset_assetId_check: error real de la base de datos a mitad de la persistencia.
+        await tx.$executeRaw`UPDATE "MediaAsset" SET "assetId" = '' WHERE "lastCandidateRunId" = ${la.runId}`;
+        return "no";
+      }, OPTS).then(() => null, (e: unknown) => e);
+      expect(err).toBeTruthy();
+      expect(await monitor.mediaAsset.count()).toBe(0);
+      expect(await runStatus(la.runId)).toBe("RUNNING");
+      expect(await lockRow()).toEqual(before);
+      expect(await svcB.acquire(OPTS)).toEqual({ status: "BUSY", reason: "LEASE_HELD" });
+      expect(await svcA.finishWith(la, SUMMARY, writeAsset(la.runId), OPTS)).toMatchObject({ ok: true }); // y A puede reintentar
+    });
+  });
+
+  describe("limpieza de las pruebas: retenciones acotadas, terminación forzosa y suite contaminada", () => {
+    const dbUrl = () => { const u = new URL(ADMIN_URL!); u.pathname = `/${dbName}`; return u.toString(); };
+    /** Sesión AJENA a la suite (otro application_name): nunca debe terminarse. */
+    async function foreign(url: string, applicationName: string) {
+      const c = new pg.Client({ connectionString: url, application_name: applicationName });
+      await c.connect();
+      const [{ pid }] = (await c.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows as [{ pid: number }];
+      return { c, pid };
+    }
+    const alive = async (pid: number) => (await monitor.$queryRaw<{ n: number }[]>`SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid = ${pid}`)[0]!.n === 1;
+
+    it("identifica sus sesiones: todas las de la base temporal llevan el application_name exclusivo de la suite, salvo monitor", async () => {
+      await Promise.all([...Array.from({ length: 4 }, () => app.$queryRaw`SELECT 1 AS n FROM pg_sleep(0.1)`), other.$queryRaw`SELECT 1`, holderDb.$queryRaw`SELECT 1`]);
+      expect(SUITE_APP).toMatch(/^aiw-pgc-[0-9a-f]{8}$/);
+      const [me] = await monitor.$queryRaw<{ name: string; pid: number }[]>`SELECT current_setting('application_name') AS name, pg_backend_pid() AS pid`;
+      expect(me!.name).toBe(MONITOR_APP);
+      const rows = await monitor.$queryRaw<{ pid: number; name: string }[]>`SELECT pid, application_name AS name FROM pg_stat_activity
+        WHERE datname = ${dbName} AND backend_type = 'client backend' AND pid <> pg_backend_pid()`;
+      expect(rows.length).toBeGreaterThanOrEqual(6); // 4 de app (el pool completo), other y holderDb
+      expect(new Set(rows.map((r) => r.name))).toEqual(new Set([SUITE_APP]));
+    });
+
+    it("hold() falla de forma acotada si no puede obtener el bloqueo (lock_timeout local), y su límite es menor que el de la limpieza", async () => {
+      expect(HOLD_LOCK_TIMEOUT_MS).toBeLessThan(CLEANUP_LIMIT_MS);
+      const f = await foreign(dbUrl(), "aiw-ajena-hold");
+      try {
+        await f.c.query("BEGIN"); await f.c.query(LOCK_STMT); // la fila queda retenida por una sesión fuera del registro
+        const t0 = Date.now();
+        const err = await hold(LOCK_STMT, { lockTimeoutMs: 300 }).then(() => null, (e: unknown) => e);
+        expect(String((err as Error | null)?.message)).toMatch(/lock timeout/i);
+        expect(Date.now() - t0).toBeLessThan(5_000);
+        // El valor es local a la transacción: no se filtra a la conexión de holderDb.
+        expect((await holderDb.$queryRaw<{ v: string }[]>`SELECT current_setting('lock_timeout') AS v`)[0]!.v).toBe("0");
+      } finally { await f.c.query("ROLLBACK").catch(() => undefined); await f.c.end(); }
+    });
+
+    it("si vence el límite: termina SOLO las sesiones de la suite (nunca monitor ni sesiones ajenas), y la suite queda contaminada sin ejecutar nada más", async () => {
+      const { createMediaLease } = await import("@/services/media-lease.service");
+      const ajenaMismaBase = await foreign(dbUrl(), "aiw-ajena-misma-base");
+      const mismoNombreOtraBase = await foreign(ADMIN_URL!, SUITE_APP); // mismo application_name, OTRA base de datos
+      try {
+        await ajenaMismaBase.c.query("BEGIN"); await ajenaMismaBase.c.query(LOCK_STMT); // transacción ajena abierta
+        const t = createTestTracker({ limitMs: 300, settleMs: 5_000, terminate: () => terminateSuiteSessions() });
+        t.begin();
+        const svc = trackSvc(createMediaLease(app), t);
+        // Operación de la suite que espera SIN límite (lock_timeout 0) tras la transacción ajena: la limpieza no termina.
+        const blocked = other.$transaction(async (tx) => { await tx.$queryRawUnsafe(LOCK_STMT); }, { maxWait: 10_000, timeout: 60_000 });
+        t.registry().ops.push(blocked);
+        await waitForLockWaiters(1);
+        const [w] = await monitor.$queryRaw<{ pid: number }[]>`SELECT pid FROM pg_stat_activity WHERE datname = ${dbName} AND wait_event_type = 'Lock'`;
+        const monitorPid = (await monitor.$queryRaw<{ pid: number }[]>`SELECT pg_backend_pid() AS pid`)[0]!.pid;
+
+        const err = await t.finish().then(() => null, (e: unknown) => e);
+        expect(err).toBeInstanceOf(CleanupTimeoutError);
+        const { report, settled, message } = err as CleanupTimeoutError;
+        expect(message).toMatch(/no terminó en 300 ms/);
+        expect(report!.targeted).toContain(w!.pid); // la sesión bloqueada de la suite
+        expect(report!.targeted).not.toContain(monitorPid);
+        expect(report!.targeted).not.toContain(ajenaMismaBase.pid);
+        expect(report!.targeted).not.toContain(mismoNombreOtraBase.pid);
+        expect(report!.remaining).toEqual([]);
+        expect(settled).toBe(true);
+        expect(await blocked.then(() => "ok", () => "rechazada")).toBe("rechazada");
+
+        // Intactas: monitor, la sesión ajena (con su transacción abierta) y la de otra base de datos.
+        expect(await alive(monitorPid)).toBe(true);
+        expect(await alive(ajenaMismaBase.pid)).toBe(true);
+        const [st] = await monitor.$queryRaw<{ state: string }[]>`SELECT state FROM pg_stat_activity WHERE pid = ${ajenaMismaBase.pid}`;
+        expect(st!.state).toBe("idle in transaction");
+        expect((await mismoNombreOtraBase.c.query("SELECT 1 AS n")).rows).toEqual([{ n: 1 }]);
+        // Ninguna sesión de la suite sigue dentro de una transacción.
+        const [open] = await monitor.$queryRaw<{ n: number }[]>`SELECT count(*)::int AS n FROM pg_stat_activity
+          WHERE datname = ${dbName} AND application_name = ${SUITE_APP} AND xact_start IS NOT NULL`;
+        expect(open!.n).toBe(0);
+
+        // Contaminada: nada vuelve a ejecutarse ni a registrarse.
+        expect(t.contaminated).toBe(err);
+        expect(() => t.begin()).toThrow(/Suite contaminada/);
+        expect(() => t.registry()).toThrow(/Suite contaminada/);
+        await expect(hold(LOCK_STMT, { tracker: t })).rejects.toThrow(/Suite contaminada/);
+        await expect(svc.acquire(OPTS)).rejects.toThrow(/Suite contaminada/);
+        expect(Number((await lockRow()).fencingToken)).toBe(0); // acquire no llegó a ejecutarse
+      } finally {
+        await ajenaMismaBase.c.query("ROLLBACK").catch(() => undefined);
+        await Promise.all([ajenaMismaBase.c.end(), mismoNombreOtraBase.c.end()]);
+      }
+    });
+
+    it("si la terminación forzosa falla, la suite también queda contaminada y se informa", async () => {
+      const t = createTestTracker({ limitMs: 100, settleMs: 100, terminate: async () => { throw new Error("sin permiso"); } });
+      t.begin();
+      t.registry().ops.push(new Promise(() => undefined)); // nunca termina
+      const err = await t.finish().then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(CleanupTimeoutError);
+      expect((err as Error).message).toMatch(/terminación forzosa FALLÓ.*sin resolver/);
+      expect(((err as Error).cause as Error).message).toBe("sin permiso");
+      expect(() => t.begin()).toThrow(/Suite contaminada/);
+    });
+
+    it("si la terminación forzosa se cuelga: la suite ya está contaminada mientras se ejecuta, y se corta a los terminateMs", async () => {
+      expect(CLEANUP_LIMIT_MS + TERMINATE_LIMIT_MS + SETTLE_LIMIT_MS).toBeLessThan(AFTER_EACH_LIMIT_MS - 5_000); // margen
+      let during: { begin?: unknown; gate?: unknown; hold?: unknown; svc?: unknown; flag?: unknown } = {};
+      const { createMediaLease } = await import("@/services/media-lease.service");
+      const t = createTestTracker({ limitMs: 100, terminateMs: 300, settleMs: 100, terminate: async () => {
+        // Comprobado DENTRO de la terminación: la marca ya está activa para todo lo que podría abrir algo.
+        during = {
+          flag: t.contaminated?.message,
+          begin: (() => { try { t.begin(); return "ok"; } catch (e) { return (e as Error).message; } })(),
+          gate: (() => { try { doneGate(t); return "ok"; } catch (e) { return (e as Error).message; } })(),
+          hold: await hold(LOCK_STMT, { tracker: t }).then(() => "ok", (e: Error) => e.message),
+          svc: await svc.acquire(OPTS).then(() => "ok", (e: Error) => e.message),
+        };
+        return new Promise<never>(() => undefined); // nunca termina
+      } });
+      t.begin();
+      const svc = trackSvc(createMediaLease(app), t);
+      t.registry().ops.push(new Promise(() => undefined)); // la limpieza no termina
+      const t0 = Date.now();
+      const err = await t.finish().then(() => null, (e: unknown) => e);
+      expect(Date.now() - t0).toBeLessThan(3_000); // 100 + 300 + 100 ms, sin quedarse colgado
+      expect(during.flag).toMatch(/terminación forzosa en curso/);
+      for (const k of ["begin", "gate", "hold", "svc"] as const) expect(during[k]).toMatch(/Suite contaminada/);
+      expect(err).toBeInstanceOf(CleanupTimeoutError);
+      expect((err as Error).message).toMatch(/no terminó en 100 ms; la terminación forzosa NO se completó en 300 ms;.*sin resolver/);
+      expect(t.contaminated).toBe(err);
+      expect(() => t.begin()).toThrow(/Suite contaminada/);
+      expect(Number((await lockRow()).fencingToken)).toBe(0); // nada llegó a ejecutarse
+    });
+
+    it("una prueba que agotó su tiempo contamina la suite aunque su limpieza termine", async () => {
+      const t = createTestTracker({ limitMs: 1_000, settleMs: 100, terminate: () => Promise.reject(new Error("no debe llamarse")) });
+      t.begin();
+      const ac = new AbortController(); ac.abort();
+      await expect(t.finish(ac.signal)).rejects.toThrow(/agotó su tiempo/);
+      expect(() => t.begin()).toThrow(/Suite contaminada/);
+    });
+
+    it("limpieza normal: libera retenciones, abre barreras y espera operaciones; lo creado después no se registra en la prueba siguiente", async () => {
+      const { createMediaLease } = await import("@/services/media-lease.service");
+      const t = createTestTracker({ limitMs: 5_000, settleMs: 1_000, terminate: () => Promise.reject(new Error("no debe llamarse")) });
+      t.begin();
+      const svc = trackSvc(createMediaLease(app), t);
+      await hold(LOCK_STMT, { tracker: t }); // sin liberar, como en una prueba que falla a mitad
+      const done = doneGate(t);
+      const waiting = svc.acquire(OPTS); // espera la fila retenida
+      await waitForLockWaiters(1);
+      let opened = false; void done.wait.then(() => { opened = true; });
+      await t.finish();
+      expect(opened).toBe(true);
+      const got = await waiting;
+      if (got.status !== "ACQUIRED") throw new Error("no adquirió durante la limpieza"); // terminó durante la limpieza
+      expect(t.contaminated).toBeNull();
+      // Prueba cerrada: lo que intente crear después se rechaza sin ejecutarse.
+      expect(() => doneGate(t)).toThrow(/fuera de una prueba activa/);
+      await expect(hold(LOCK_STMT, { tracker: t })).rejects.toThrow(/fuera de una prueba activa/);
+      await expect(svc.renew(got.lease, OPTS)).rejects.toThrow(/después de cerrar su prueba/);
+      t.begin(); // la siguiente prueba empieza con un registro vacío
+      expect(t.registry()).toEqual({ closed: false, gates: [], holds: [], ops: [] });
+      await t.finish();
+      const [r] = await monitor.$queryRaw<{ n: number }[]>`SELECT count(*)::int AS n FROM pg_stat_activity
+        WHERE datname = ${dbName} AND application_name = ${SUITE_APP} AND xact_start IS NOT NULL`;
+      expect(r!.n).toBe(0);
+    });
+  });
+
   it("no usa el reloj de Node: con la hora del sistema en 2099, el lease se calcula con el reloj de PostgreSQL", async () => {
     const { a: svcA } = await leaseSvc();
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -506,6 +955,8 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
     const [row] = await monitor.$queryRaw<{ now: Date }[]>`SELECT (clock_timestamp() AT TIME ZONE 'UTC') AS now`;
     const now = row!.now;
     expect(r.lease.leaseExpiresAt.getUTCFullYear()).not.toBe(2099);
+    expect(r.lease.startedAt!.getUTCFullYear()).not.toBe(2099); // startedAt también viene de PostgreSQL
+    expect(Math.abs(r.lease.startedAt!.getTime() - now.getTime())).toBeLessThan(10_000);
     expect(Math.abs(r.lease.leaseExpiresAt.getTime() - (now.getTime() + 60_000))).toBeLessThan(10_000);
   });
 });
