@@ -42,6 +42,7 @@ vi.mock("@/lib/cloudinary", () => {
     deletePrivateImages: remove,
     deleteImage: async (id: string | null | undefined) => { if (id) await remove([id]); },
     deleteImages: remove,
+    deleteAllUserAssets: async () => undefined, // borrado de cuentas (fase 19.6.3): Cloudinary simulado
   };
 });
 
@@ -777,6 +778,125 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
       expect(await lockRow()).toEqual(before);
       expect(await svcB.acquire(OPTS)).toEqual({ status: "BUSY", reason: "LEASE_HELD" });
       expect(await svcA.finishWith(la, SUMMARY, writeAsset(la.runId), OPTS)).toMatchObject({ ok: true }); // y A puede reintentar
+    });
+  });
+
+  describe("persistencia de MediaAsset (19.6.3) frente a finishWith y al borrado REAL de cuentas", () => {
+    const DONE = { summary: { ok: 1 }, errorCodes: [] };
+    type Cand = import("@/services/media-reconcile.service").MediaCandidate;
+    const cand = (owner: string, name: string): Cand => ({
+      publicId: `ai-wardrobe/${owner}/wardrobe/${name}`, delivery: "upload", kind: "wardrobe", ownerUserId: owner, ownerMissing: false,
+      assetId: `as-${name}`, version: 1, bytes: 10, format: "jpg", resourceCreatedAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    const detection = (cands: Cand[]) => ({
+      report: { complete: true, inventoryStatus: "COMPLETE", inventoryComplete: { upload: true, authenticated: true }, errors: [],
+        byCategory: { ORPHAN_CANDIDATE: cands.length } } as never,
+      candidates: cands,
+    });
+    const detectionAt = (startedAt: Date, cands: Cand[]) => {
+      const d = detection(cands);
+      return { ...d, report: { ...(d.report as object), startedAt: startedAt.toISOString() } as never };
+    };
+    const services = async () => ({
+      ...(await leaseSvc()),
+      persist: (await import("@/services/media-asset.service")).persistMediaCandidates,
+      account: (await import("@/services/account.service")).accountService,
+    });
+    /** Registra una operación en la limpieza de la prueba (se espera siempre, también si la prueba falla). */
+    const tracked = <R,>(p: Promise<R>): Promise<R> => { T.registry().ops.push(p); return p; };
+    const assets = (owner: string) => monitor.mediaAsset.count({ where: { ownerUserId: owner } });
+    const exists = async (id: string) => (await monitor.user.count({ where: { id } })) === 1;
+    /** Ejecución completa previa: deja filas activas de `cands`. */
+    async function seed(svc: Awaited<ReturnType<typeof services>>, cands: Cand[]) {
+      const l = await acquiredBy(svc.a);
+      const r = await svc.a.finishWith(l, DONE, (tx) => svc.persist(tx, { runId: l.runId, startedAt: l.startedAt, detection: detectionAt(l.startedAt, cands) }));
+      expect(r.ok).toBe(true);
+    }
+
+    it("17. atomicidad real: mientras la transacción de finishWith sigue abierta, otra conexión no ve nada; al cerrar, todo a la vez", async () => {
+      const svc = await services();
+      const u = await newUser();
+      const l = await acquiredBy(svc.a);
+      const inside = gate(); const done = doneGate();
+      const p = svc.a.finishWith(l, DONE, async (tx) => {
+        const s = await svc.persist(tx, { runId: l.runId, startedAt: l.startedAt, detection: detectionAt(l.startedAt, [cand(u.id, "a"), cand(u.id, "b")]) });
+        inside.open(); await done.wait; return s;
+      });
+      await reached(inside, p);
+      expect(await assets(u.id)).toBe(0); // escrito, pero sin confirmar
+      expect(await runStatus(l.runId)).toBe("RUNNING");
+      done.open();
+      expect(await p).toMatchObject({ ok: true, value: { created: 2 } });
+      expect(await assets(u.id)).toBe(2);
+      expect(await runStatus(l.runId)).toBe("COMPLETED");
+      expect((await lockRow()).holderRunId).toBeNull();
+    });
+
+    it("M1. fuera de finishWith, la persistencia bloquea el lock y comprueba la caducidad DESPUÉS de esperar: si caduca mientras espera, RUN_NOT_ACTIVE", async () => {
+      const svc = await services();
+      const u = await newUser();
+      const l = await acquiredBy(svc.a);
+      await app.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "heartbeatAt" = (clock_timestamp() AT TIME ZONE 'UTC'),
+        "leaseExpiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + interval '1500 milliseconds'`);
+      const h = await hold(); // retiene la fila del lock SIN modificarla
+      const p = tracked(app.$transaction((tx) => svc.persist(tx, { runId: l.runId, startedAt: l.startedAt, detection: detectionAt(l.startedAt, [cand(u.id, "a")]) })));
+      await waitForLockWaiters(1);
+      for (let end = Date.now() + 10_000; ; ) {
+        const [r] = await monitor.$queryRaw<{ expired: boolean }[]>`SELECT "leaseExpiresAt" <= (clock_timestamp() AT TIME ZONE 'UTC') AS expired FROM "MediaReconcileLock"`;
+        if (r!.expired) break;
+        if (Date.now() > end) throw new Error("el lease no llegó a caducar");
+        await new Promise((r2) => setTimeout(r2, 50));
+      }
+      expect(await settled(p)).toBe(false); // sigue esperando la fila
+      await h.release();
+      await expect(p).rejects.toMatchObject({ code: "RUN_NOT_ACTIVE" });
+      expect(await assets(u.id)).toBe(0);
+      expect(await runStatus(l.runId)).toBe("RUNNING");
+    });
+
+    it("13. la persistencia llega antes: los borrados de cuenta esperan y después eliminan TODO (también las filas recién creadas); sin interbloqueos", async () => {
+      const svc = await services();
+      const u = await newUser(); const v = await newUser();
+      await seed(svc, [cand(v.id, "vieja")]); // v: fila activa que esta ejecución no ve (pasará a CLEARED)
+      const l = await acquiredBy(svc.a);
+      const inside = gate(); const done = doneGate();
+      const p = svc.a.finishWith(l, DONE, async (tx) => {
+        const s = await svc.persist(tx, { runId: l.runId, startedAt: l.startedAt, detection: detectionAt(l.startedAt, [cand(u.id, "nueva")]) });
+        inside.open(); await done.wait; return s; // con FOR KEY SHARE de u y v
+      });
+      await reached(inside, p);
+      const delU = tracked(svc.account.delete(u.id, "")); const delV = tracked(svc.account.delete(v.id, ""));
+      await waitForLockWaiters(2); // los dos borrados esperan la fila de su usuario
+      expect(await exists(u.id) && await exists(v.id)).toBe(true);
+      done.open();
+      expect(await p).toMatchObject({ ok: true, value: { created: 1, cleared: 1 } });
+      await Promise.all([delU, delV]);
+      expect([await exists(u.id), await exists(v.id)]).toEqual([false, false]);
+      expect([await assets(u.id), await assets(v.id)]).toEqual([0, 0]); // la fila nueva de u no sobrevive a su cuenta
+      expect(await runStatus(l.runId)).toBe("COMPLETED");
+    });
+
+    it("13. el borrado de cuenta llega antes (ya tiene la fila del usuario): la persistencia espera, ve la cuenta borrada y no recrea nada", async () => {
+      const svc = await services();
+      const u = await newUser();
+      await seed(svc, [cand(u.id, "vieja")]);
+      const token = `tok-${Math.random().toString(36).slice(2)}`;
+      await app.verificationToken.create({ data: { identifier: u.email, token, expires: new Date(Date.now() + 3_600_000) } });
+      // El borrado REAL bloquea primero el usuario y se detiene en su siguiente sentencia (la fila del token está retenida).
+      const h = await hold(`SELECT 1 FROM "VerificationToken" WHERE "token" = '${token}' FOR UPDATE`);
+      const del = tracked(svc.account.delete(u.id, ""));
+      await waitForLockWaiters(1);
+      const l = await acquiredBy(svc.a);
+      const p = svc.a.finishWith(l, DONE, (tx) => svc.persist(tx, { runId: l.runId, startedAt: l.startedAt, detection: detectionAt(l.startedAt, [cand(u.id, "nueva")]) }));
+      await waitForLockWaiters(2); // la persistencia espera la fila del usuario (FOR KEY SHARE)
+      expect(await assets(u.id)).toBe(1);
+      await h.release();
+      await del;
+      // El detector vio al usuario y ahora no existe: no se crea la nueva ni se toca la vieja (la borró la cuenta).
+      expect(await p).toMatchObject({ ok: true, value: { created: 0, cleared: 0, skippedOwnerDeleted: 1 } });
+      expect(await exists(u.id)).toBe(false);
+      expect(await assets(u.id)).toBe(0);
+      expect(await runStatus(l.runId)).toBe("COMPLETED");
     });
   });
 

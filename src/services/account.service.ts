@@ -42,6 +42,10 @@ export const accountService = {
       throw new AppError("No hemos podido borrar tus imágenes, así que no se ha eliminado la cuenta. Inténtalo de nuevo en unos minutos.", 502, "ASSET_DELETE_FAILED");
     }
     await prisma.$transaction([
+      // PRIMERO se bloquea la fila del usuario (orden de bloqueos User → MediaAsset, el mismo que la persistencia de la
+      // reconciliación, que toma FOR KEY SHARE de los propietarios antes de tocar MediaAsset): sin interbloqueos, y una
+      // persistencia en curso termina antes de que el borrado lea MediaAsset (sus filas nuevas también se eliminan).
+      prisma.$queryRaw`SELECT 1 FROM "User" WHERE "id" = ${userId} FOR UPDATE`,
       prisma.verificationToken.deleteMany({ where: { identifier: user.email } }),
       prisma.$executeRaw`DELETE FROM "RateLimit" WHERE "key" LIKE ${`%:${userId}`}`,
       // Reconciliación de medios: MediaAsset no tiene FK a User (debe poder sobrevivir a la cuenta mientras el
