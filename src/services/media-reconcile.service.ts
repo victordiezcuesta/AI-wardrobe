@@ -10,7 +10,8 @@ import { prisma } from "@/lib/prisma";
  *
  * Recorre el inventario de Cloudinary bajo `ai-wardrobe/` (públicas y privadas, paginado) y lo compara con las fuentes
  * de verdad de PostgreSQL. No borra, mueve ni etiqueta nada en Cloudinary y no escribe en la base de datos.
- * Devuelve un informe AGREGADO (recuentos, sin publicId, userId ni URLs).
+ * Devuelve un informe AGREGADO (recuentos, sin publicId, userId ni URLs). La variante interna detectOrphanMediaDetailed
+ * devuelve además las candidatas detalladas para la futura persistencia (nunca se exponen ni se registran).
  *
  * Fuentes de verdad (referencias de almacenamiento):
  * - wardrobe  (público)  → WardrobeItem.imagePublicId (varias prendas pueden compartir imagen);
@@ -314,9 +315,48 @@ function urlProtection(urls: (string | null)[], cloudName: string): UrlProtectio
   return p;
 }
 
-export async function detectOrphanMedia(opts: { now?: Date; graceMs?: number; maxPagesPerType?: number; budgetMs?: number; listPage?: ListPage } = {}): Promise<MediaReconcileReport> {
+/**
+ * Candidata DEMOSTRADA (solo ORPHAN_CANDIDATE de una ejecución completa) con lo necesario para persistirla. Uso INTERNO:
+ * nunca forma parte del informe, de respuestas HTTP, de logs ni de errores (contiene identificadores).
+ * - `ownerUserId`: el de la ruta `ai-wardrobe/<userId>/…`. `ownerMissing`: la consulta de propietarios funcionó y ese
+ *   usuario no existe (si la consulta falla, el recurso queda INCOMPLETE y no hay candidata).
+ * - `assetId`: el valor opaco tal como llegó (validado, sin normalizar). `version`, `bytes` y `format`: null si no venían.
+ */
+export interface MediaCandidate {
+  publicId: string;
+  delivery: DeliveryType;
+  kind: MediaKind;
+  ownerUserId: string;
+  ownerMissing: boolean;
+  assetId: string;
+  version: number | null;
+  bytes: number | null;
+  format: string | null;
+  resourceCreatedAt: Date;
+}
+export interface DetailedDetection { report: MediaReconcileReport; candidates: readonly Readonly<MediaCandidate>[] }
+type DetectOpts = { now?: Date; graceMs?: number; maxPagesPerType?: number; budgetMs?: number; listPage?: ListPage };
+
+/** Informe AGREGADO (contrato público del endpoint): sin identificadores, URLs ni datos personales. */
+export async function detectOrphanMedia(opts: DetectOpts = {}): Promise<MediaReconcileReport> {
+  return run(opts, null);
+}
+
+/**
+ * Variante INTERNA para la reconciliación persistente: el mismo informe más las candidatas detalladas. `now` es
+ * obligatorio y debe ser el `startedAt` del lease (reloj de PostgreSQL): la antigüedad nunca se calcula con el reloj de
+ * Node. Se copia al empezar, así que ni el reloj del sistema ni cambios posteriores en el objeto recibido la alteran.
+ */
+export async function detectOrphanMediaDetailed(opts: DetectOpts & { now: Date }): Promise<DetailedDetection> {
+  if (!(opts?.now instanceof Date) || Number.isNaN(opts.now.getTime())) throw new TypeError("detectOrphanMediaDetailed requiere `now` (startedAt del lease)");
+  const candidates: MediaCandidate[] = [];
+  const report = await run(opts, candidates);
+  return { report, candidates: Object.freeze(candidates.map((c) => Object.freeze(c))) };
+}
+
+async function run(opts: DetectOpts, candidates: MediaCandidate[] | null): Promise<MediaReconcileReport> {
   const t0 = Date.now();
-  const now = opts.now ?? new Date();
+  const now = new Date((opts.now ?? new Date()).getTime()); // copia: el instante de referencia no puede cambiar a mitad
   const graceMs = effectiveGraceMs(opts.graceMs);
   const listPage = opts.listPage ?? listAppResourcesPage;
   const report: MediaReconcileReport = {
@@ -398,7 +438,12 @@ export async function detectOrphanMedia(opts: { now?: Date; graceMs?: number; ma
     // Última comprobación: la ejecución debe ser completa. Solo aquí se cuenta candidatesWithheld.
     if (!actionable) { report.byCategory.INCOMPLETE++; report.candidatesWithheld++; continue; }
     report.byCategory.ORPHAN_CANDIDATE++;
-    if (!owners.has(p.userId)) report.orphanDetail.ownerMissing++;
+    const ownerMissing = !owners.has(p.userId);
+    if (ownerMissing) report.orphanDetail.ownerMissing++;
+    candidates?.push({
+      publicId: it.publicId, delivery: it.delivery, kind: p.kind, ownerUserId: p.userId, ownerMissing, assetId: it.assetId,
+      version: it.version, bytes: it.bytes, format: it.format, resourceCreatedAt: new Date(it.createdAt.getTime()),
+    });
     if (p.kind === "personal" && sourceCites?.has(it.publicId)) report.orphanDetail.personalCitedOnlyBySourcePhoto++;
   }
 

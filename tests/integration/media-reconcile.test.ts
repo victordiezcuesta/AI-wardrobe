@@ -1053,3 +1053,141 @@ describe("19.2.0 asset_id como identificador opaco", () => {
     expect(n).toMatchObject({ ok: true, item: { assetId: "Mixed-Case_ID" } });
   });
 });
+
+// ───────────────────── Fase 19.6.2: salida interna detallada (candidatas para la persistencia) ─────────────────────
+
+describe("19.6.2 detectOrphanMediaDetailed: candidatas detalladas, solo internas", () => {
+  const detailed = async (opts: Record<string, unknown> = {}) =>
+    (await import("@/services/media-reconcile.service")).detectOrphanMediaDetailed({ now: NOW, ...opts } as never);
+  const withoutDuration = (r: { durationMs: number }) => ({ ...r, durationMs: 0 });
+
+  it("cada candidata trae exactamente los campos necesarios, con los valores opacos tal como llegaron", async () => {
+    const u = await user();
+    const w = `ai-wardrobe/${u.id}/wardrobe/Foto_Ñ-1`; const p = `ai-wardrobe/${u.id}/personal/p`; const g = "ai-wardrobe/ghost-owner/try-on/g";
+    paginate("upload", [{ ...res(w, "upload"), asset_id: "Mixed-Case_ID:01/ab", version: 7, bytes: 0, format: "webp" }]);
+    paginate("authenticated", [
+      { public_id: p, type: "authenticated", resource_type: "image", created_at: "2026-11-18T12:00:00.123Z", asset_id: "p-asset" }, // sin version/bytes/format
+      res(g, "authenticated"),
+    ]);
+    const { report, candidates } = await detailed();
+    expect(report.complete).toBe(true);
+    expect(candidates).toEqual([
+      { publicId: w, delivery: "upload", kind: "wardrobe", ownerUserId: u.id, ownerMissing: false, assetId: "Mixed-Case_ID:01/ab",
+        version: 7, bytes: 0, format: "webp", resourceCreatedAt: new Date(OLD) },
+      { publicId: p, delivery: "authenticated", kind: "personal", ownerUserId: u.id, ownerMissing: false, assetId: "p-asset",
+        version: null, bytes: null, format: null, resourceCreatedAt: new Date("2026-11-18T12:00:00.123Z") },
+      { publicId: g, delivery: "authenticated", kind: "try-on", ownerUserId: "ghost-owner", ownerMissing: true, assetId: res(g, "authenticated").asset_id,
+        version: 1732190000, bytes: 12345, format: "jpg", resourceCreatedAt: new Date(OLD) },
+    ]);
+    for (const c of candidates) expect(Object.keys(c).sort()).toEqual(
+      ["assetId", "bytes", "delivery", "format", "kind", "ownerMissing", "ownerUserId", "publicId", "resourceCreatedAt", "version"]);
+    expect(Object.isFrozen(candidates) && candidates.every((c) => Object.isFrozen(c))).toBe(true);
+    expect(report.byCategory.ORPHAN_CANDIDATE).toBe(3);
+    expect(report.orphanDetail.ownerMissing).toBe(1);
+    // El informe es EXACTAMENTE el del detector público (mismas entradas) y no contiene ningún dato detallado.
+    expect(withoutDuration(report)).toEqual(withoutDuration(await detect()));
+    expect(JSON.stringify(report)).not.toMatch(/ai-wardrobe\/|ghost-owner|Mixed-Case|p-asset/);
+    expect(JSON.stringify(report)).not.toContain(u.id);
+    expect(holder.writes).toEqual([]);
+    expect(admin.mutations).toEqual([]);
+  });
+
+  it("REFERENCED, TOO_RECENT, UNKNOWN, QUARANTINED e INCOMPLETE (URL ambigua, metadatos ausentes) nunca son candidatas", async () => {
+    const u = await user(); const v = await user();
+    const refd = `ai-wardrobe/${u.id}/wardrobe/r`; await item(u.id, refd);
+    const byUrl = `ai-wardrobe/${u.id}/wardrobe/por-url`;
+    await t.prisma.user.update({ where: { id: u.id }, data: { image: url(byUrl) } });
+    await t.prisma.user.update({ where: { id: v.id }, data: { image: `https://res.cloudinary.com/demo/image/upload/v1/ai-wardrobe/${v.id}/wardrobe/x%2Fy` } }); // ambigua → protege a v
+    const orphan = `ai-wardrobe/${u.id}/wardrobe/huerfana`;
+    paginate("upload", [
+      res(refd, "upload"), res(byUrl, "upload"), res(`ai-wardrobe/${u.id}/wardrobe/nueva`, "upload", RECENT),
+      res(`ai-wardrobe/${u.id}/personal/en-upload`, "upload"), // tipo de entrega inesperado → UNKNOWN
+      res(`ai-wardrobe/${u.id}/otra-carpeta/z`, "upload"), // ruta no reconocida → UNKNOWN
+      res(`ai-wardrobe/${u.id}/_quarantine/wardrobe/q`, "upload"),
+      res(`ai-wardrobe/${v.id}/wardrobe/ambigua`, "upload"),
+      { ...res(`ai-wardrobe/${u.id}/wardrobe/sin-asset`, "upload"), asset_id: "con espacio" }, // metadato obligatorio inválido
+      res(orphan, "upload"),
+    ]);
+    const { report, candidates } = await detailed();
+    expect(report.complete).toBe(true);
+    expect(counts(report)).toEqual({ ...ZERO, REFERENCED: 2, TOO_RECENT: 1, UNKNOWN: 2, QUARANTINED: 1, INCOMPLETE: 2, ORPHAN_CANDIDATE: 1 });
+    expect(candidates.map((c) => c.publicId)).toEqual([orphan]);
+  });
+
+  it.each([
+    ["una página del inventario falla", (o: string) => { admin.pages.upload = [{ resources: [res(o, "upload")], next_cursor: "upload-c1" }, new Error("x")]; }, {}, 2],
+    ["se alcanza el límite de páginas", (o: string) => { paginate("upload", [res(o, "upload")], [res(`${o}2`, "upload")]); }, { maxPagesPerType: 1 }, 2],
+    ["un recurso de la página es anómalo", (o: string) => { paginate("upload", [res(o, "upload"), { public_id: "otra-app/x", type: "upload" }]); }, {}, 2],
+    // Con el presupuesto agotado tampoco llega a leerse el inventario privado: solo se retiene la de upload.
+    ["se agota el presupuesto de tiempo", (o: string) => { admin.pages.upload = [{ resources: [res(o, "upload")], next_cursor: "upload-c1" }, HANG]; }, { budgetMs: 200 }, 1],
+  ])("inventario incompleto (%s) → ninguna candidata; las retenidas solo se cuentan", async (_n, setup, opts, withheld) => {
+    const u = await user();
+    setup(`ai-wardrobe/${u.id}/wardrobe/o`);
+    paginate("authenticated", [res(`ai-wardrobe/${u.id}/try-on/t`, "authenticated")]); // este tipo, por sí solo, está completo
+    const { report, candidates } = await detailed(opts);
+    expect(report.complete).toBe(false);
+    expect(report.byCategory.ORPHAN_CANDIDATE).toBe(0);
+    expect(report.candidatesWithheld).toBe(withheld);
+    expect(candidates).toEqual([]);
+  });
+
+  it("una consulta de PostgreSQL fallida (propietarios) → INCOMPLETE y ninguna candidata", async () => {
+    const u = await user();
+    paginate("upload", [res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload")]);
+    const spy = vi.spyOn(t.prisma.user, "findMany").mockRejectedValueOnce(new Error("conexión perdida"));
+    try {
+      const { report, candidates } = await detailed();
+      expect(report.complete).toBe(false);
+      expect(report.byCategory).toEqual({ ...ZERO, INCOMPLETE: 1 });
+      expect(candidates).toEqual([]);
+    } finally { spy.mockRestore(); }
+  });
+
+  it("clasifica con el `now` recibido (startedAt del lease) aunque el reloj del sistema avance o el objeto cambie durante la ejecución", async () => {
+    const u = await user();
+    const young = `ai-wardrobe/${u.id}/wardrobe/23h`; const old = `ai-wardrobe/${u.id}/wardrobe/25h`;
+    const at = (h: number) => new Date(NOW.getTime() - h * 3_600_000).toISOString();
+    const now = new Date(NOW);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(NOW);
+      admin.pages.upload = [async () => {
+        vi.setSystemTime(new Date(NOW.getTime() + 10 * 86_400_000)); // el reloj de Node salta 10 días
+        now.setTime(NOW.getTime() + 10 * 86_400_000); // y el llamador modifica su objeto
+        return { resources: [res(young, "upload", at(23)), res(old, "upload", at(25))] };
+      }];
+      const { report, candidates } = await detailed({ now, budgetMs: 30 * 86_400_000 });
+      expect(report.startedAt).toBe(NOW.toISOString());
+      expect(counts(report)).toEqual({ ...ZERO, TOO_RECENT: 1, ORPHAN_CANDIDATE: 1 });
+      expect(candidates.map((c) => c.publicId)).toEqual([old]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("exige `now`: sin él (o inválido) no consulta nada ni usa el reloj de Node", async () => {
+    const { detectOrphanMediaDetailed } = await import("@/services/media-reconcile.service");
+    await expect(detectOrphanMediaDetailed({} as never)).rejects.toThrow(TypeError);
+    await expect(detectOrphanMediaDetailed({ now: new Date(Number.NaN) })).rejects.toThrow(TypeError);
+    await expect(detectOrphanMediaDetailed({ now: "2026-11-21T12:00:00Z" } as never)).rejects.toThrow(TypeError);
+    expect(admin.calls).toEqual([]);
+  });
+
+  it("el endpoint público y el log siguen sin exponer datos detallados", async () => {
+    const u = await user();
+    const orphan = `ai-wardrobe/${u.id}/wardrobe/o`;
+    paginate("upload", [res(orphan, "upload")]);
+    const { candidates, report } = await detailed();
+    expect(candidates).toHaveLength(1);
+    const { GET } = await import("@/app/api/cron/media-reconcile/route");
+    const r = await GET(new Request("http://localhost:3000/api/cron/media-reconcile", { headers: { authorization: `Bearer ${CRON_SECRET}` } }));
+    const body = await r.json() as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(Object.keys(report).sort()); // mismo contrato: ninguna clave nueva
+    expect(body).not.toHaveProperty("candidates");
+    expect(JSON.stringify(body)).not.toMatch(new RegExp(`${u.id}|ai-wardrobe/|${candidates[0]!.assetId}`));
+    // Con errores, el log solo lleva códigos genéricos.
+    admin.pages.upload = [{ resources: [res(orphan, "upload")], next_cursor: "upload-c1" }, new Error(`fallo con ${orphan}`)];
+    await detailed();
+    const logged = (errSpy.mock.calls as unknown[][]).flat().map((x) => (x instanceof Error ? `${x.message}\n${x.stack}` : String(x))).join("\n");
+    expect(logged).toContain("inventory/upload/CLOUDINARY_ERROR");
+    expect(logged).not.toMatch(new RegExp(`${u.id}|ai-wardrobe/|${candidates[0]!.assetId}`));
+  });
+});
