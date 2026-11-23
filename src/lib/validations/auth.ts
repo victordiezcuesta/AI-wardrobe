@@ -4,6 +4,9 @@ export const passwordSchema = z
   .string()
   .min(10, "Mínimo 10 caracteres")
   .max(128)
+  // bcrypt solo usa los primeros 72 BYTES UTF-8: se rechaza lo que los supere en vez de truncarlo en silencio.
+  // `string.length` cuenta unidades UTF-16, no bytes («ñ» son 2 bytes y «😀» 4).
+  .refine((value) => new TextEncoder().encode(value).length <= 72, "La contraseña no puede superar los 72 bytes UTF-8 (los caracteres con tilde o los emojis ocupan más de 1 byte)")
   .regex(/[a-z]/, "Incluye una minúscula")
   .regex(/[A-Z]/, "Incluye una mayúscula")
   .regex(/[0-9]/, "Incluye un número");

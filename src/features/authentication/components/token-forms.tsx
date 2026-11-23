@@ -39,7 +39,7 @@ export function ResetForm({ token }: { token: string }) {
   if (done) return <p className="rounded-card bg-linen p-5">Contraseña actualizada. <Link href="/login" className="underline">Inicia sesión</Link>.</p>;
   return (
     <form onSubmit={onSubmit} className="space-y-4" noValidate>
-      <Input label="Nueva contraseña" name="password" type="password" autoComplete="new-password" required error={error} hint="Mínimo 10 caracteres, con mayúscula, minúscula y número." />
+      <Input label="Nueva contraseña" name="password" type="password" autoComplete="new-password" required error={error} hint="Mínimo 10 caracteres, con mayúscula, minúscula y número. Máximo 72 bytes UTF-8." />
       <Button type="submit" size="lg" className="w-full" loading={loading}>Guardar contraseña</Button>
     </form>
   );

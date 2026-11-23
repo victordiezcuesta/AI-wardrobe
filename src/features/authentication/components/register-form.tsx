@@ -30,7 +30,7 @@ export function RegisterForm() {
     <form onSubmit={onSubmit} className="space-y-4" noValidate>
       <Input label="Nombre (opcional)" name="name" autoComplete="given-name" error={errors.name} />
       <Input label="Email" name="email" type="email" autoComplete="email" required error={errors.email} />
-      <Input label="Contraseña" name="password" type="password" autoComplete="new-password" required hint="Mínimo 10 caracteres, con mayúscula, minúscula y número." error={errors.password} />
+      <Input label="Contraseña" name="password" type="password" autoComplete="new-password" required hint="Mínimo 10 caracteres, con mayúscula, minúscula y número. Máximo 72 bytes UTF-8." error={errors.password} />
       {errors.form && <p className="text-sm text-danger">{errors.form}</p>}
       <Button type="submit" size="lg" className="w-full" loading={loading}>Crear cuenta</Button>
     </form>

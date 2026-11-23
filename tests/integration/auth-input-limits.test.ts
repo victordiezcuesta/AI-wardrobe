@@ -160,3 +160,35 @@ describe("tokens: de 20 a 64 caracteres", () => {
     await validation(await routes.reset(post("/api/auth/reset-password", { token: "t".repeat(19), password: NEW_PASS })));
   });
 });
+
+describe("contraseñas: máximo 72 bytes UTF-8 (19.17c)", () => {
+  const OK = "😀".repeat(17) + "Aa1x";   // 72 bytes (21 unidades UTF-16)
+  const TOO_LONG = "😀".repeat(18) + "Aa1"; // 75 bytes
+  const passwordIssue = (issues: { path: string; message: string }[]) => expect(issues.some((i) => i.path === "password" && /72 bytes UTF-8/.test(i.message))).toBe(true);
+  it("registro con más de 72 bytes → 422 sin bcrypt, usuario, correo, token ni contador", async () => {
+    passwordIssue(await validation(await routes.register(post("/api/auth/register", { email: "ana@example.com", password: TOO_LONG }))));
+    passwordIssue(await validation(await routes.register(post("/api/auth/register", { email: "ana@example.com", password: `Aa1${"x".repeat(70)}` }))));
+    await noEffects();
+  });
+  it("registro con exactamente 72 bytes funciona y la contraseña completa verifica", async () => {
+    expect((await routes.register(post("/api/auth/register", { email: "ana@example.com", password: OK }))).status).toBe(201);
+    const u = await t.prisma.user.findUniqueOrThrow({ where: { email: "ana@example.com" } });
+    expect(await bcrypt.compare(OK, u.passwordHash!)).toBe(true);
+  }, 30_000);
+  it("restablecimiento con más de 72 bytes → 422 sin bcrypt, sin cambiar la contraseña y sin consumir el token", async () => {
+    const email = "ana@example.com";
+    await verifiedUser(email);
+    await routes.forgot(post("/api/auth/forgot-password", { email }));
+    const token = tokenFromMail();
+    const before = { tokens: await tokenRows(), hash: (await t.prisma.user.findUniqueOrThrow({ where: { email } })).passwordHash };
+    hashSpy.mockClear(); compareSpy.mockClear();
+    passwordIssue(await validation(await routes.reset(post("/api/auth/reset-password", { token, password: TOO_LONG }))));
+    expect(hashSpy).not.toHaveBeenCalled(); expect(compareSpy).not.toHaveBeenCalled();
+    expect(await tokenRows()).toEqual(before.tokens);
+    expect((await t.prisma.user.findUniqueOrThrow({ where: { email } })).passwordHash).toBe(before.hash);
+    expect((await routes.reset(post("/api/auth/reset-password", { token, password: OK }))).status).toBe(200); // 72 bytes: válido
+    expect(await tokenRows()).toEqual([]);
+    const after = await t.prisma.user.findUniqueOrThrow({ where: { email } });
+    expect(await bcrypt.compare(OK, after.passwordHash!)).toBe(true);
+  }, 30_000);
+});

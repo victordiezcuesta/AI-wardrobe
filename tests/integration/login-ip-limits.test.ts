@@ -265,6 +265,13 @@ describe("longitud del email en el login (19.17b: máximo 254 tras normalizar)",
     expect(limited(r)).toEqual(["CredentialsSignin", "credentials"]);
     expect(compareSpy).toHaveBeenCalled();
   });
+  it("19.17c: una contraseña de más de 72 bytes no se rechaza por validación: llega a bcrypt.compare y se cuenta como fallo de credenciales", async () => {
+    await createUser("a@l.com");
+    const r = await attempt("a@l.com", "😀".repeat(30), xff(IP_A)); // 120 bytes, 60 unidades UTF-16 (≤ 128)
+    expect(limited(r)).toEqual(["CredentialsSignin", "credentials"]);
+    expect(compareSpy).toHaveBeenCalled();
+    expect(await count(emailKey("a@l.com"))).toBe(1);
+  });
 });
 
 describe("errores de infraestructura: fail-closed (bcrypt no se ejecuta)", () => {

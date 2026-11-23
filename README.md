@@ -62,7 +62,7 @@ La app usa Prisma 7 con el **adaptador de Neon** (`@prisma/adapter-neon`). El es
 - `AUTH_URL`: URL pública (`http://localhost:3000` en local).
 - Fuera de Vercel, define también `AUTH_TRUST_HOST=true`.
 - **Correo:** registro y recuperación envían enlaces por email. Configura `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` y `EMAIL_FROM`. **Sin `SMTP_HOST` los enlaces se imprimen en la consola del servidor**: cómodo en local, inútil en producción (nadie podrá verificar su cuenta).
-- Sesiones JWT en cookie `httpOnly`. Contraseñas con bcrypt (coste 12). Inicio de sesión bloqueado hasta verificar el email.
+- Sesiones JWT en cookie `httpOnly`. Contraseñas con bcrypt (coste 12); bcrypt solo usa los primeros 72 bytes UTF-8, así que el registro y el restablecimiento rechazan contraseñas más largas (sin truncarlas) y el inicio de sesión no aplica ese límite, para no bloquear cuentas existentes. Inicio de sesión bloqueado hasta verificar el email.
 
 ## 6. Configuración de Cloudinary
 

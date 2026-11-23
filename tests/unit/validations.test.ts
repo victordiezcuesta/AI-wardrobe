@@ -91,9 +91,41 @@ describe("tokens de verificación y restablecimiento (20–64 caracteres)", () =
     expect(token).toHaveLength(64);
     for (const [, parse] of CASES) expect(parse(token).success).toBe(true);
   });
-  it("las contraseñas no cambian en esta fase: 128 caracteres siguen siendo válidos", () => {
-    expect(resetSchema.safeParse({ token: "t".repeat(40), password: `Aa1${"x".repeat(125)}` }).success).toBe(true);
+  it("el login conserva su límite de 128 caracteres y no aplica el de 72 bytes", () => {
+    expect(loginSchema.safeParse({ email: "a@b.co", password: `Aa1${"x".repeat(125)}` }).success).toBe(true);
+    expect(loginSchema.safeParse({ email: "a@b.co", password: "😀".repeat(100) }).success).toBe(true); // 400 bytes
     expect(loginSchema.safeParse({ email: "a@b.co", password: "x".repeat(128) }).success).toBe(true);
     expect(loginSchema.safeParse({ email: "a@b.co", password: "x".repeat(129) }).success).toBe(false);
+  });
+});
+
+/** Fase 19.17c — bcrypt solo usa los primeros 72 BYTES UTF-8: registro y restablecimiento rechazan lo que los supere. */
+describe("passwordSchema: máximo 72 bytes UTF-8", () => {
+  const bytes = (s: string) => new TextEncoder().encode(s).length;
+  const SCHEMAS = [
+    ["registerSchema", (password: string) => registerSchema.safeParse({ email: "a@b.co", password })],
+    ["resetSchema", (password: string) => resetSchema.safeParse({ token: "t".repeat(40), password })],
+  ] as const;
+  const CASES: [string, string, boolean][] = [
+    ["ASCII 72 bytes", `Aa1${"x".repeat(69)}`, true],
+    ["ASCII 73 bytes", `Aa1${"x".repeat(70)}`, false],
+    ["ñ ×34 + Aa1x = 72 bytes", `${"ñ".repeat(34)}Aa1x`, true],
+    ["ñ ×34 + Aa1xy = 73 bytes", `${"ñ".repeat(34)}Aa1xy`, false],
+    ["😀 ×17 + Aa1x = 72 bytes", `${"😀".repeat(17)}Aa1x`, true],
+    ["😀 ×18 + Aa1 = 75 bytes", `${"😀".repeat(18)}Aa1`, false],
+  ];
+  it("los ejemplos tienen los bytes esperados (y length no sirve para medirlos)", () => {
+    expect(CASES.map(([, p]) => bytes(p))).toEqual([72, 73, 72, 73, 72, 75]);
+    expect(`${"ñ".repeat(34)}Aa1x`.length).toBe(38);
+  });
+  describe.each(SCHEMAS)("%s", (_n, parse) => {
+    it.each(CASES)("%s", (_label, password, ok) => {
+      const r = parse(password);
+      expect(r.success).toBe(ok);
+      if (!ok) expect(JSON.stringify(r.error?.issues)).toContain("72 bytes UTF-8");
+    });
+    it("conserva el resto de reglas (mínimo, composición y 128 caracteres)", () => {
+      for (const p of ["Aa1xxxxxx", "abcdefghij1", "ABCDEFGHIJ1", "Abcdefghij", `Aa1${"x".repeat(125)}`]) expect(parse(p).success, p).toBe(false);
+    });
   });
 });
