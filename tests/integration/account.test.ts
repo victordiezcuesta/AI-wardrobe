@@ -52,7 +52,9 @@ async function seed(email: string, password: string) {
   await t.prisma.shoppingRecommendation.create({ data: { userId: u.id, batchId: "b1", gapLabel: "Camisa", gapReason: "r", searchQuery: "q", products: { create: [{ provider: "awin", externalId: "1", name: "P", store: "Mango", url: "https://x.example.com" }] } } });
   await t.prisma.aiUsageLog.create({ data: { userId: u.id, task: "ITEM_ANALYSIS", provider: "openrouter", model: "m" } });
   await t.prisma.verificationToken.create({ data: { identifier: email, token: `tok-${email}`, expires: new Date(Date.now() + 1e6) } });
-  await t.prisma.$executeRawUnsafe(`INSERT INTO "RateLimit"("key","count") VALUES ('stylist:${u.id}', 3), ('login:${email}', 1)`);
+  const { emailRateKey } = await import("@/lib/rate-limit/email"); // 19.15a: el contador de login no lleva el email en claro
+  await t.prisma.$executeRawUnsafe(`INSERT INTO "RateLimit"("key","count") VALUES ('stylist:${u.id}', 3), ('${emailRateKey("login-email", email)}', 1)`);
+  expect(emailRateKey("login-email", email)).not.toContain("@");
   await mediaAssets(u.id);
   return u.id;
 }

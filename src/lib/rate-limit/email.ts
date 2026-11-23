@@ -3,7 +3,8 @@ import { env } from "@/lib/env";
 import { rateLimit } from "./index";
 
 /**
- * Fase 19.13a — rate limiting por EMAIL con claves pseudonimizadas. SOLO Node.js (`node:crypto`).
+ * Fase 19.13a (login en 19.15a) — rate limiting por EMAIL con claves pseudonimizadas: registro (`register-email`), recuperación
+ * de contraseña (`forgot-email`) e inicio de sesión (`login-email`). SOLO Node.js (`node:crypto`).
  *
  * Clave: `<scope>:<32 hex>`, donde
  *   subclave = HMAC-SHA256(AUTH_SECRET, "rate-limit:email-key:v1")            (separación de dominio)
@@ -11,7 +12,8 @@ import { rateLimit } from "./index";
  * El scope entra también en el mensaje firmado: el mismo email da hashes DISTINTOS en cada scope, así que no se pueden
  * correlacionar las filas de registro y de recuperación de un mismo email. El email nunca aparece en la clave (ni «@»),
  * la longitud es fija sea cual sea el email y, sin AUTH_SECRET, no se puede confirmar por fuerza bruta si un email está en
- * la tabla (un SHA-256 sin secreto sí lo permitiría). Rotar AUTH_SECRET reinicia estos contadores (también invalida las
+ * la tabla (un SHA-256 sin secreto sí lo permitiría). El scope `login-email` sustituye a las claves `login:<email>` en claro
+ * (19.15a); las filas antiguas no se migran: caducan y las elimina la purga de RateLimit. Rotar AUTH_SECRET reinicia estos contadores (también invalida las
  * sesiones, así que no es un coste añadido). Sin variables nuevas.
  *
  * El helper NO comprueba si existe la cuenta (el contador sube para cualquier email, existente o no: nada que enumerar),
@@ -19,7 +21,7 @@ import { rateLimit } from "./index";
  * email ya validado por Zod (recortado, en minúsculas y con formato válido); aquí solo se reaplica esa misma
  * normalización (idempotente) para que dos formas del mismo email nunca generen contadores distintos.
  */
-export const EMAIL_RATE_SCOPES = ["register-email", "forgot-email"] as const;
+export const EMAIL_RATE_SCOPES = ["register-email", "forgot-email", "login-email"] as const;
 export type EmailRateScope = (typeof EMAIL_RATE_SCOPES)[number];
 
 const KEY_DERIVATION_CONTEXT = "rate-limit:email-key:v1";

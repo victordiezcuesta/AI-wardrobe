@@ -120,7 +120,38 @@ describe("validación de entradas y secreto", () => {
     cfg.secret = "k".repeat(16);
     expect(emailRateKey("register-email", EMAIL)).toBe(`register-email:${reference("k".repeat(16), "register-email", EMAIL)}`);
   });
-  it("los scopes permitidos son exactamente los dos previstos", () => { expect([...EMAIL_RATE_SCOPES]).toEqual(["register-email", "forgot-email"]); });
+  it("los scopes permitidos son exactamente los tres previstos", () => { expect([...EMAIL_RATE_SCOPES]).toEqual(["register-email", "forgot-email", "login-email"]); });
+
+  describe("scope login-email (19.15a)", () => {
+    it("es un scope válido y su clave es `login-email:` + 32 hexadecimales, igual que la implementación de referencia", () => {
+      const key = emailRateKey("login-email", EMAIL);
+      expect(key).toMatch(/^login-email:[0-9a-f]{32}$/);
+      expect(key).toBe(`login-email:${reference(SECRET, "login-email", EMAIL)}`);
+      expect(emailRateKey("login-email", "ana@example.com")).toBe("login-email:ebf23da0f67e9e70bd337b4afd08ce9f"); // vector fijo (calculado aparte con otra implementación)
+    });
+    it("la misma dirección da claves distintas en los tres scopes (separación criptográfica)", () => {
+      const keys = (["register-email", "forgot-email", "login-email"] as const).map((s) => emailRateKey(s, EMAIL));
+      expect(new Set(keys).size).toBe(3);
+      expect(new Set(keys.map((k) => k.split(":")[1])).size).toBe(3); // ni siquiera comparten el hash
+    });
+    it("el email no aparece en la clave, y su longitud es fija con emails muy largos o con caracteres especiales", () => {
+      for (const email of [EMAIL, `${"a".repeat(5_000)}@example.com`, "ñandú+tag@exámple.org"]) {
+        const key = emailRateKey("login-email", email);
+        expect(key).not.toContain("@"); expect(key).not.toContain(email);
+        expect(key).toHaveLength("login-email:".length + 32);
+      }
+    });
+    it("usa la misma normalización (recorte y minúsculas) y deriva de AUTH_SECRET: otro secreto, otra clave", () => {
+      expect(emailRateKey("login-email", "  ANA@Example.COM ")).toBe(emailRateKey("login-email", EMAIL));
+      cfg.secret = "t".repeat(32);
+      expect(emailRateKey("login-email", EMAIL)).not.toBe(`login-email:${reference(SECRET, "login-email", EMAIL)}`);
+    });
+    it("rateLimitByEmail acepta el scope y delega en rateLimit con la clave pseudonimizada y los parámetros dados (10/900)", async () => {
+      await rateLimitByEmail("login-email", EMAIL, 10, 900);
+      expect(rl.rateLimit).toHaveBeenCalledTimes(1);
+      expect(rl.rateLimit).toHaveBeenCalledWith(emailRateKey("login-email", EMAIL), 10, 900);
+    });
+  });
 });
 
 describe("rateLimitByEmail", () => {

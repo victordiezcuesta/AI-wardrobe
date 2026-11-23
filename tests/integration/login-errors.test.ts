@@ -20,6 +20,7 @@ const LIMIT = 10; // política actual: 10 intentos / 15 min por email
 let t: TestDb;
 let Auth: typeof import("@auth/core").Auth;
 let authOptions: typeof import("@/lib/auth").authOptions;
+let emailKey: (email: string) => string; // clave HMAC `login-email` (19.15a)
 
 beforeAll(async () => {
   setTestEnv();
@@ -27,6 +28,8 @@ beforeAll(async () => {
   holder.prisma = t.prisma;
   ({ Auth } = await import("@auth/core"));
   ({ authOptions } = await import("@/lib/auth"));
+  const { emailRateKey } = await import("@/lib/rate-limit/email");
+  emailKey = (email) => emailRateKey("login-email", email);
 }, 60_000);
 afterAll(async () => { await t?.stop(); });
 // Auth.js registra con console.error todo fallo de login (también los esperados): se silencia y se inspecciona.
@@ -114,11 +117,11 @@ describe("límite de intentos", () => {
   it("la política no cambia: 10 intentos por ventana de 15 minutos", async () => {
     await createUser("ventana@l.com", "Clave-12345");
     for (let i = 0; i < LIMIT; i++) await attempt("ventana@l.com", "Mala-12345");
-    const row = await t.prisma.rateLimit.findUniqueOrThrow({ where: { key: "login:ventana@l.com" } });
+    const row = await t.prisma.rateLimit.findUniqueOrThrow({ where: { key: emailKey("ventana@l.com") } });
     expect(row.count).toBe(LIMIT);
     expect((await attempt("ventana@l.com", "Mala-12345")).code).toBe("rate_limited");
     // Ventana vencida (más de 15 min): el contador se reinicia y vuelve a responder «credenciales».
-    await t.prisma.rateLimit.update({ where: { key: "login:ventana@l.com" }, data: { windowStart: new Date(Date.now() - 15 * 60_000 - 1000) } });
+    await t.prisma.rateLimit.update({ where: { key: emailKey("ventana@l.com") }, data: { windowStart: new Date(Date.now() - 15 * 60_000 - 1000) } });
     expect((await attempt("ventana@l.com", "Mala-12345")).code).toBe("credentials");
   }, 30_000);
 });

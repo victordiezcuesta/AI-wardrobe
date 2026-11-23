@@ -11,7 +11,7 @@ import { prismaProxy, setTestEnv } from "../helpers/mock-prisma";
  * infraestructura por clave; sin fallos configurados delega siempre en la implementación real.
  */
 const holder = vi.hoisted(() => ({ prisma: null as PrismaClient | null }));
-const faults = vi.hoisted(() => ({ status: null as ((key: string) => boolean) | null, increment: null as ((key: string) => boolean) | null, calls: [] as string[] }));
+const faults = vi.hoisted(() => ({ status: null as ((key: string) => boolean) | null, increment: null as ((key: string) => boolean) | null, calls: [] as string[], params: {} as Record<string, [number, number]> }));
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
 vi.mock("@/lib/rate-limit", async (orig) => {
   const real = await orig<typeof import("@/lib/rate-limit")>();
@@ -19,6 +19,7 @@ vi.mock("@/lib/rate-limit", async (orig) => {
     ...real,
     rateLimit: async (key: string, limit: number, windowSec: number) => {
       faults.calls.push(`inc:${key}`);
+      faults.params[key] = [limit, windowSec];
       if (faults.increment?.(key)) throw new Error("fallo de almacenamiento simulado");
       return real.rateLimit(key, limit, windowSec);
     },
@@ -41,6 +42,7 @@ let Auth: typeof import("@auth/core").Auth;
 let authOptions: typeof import("@/lib/auth").authOptions;
 let authService: typeof import("@/services/auth.service").authService;
 let compareSpy: ReturnType<typeof vi.spyOn>;
+let emailKey: (email: string) => string; // clave HMAC `login-email` del email (la real, sin simular)
 let errSpy: ReturnType<typeof vi.spyOn>;
 let infoSpy: ReturnType<typeof vi.spyOn>;
 
@@ -49,11 +51,13 @@ beforeAll(async () => {
   ({ Auth } = await import("@auth/core"));
   ({ authOptions } = await import("@/lib/auth"));
   ({ authService } = await import("@/services/auth.service"));
+  const { emailRateKey } = await import("@/lib/rate-limit/email");
+  emailKey = (email) => emailRateKey("login-email", email);
 }, 60_000);
 afterAll(async () => { await t?.stop(); });
 beforeEach(async () => {
   vi.stubEnv("VERCEL", "1");
-  faults.status = null; faults.increment = null; faults.calls.length = 0;
+  faults.status = null; faults.increment = null; faults.calls.length = 0; for (const k of Object.keys(faults.params)) delete faults.params[k];
   await t.prisma.$executeRawUnsafe(`DELETE FROM "RateLimit"`);
   await t.prisma.$executeRawUnsafe(`DELETE FROM "User"`); // cascada: sesiones y perfil
   compareSpy = vi.spyOn(bcrypt, "compare");
@@ -97,17 +101,17 @@ describe("resolución de IP: qué contadores se aplican", () => {
     expect(r.sessionCookie).toBe(true);
     expect(await count(`login-ip-1m:${KEY_A}`)).toBe(1);
     expect(await count(`login-ip-15m:${KEY_A}`)).toBe(1);
-    expect(await count("login:a@l.com")).toBe(1);
+    expect(await count(emailKey("a@l.com"))).toBe(1);
     expect(await count(`login-fail-ip:${KEY_A}`)).toBeNull(); // un éxito no cuenta como fallo
     expect(faults.calls[0]).toBe(`status:login-fail-ip:${KEY_A}`);
-    expect(faults.calls.slice(1)).toEqual([`inc:login-ip-1m:${KEY_A}`, `inc:login-ip-15m:${KEY_A}`, "inc:login:a@l.com"]); // orden exacto
+    expect(faults.calls.slice(1)).toEqual([`inc:login-ip-1m:${KEY_A}`, `inc:login-ip-15m:${KEY_A}`, `inc:${emailKey("a@l.com")}`]); // orden exacto
   });
   it("sin VERCEL (local o autoalojado): solo el contador por email, aunque haya x-forwarded-for", async () => {
     vi.stubEnv("VERCEL", "");
     await createUser("a@l.com");
     await attempt("a@l.com", PASS, xff(IP_A));
-    expect(await keys()).toEqual(["login:a@l.com"]);
-    expect(faults.calls).toEqual(["inc:login:a@l.com"]);
+    expect(await keys()).toEqual([emailKey("a@l.com")]);
+    expect(faults.calls).toEqual([`inc:${emailKey("a@l.com")}`]);
   });
   it.each([
     ["x-real-ip", { "x-real-ip": IP_A }], ["x-vercel-forwarded-for", { "x-vercel-forwarded-for": IP_A }], ["Forwarded", { forwarded: `for=${IP_A}` }],
@@ -115,18 +119,18 @@ describe("resolución de IP: qué contadores se aplican", () => {
   ])("%s no se usa: solo el contador por email", async (_n, headers) => {
     await createUser("a@l.com");
     await attempt("a@l.com", PASS, headers);
-    expect(await keys()).toEqual(["login:a@l.com"]);
+    expect(await keys()).toEqual([emailKey("a@l.com")]);
   });
   it.each([["varias IP", "203.0.113.7, 198.51.100.9"], ["con puerto", "203.0.113.7:80"], ["texto", "unknown"], ["vacía", ""]])(
     "x-forwarded-for no fiable (%s) → solo el contador por email", async (_n, v) => {
       await createUser("a@l.com");
       await attempt("a@l.com", PASS, xff(v));
-      expect(await keys()).toEqual(["login:a@l.com"]);
+      expect(await keys()).toEqual([emailKey("a@l.com")]);
     });
   it("sin IP, el límite por email sigue aplicándose (10 por 15 min) y bcrypt no se ejecuta al superarlo", async () => {
     vi.stubEnv("VERCEL", "");
     await createUser("a@l.com");
-    await seed("login:a@l.com", 10);
+    await seed(emailKey("a@l.com"), 10);
     compareSpy.mockClear();
     expect(limited(await attempt("a@l.com", PASS))).toEqual(RATE_LIMITED);
     expect(compareSpy).not.toHaveBeenCalled();
@@ -155,7 +159,7 @@ describe("bloqueos: bcrypt no se ejecuta y no se consumen contadores posteriores
     expect(compareSpy).not.toHaveBeenCalled();
     expect(await count(`login-ip-1m:${KEY_A}`)).toBe(21);
     expect(await count(`login-ip-15m:${KEY_A}`)).toBeNull();
-    expect(await count("login:a@l.com")).toBeNull();
+    expect(await count(emailKey("a@l.com"))).toBeNull();
   });
   it("IP bloqueada por el límite de 15 minutos (120): sin bcrypt; no consume el de email", async () => {
     await seed(`login-ip-15m:${KEY_A}`, 120);
@@ -163,10 +167,10 @@ describe("bloqueos: bcrypt no se ejecuta y no se consumen contadores posteriores
     expect(compareSpy).not.toHaveBeenCalled();
     expect(await count(`login-ip-1m:${KEY_A}`)).toBe(1);
     expect(await count(`login-ip-15m:${KEY_A}`)).toBe(121);
-    expect(await count("login:a@l.com")).toBeNull();
+    expect(await count(emailKey("a@l.com"))).toBeNull();
   });
   it("email bloqueado (10): sin bcrypt; los contadores de IP ya se habían consumido", async () => {
-    await seed("login:a@l.com", 10);
+    await seed(emailKey("a@l.com"), 10);
     expect(limited(await attempt("a@l.com", PASS, xff(IP_A)))).toEqual(RATE_LIMITED);
     expect(compareSpy).not.toHaveBeenCalled();
     expect(await count(`login-ip-1m:${KEY_A}`)).toBe(1);
@@ -174,7 +178,7 @@ describe("bloqueos: bcrypt no se ejecuta y no se consumen contadores posteriores
     expect(await count(`login-fail-ip:${KEY_A}`)).toBeNull();
   });
   it("justo por debajo de cada límite se permite el intento (19 / 119 / 29 / 9)", async () => {
-    await seed(`login-ip-1m:${KEY_A}`, 19); await seed(`login-ip-15m:${KEY_A}`, 119); await seed(`login-fail-ip:${KEY_A}`, 29); await seed("login:a@l.com", 9);
+    await seed(`login-ip-1m:${KEY_A}`, 19); await seed(`login-ip-15m:${KEY_A}`, 119); await seed(`login-fail-ip:${KEY_A}`, 29); await seed(emailKey("a@l.com"), 9);
     const r = await attempt("a@l.com", PASS, xff(IP_A));
     expect(r.sessionCookie).toBe(true);
     expect(compareSpy).toHaveBeenCalledTimes(1);
@@ -183,7 +187,7 @@ describe("bloqueos: bcrypt no se ejecuta y no se consumen contadores posteriores
     await seed(`login-fail-ip:${KEY_A}`, 30);
     const byIp = await attempt("a@l.com", PASS, xff(IP_A));
     await t.prisma.$executeRawUnsafe(`DELETE FROM "RateLimit"`);
-    await seed("login:a@l.com", 10);
+    await seed(emailKey("a@l.com"), 10);
     const byEmail = await attempt("a@l.com", PASS, xff(IP_B));
     expect(limited(byIp)).toEqual(limited(byEmail));
     expect(byIp.message).toBe(LOGIN_MESSAGES.rateLimited); expect(byEmail.message).toBe(LOGIN_MESSAGES.rateLimited);
@@ -197,15 +201,53 @@ describe("bloqueos: bcrypt no se ejecuta y no se consumen contadores posteriores
   });
 });
 
+describe("clave pseudonimizada del contador por email (19.15a)", () => {
+  /** Claves de RateLimit que NO existían antes del intento (las antiguas, con email en claro, pueden seguir ahí). */
+  const newKeysAfter = async (run: () => Promise<unknown>) => {
+    const before = new Set(await keys());
+    await run();
+    return (await keys()).filter((k) => !before.has(k));
+  };
+  it("el intento crea la clave `login-email:<32 hex>` y ninguna nueva contiene el email, ni correcto, ni fallido, ni de cuenta inexistente", async () => {
+    await createUser("a@l.com");
+    await seed("login:antiguo@l.com", 4); // fila histórica con email en claro: no se migra ni se toca
+    for (const [email, pass] of [["a@l.com", PASS], ["a@l.com", "Mala-12345"], ["fantasma@l.com", PASS]] as const) {
+      const created = await newKeysAfter(() => attempt(email, pass, xff(IP_A)));
+      for (const k of created) { expect(k, email).not.toContain("@"); expect(k, email).not.toContain(email); }
+      expect(created.every((k) => k.startsWith("login-ip-") || k.startsWith("login-fail-ip:") || /^login-email:[0-9a-f]{32}$/.test(k))).toBe(true);
+    }
+    expect(await keys()).toContain(emailKey("fantasma@l.com")); // se cuenta también para cuentas inexistentes
+    expect(await count("login:antiguo@l.com")).toBe(4);           // la fila antigua sigue intacta (sin migrar ni borrar)
+    expect((await keys()).filter((k) => k.startsWith("login:"))).toEqual(["login:antiguo@l.com"]); // ninguna `login:<email>` nueva
+  });
+  it("el contador antiguo con email en claro ya no cuenta: sembrado a 10 no bloquea (los contadores se reinician)", async () => {
+    await createUser("a@l.com");
+    await seed("login:a@l.com", 10);
+    expect((await attempt("a@l.com", PASS, xff(IP_A))).sessionCookie).toBe(true);
+    expect(await count("login:a@l.com")).toBe(10); // sin tocar
+  });
+  it("el límite sigue siendo 10 intentos en 900 s sobre la clave pseudonimizada", async () => {
+    await createUser("a@l.com");
+    await attempt("a@l.com", PASS, xff(IP_A));
+    expect(faults.params[emailKey("a@l.com")]).toEqual([10, 900]);
+  });
+  it("emails distintos tienen contadores distintos y el mismo email, con otra capitalización, comparte contador", async () => {
+    await createUser("a@l.com"); await createUser("b@l.com");
+    await attempt("a@l.com", PASS, xff(IP_A)); await attempt("  A@L.COM ", PASS, xff(IP_A)); await attempt("b@l.com", PASS, xff(IP_A));
+    expect(await count(emailKey("a@l.com"))).toBe(2);
+    expect(await count(emailKey("b@l.com"))).toBe(1);
+  });
+});
+
 describe("errores de infraestructura: fail-closed (bcrypt no se ejecuta)", () => {
   beforeEach(async () => { await createUser("a@l.com"); compareSpy.mockClear(); });
   it.each([
-    ["la consulta de fallos por IP", "status", `login-fail-ip:${KEY_A}`],
-    ["el contador de 1 minuto", "increment", `login-ip-1m:${KEY_A}`],
-    ["el contador de 15 minutos", "increment", `login-ip-15m:${KEY_A}`],
-    ["el contador por email", "increment", "login:a@l.com"],
+    ["la consulta de fallos por IP", "status", (): string => `login-fail-ip:${KEY_A}`],
+    ["el contador de 1 minuto", "increment", (): string => `login-ip-1m:${KEY_A}`],
+    ["el contador de 15 minutos", "increment", (): string => `login-ip-15m:${KEY_A}`],
+    ["el contador por email", "increment", (): string => emailKey("a@l.com")],
   ] as const)("falla %s → error interno, sin sesión y sin bcrypt", async (_n, kind, key) => {
-    faults[kind] = (k) => k === key;
+    faults[kind] = (k) => k === key();
     const r = await attempt("a@l.com", PASS, xff(IP_A));
     expect(configuration(r)).toBe("Configuration");
     expect(r.sessionCookie).toBe(false);
