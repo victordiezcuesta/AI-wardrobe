@@ -384,6 +384,7 @@ describe("retención DRY_RUN (19.8a) dentro del orquestador", () => {
     const calls: unknown[][] = [];
     return { calls, dep: { run: vi.fn(async (...a: unknown[]) => { calls.push(a); if (result instanceof Error) throw result; return result; }) } };
   };
+  const stoppedLogs = () => (errSpy.mock.calls as unknown[][]).map((c) => String(c[0])).filter((l) => l.includes("Retención") && l.includes("STOPPED"));
   const summaryArg = (args: unknown[]) => (args[1] as { summary: { retention?: unknown; report?: unknown } }).summary;
 
   it("se ejecuta tras acquire y ANTES de la detección, con el lease, 20 s, TTL 360 s y GRACE_HOURS; el resultado va al summary", async () => {
@@ -408,6 +409,47 @@ describe("retención DRY_RUN (19.8a) dentro del orquestador", () => {
     expect(deps.detect).toHaveBeenCalledTimes(1);
     expect(res).toMatchObject({ outcome: "COMPLETED", finalized: true, errorCodes: ["retention/DEADLOCK"] });
     expect(calls.finish[0]![1]).toMatchObject({ errorCodes: ["retention/DEADLOCK"], summary: { retention: stopped } });
+  });
+
+  it("STOPPED → un único log sanitizado (modo, códigos, lotes) sin ids/URLs/mensajes; la detección continúa y COMPLETED", async () => {
+    const stopped = { ...RETENTION_DONE, status: "STOPPED", errorCodes: ["retention/DEADLOCK", "retention/LOCK_TIMEOUT"] };
+    const { runner, deps } = setup({ retention: retentionOf(stopped).dep });
+    errSpy.mockClear();
+    const res = await runner.run();
+    expect(deps.detect).toHaveBeenCalledTimes(1);
+    expect(res).toMatchObject({ outcome: "COMPLETED", finalized: true });
+    const logs = stoppedLogs();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("DRY_RUN");
+    expect(logs[0]).toContain("retention/DEADLOCK,retention/LOCK_TIMEOUT");
+    expect(JSON.parse(logs[0]!).message).not.toMatch(/ai-wardrobe|https?:|asset-secreto|owner|cloudinary/i);
+  });
+
+  it("retención que lanza con mensaje sensible → log STOPPED solo con retention/INTERNAL", async () => {
+    const { runner } = setup({ retention: retentionOf(new Error("https://res.cloudinary.com/ai-wardrobe/u/x")).dep });
+    errSpy.mockClear();
+    await runner.run();
+    const logs = stoppedLogs();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("retention/INTERNAL");
+    expect(JSON.parse(logs[0]!).message).not.toMatch(/ai-wardrobe|https?:|cloudinary/i);
+  });
+
+  it.each(["DONE", "PARTIAL", "SKIPPED"])("%s no genera log de STOPPED", async (status) => {
+    const { runner } = setup({ retention: retentionOf({ ...RETENTION_DONE, status }).dep });
+    errSpy.mockClear();
+    const res = await runner.run();
+    expect(res).toMatchObject({ outcome: "COMPLETED" });
+    expect(stoppedLogs().length > 0).toBe(false);
+  });
+
+  it("LEASE_LOST no se registra como STOPPED y conserva su cierre", async () => {
+    const lost = { ...RETENTION_DONE, status: "LEASE_LOST", errorCodes: ["retention/LEASE_LOST"] };
+    const { runner } = setup({ retention: retentionOf(lost).dep, release: [{ released: false, reason: "LEASE_LOST" }] });
+    errSpy.mockClear();
+    const res = await runner.run();
+    expect(res).toMatchObject({ outcome: "LEASE_LOST" });
+    expect(stoppedLogs().length > 0).toBe(false);
   });
 
   it("la retención lanza (inesperado) → STOPPED retention/INTERNAL y la detección continúa", async () => {

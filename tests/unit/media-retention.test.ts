@@ -85,7 +85,7 @@ function harness(o: { assets?: unknown[][]; runs?: unknown[][]; outcomes?: (unkn
     }),
   };
   const svc = m.createMediaRetention({ lease: lease as never });
-  const run = (budgetMs = 20_000) => svc.run(LEASE, { budgetMs, ttlMs: 360_000, graceHours: 24, clock: () => now });
+  const run = (budgetMs = 20_000, mode?: unknown) => svc.run(LEASE, { budgetMs, ttlMs: 360_000, graceHours: 24, clock: () => now, mode: mode as never });
   return { run, sql, opts, lease };
 }
 const arows = (n: number, rule = "CLEARED", offset = 0) =>
@@ -190,5 +190,108 @@ describe("servicio DRY_RUN", () => {
     expect(r).toMatchObject({ status: "STOPPED", errorCodes: [code] });
     expect(JSON.stringify(r)).not.toMatch(/secreto|ai-wardrobe/);
     expect(h.lease.withLease).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("APPLY (19.8b-2): una sentencia por lote, sin cursor, recuentos tras el COMMIT", () => {
+  const isAssetSql = (t: string) => t.includes(`FROM "MediaAsset" a JOIN`);
+  const isDelete = (t: string) => /\bDELETE\b/.test(t);
+
+  it("cada lote de MediaAsset es UNA sentencia: misma selección en un CTE MATERIALIZED con SKIP LOCKED + DELETE … RETURNING; nunca cursor", async () => {
+    const h = harness({ assets: [arows(200), arows(200, "CLEARED", 200), arows(50, "ACTIVE", 400)] });
+    const r = await h.run(1_000_000, "APPLY");
+    expect(r).toMatchObject({ mode: "APPLY", status: "DONE", countsAreLowerBound: true,
+      assets: { eligible: 450, deleted: 450, batches: 3, complete: true, end: "COMPLETE", deletedByRule: { CLEARED: 400, ACTIVE: 50 } } });
+    const stmts = h.sql.filter((q) => isAssetSql(q.text));
+    expect(stmts).toHaveLength(3); // ni una selección aparte: selección y borrado en la misma sentencia
+    for (const q of stmts) {
+      expect(q.text).toMatch(/v AS MATERIALIZED \(/);
+      expect(q.text).toMatch(/FOR UPDATE OF a SKIP LOCKED\)\s*DELETE FROM "MediaAsset" d USING v WHERE d\."id" = v\."id"\s*RETURNING v\."rule" AS "rule"/);
+      expect(q.text).toMatch(/a\."state" IN \([^,()]+::"MediaAssetState",\s*[^,()]+::"MediaAssetState",\s*[^,()]+::"MediaAssetState"\)/);
+      expect(q.text).toMatch(/\(CASE[\s\S]+?END\) IS NOT NULL/);
+      expect(q.text).toMatch(/a\."lastCandidateAt" < \(SELECT "now" FROM t\) - GREATEST\(/);
+      expect(q.text).toMatch(/ORDER BY a\."delivery", a\."publicId" COLLATE "C"/);
+      expect(q.text).not.toMatch(/> \(\S+::"MediaDelivery"/); // sin cursor en ningún lote
+      expect(q.text).not.toMatch(/updatedAt/);
+    }
+  });
+
+  it("ejecuciones: misma selección (RUNNING/dueña/token máximo/14 por estado/referencias) + DELETE … RETURNING, sin cursor", async () => {
+    const h = harness({ runs: [rrows(200, "COMPLETED", 1000), rrows(3, "FAILED", 5000)] });
+    const r = await h.run(1_000_000, "APPLY");
+    expect(r.runs).toMatchObject({ eligible: 203, deleted: 203, batches: 2, complete: true, deletedByStatus: { COMPLETED: 200, FAILED: 3 } });
+    const stmts = h.sql.filter((q) => q.text.includes(`DELETE FROM "MediaReconcileRun"`));
+    expect(stmts).toHaveLength(2);
+    for (const q of stmts) {
+      expect(q.text).toMatch(/v AS MATERIALIZED \(/);
+      expect(q.text).toMatch(/FOR UPDATE OF r SKIP LOCKED\)\s*DELETE FROM "MediaReconcileRun" d USING v WHERE d\."id" = v\."id"\s*RETURNING v\."status" AS "status"/);
+      for (const frag of [/k\.rn > /, /r\."fencingToken" < mx\.m/, /IS DISTINCT FROM \(SELECT h FROM holder\)/, /"firstCandidateRunId" = r\."id"/, /"lastCandidateRunId" = r\."id"/, /r\."finishedAt" IS NOT NULL/]) {
+        expect(q.text).toMatch(frag);
+      }
+      expect(q.values).toContain(0); // afterToken 0: sin cursor (los tokens son > 0)
+      expect(q.values).not.toContain(1200); // nunca el token de la última fila borrada
+    }
+  });
+
+  it("orden: todos los lotes de MediaAsset antes que los de ejecuciones; solo DELETE sobre esas dos tablas, ninguna otra escritura", async () => {
+    const h = harness({ assets: [arows(200), arows(10)], runs: [rrows(5)] });
+    await h.run(1_000_000, "APPLY");
+    const kinds = h.sql.filter((q) => !q.text.includes("set_config")).map((q) => (isAssetSql(q.text) ? "A" : "R"));
+    expect(kinds).toEqual(["A", "A", "R"]);
+    for (const q of h.sql) {
+      expect(q.text).not.toMatch(/\b(INSERT|TRUNCATE|MERGE)\b|\bUPDATE\s+"/i);
+      for (const m2 of q.text.matchAll(/DELETE FROM "(\w+)"/g)) expect(["MediaAsset", "MediaReconcileRun"]).toContain(m2[1]);
+    }
+  });
+
+  it("como máximo 10 lotes de 200 por fase (MAX_BATCHES → PARTIAL) y presupuesto agotado → BUDGET", async () => {
+    const h = harness({ assets: [arows(200)], runs: [rrows(1)] });
+    const r = await h.run(1_000_000, "APPLY");
+    expect(r).toMatchObject({ status: "PARTIAL", assets: { deleted: 2000, batches: 10, complete: false, end: "MAX_BATCHES" }, runs: { deleted: 1, end: "COMPLETE" } });
+    const b = harness({ assets: [arows(200)], msPerBatch: 12_000 });
+    expect(await b.run(20_000, "APPLY")).toMatchObject({ status: "PARTIAL", assets: { deleted: 200, end: "BUDGET" }, runs: { batches: 0, end: "BUDGET" } });
+  });
+
+  it("un lote que falla (o pierde el lease) NO suma filas: solo cuentan los lotes confirmados", async () => {
+    const fail = harness({ assets: [arows(200)], outcomes: [undefined, Object.assign(new Error("x"), { name: "PrismaClientKnownRequestError", code: "P2010" })] });
+    expect(await fail.run(1_000_000, "APPLY")).toMatchObject({ status: "STOPPED", errorCodes: ["retention/DB_ERROR"],
+      assets: { deleted: 200, eligible: 200, batches: 1, end: "STOPPED" }, runs: { deleted: 0, end: "NOT_STARTED" } });
+    const lost = harness({ assets: [arows(200)], outcomes: [undefined, { ok: false, reason: "LEASE_LOST" }] });
+    expect(await lost.run(1_000_000, "APPLY")).toMatchObject({ status: "LEASE_LOST", assets: { deleted: 200, end: "LEASE_LOST" } });
+    const fk = harness({ outcomes: [undefined, Object.assign(new Error("x"), { meta: { driverAdapterError: { cause: { originalCode: "23503" } } } })] });
+    expect(await fk.run(1_000_000, "APPLY")).toMatchObject({ status: "STOPPED", errorCodes: ["retention/FK_VIOLATION"], runs: { deleted: 0, end: "STOPPED" } });
+  });
+
+  it("errores en APPLY y violaciones de FK se registran (solo el código genérico)", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const fk = Object.assign(new Error("fallo con ai-wardrobe/u/wardrobe/secreto"), { meta: { driverAdapterError: { cause: { originalCode: "23503" } } } });
+      await harness({ outcomes: [fk] }).run(1_000_000, "APPLY");
+      await harness({ outcomes: [fk] }).run(1_000_000); // también en DRY_RUN (no debería ocurrir, pero nunca se oculta)
+      const calls = (spy.mock.calls as unknown[][]).map((c) => c.map(String).join(" "));
+      const logged = calls.join("\n");
+      expect(calls.filter((c) => c.includes("retention/FK_VIOLATION"))).toHaveLength(2);
+      expect(logged).not.toMatch(/secreto|ai-wardrobe/);
+    } finally { spy.mockRestore(); }
+  });
+
+  it("DRY_RUN es el defecto y cualquier valor distinto de \"APPLY\" exacto es DRY_RUN: ni un DELETE", async () => {
+    for (const mode of [undefined, "DRY_RUN", "apply", "APPLY ", " APPLY", "DELETE", true, 1]) {
+      const h = harness({ assets: [arows(200), arows(5)], runs: [rrows(3)] });
+      const r = await h.run(1_000_000, mode);
+      expect(r).toMatchObject({ mode: "DRY_RUN", assets: { deleted: 0, eligible: 205 }, runs: { deleted: 0 } });
+      for (const q of h.sql) expect(q.text).not.toMatch(/\b(DELETE|INSERT|TRUNCATE|MERGE)\b|\bUPDATE\s+"/i);
+    }
+  });
+
+  it("APPLY sigue desactivado en la aplicación: constante en false y el orquestador no usa el resolutor ni pasa `mode`", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { RETENTION_APPLY_ENABLED } = await import("@/services/media-retention-config");
+    expect(RETENTION_APPLY_ENABLED).toBe(false);
+    const orchestrator = readFileSync("src/services/media-reconcile-run.service.ts", "utf8");
+    expect(orchestrator).not.toMatch(/media-retention-config|resolveRetentionMode|RETENTION_APPLY_ENABLED/);
+    expect(orchestrator).not.toMatch(/mode:\s*["'`]?APPLY|\bmode\s*:/);
+    const route = readFileSync("src/app/api/cron/media-reconcile/run/route.ts", "utf8");
+    expect(route).not.toMatch(/APPLY|mode|searchParams/);
   });
 });

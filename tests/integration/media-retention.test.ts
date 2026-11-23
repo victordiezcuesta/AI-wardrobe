@@ -58,15 +58,25 @@ async function acquire(svc = leaseSvc()) {
   if (r.status !== "ACQUIRED") throw new Error("no adquirió");
   return r.lease;
 }
-async function retain(o: { graceHours?: number; budgetMs?: number; lease?: Awaited<ReturnType<typeof acquire>>; svc?: Parameters<Retention["createMediaRetention"]>[0]["lease"] } = {}) {
+async function retain(o: { graceHours?: number; budgetMs?: number; lease?: Awaited<ReturnType<typeof acquire>>; svc?: Parameters<Retention["createMediaRetention"]>[0]["lease"]; mode?: "APPLY" | "DRY_RUN" | string } = {}) {
   const svc = o.svc ?? leaseSvc();
   const lease = o.lease ?? await acquire(svc as ReturnType<typeof leaseSvc>);
-  return R.createMediaRetention({ lease: svc }).run(lease, { budgetMs: o.budgetMs ?? 1_000_000, ttlMs: 360_000, graceHours: o.graceHours ?? 24 });
+  return R.createMediaRetention({ lease: svc }).run(lease, { budgetMs: o.budgetMs ?? 1_000_000, ttlMs: 360_000, graceHours: o.graceHours ?? 24, mode: o.mode as never });
 }
 const snapshot = async () => ({
   assets: await t.prisma.mediaAsset.findMany({ orderBy: { publicId: "asc" } }),
   runs: await t.prisma.mediaReconcileRun.findMany({ where: { status: { not: "RUNNING" } }, orderBy: { fencingToken: "asc" } }),
 });
+
+/** `n` filas CLEARED de hace 60 días (elegibles por la regla de 30 d) de varios propietarios. */
+async function bulk(n: number) {
+  const r1 = await run("COMPLETED", 400 * D);
+  await t.prisma.$executeRawUnsafe(`INSERT INTO "MediaAsset" ("id", "publicId", "delivery", "kind", "ownerUserId", "assetId", "resourceCreatedAt",
+      "state", "firstCandidateAt", "lastCandidateAt", "firstCandidateRunId", "lastCandidateRunId", "sightings", "ownerMissing", "createdAt", "updatedAt")
+    SELECT gen_random_uuid()::text, 'ai-wardrobe/o' || (i % 7) || '/wardrobe/b' || lpad(i::text, 5, '0'), 'UPLOAD', 'WARDROBE', 'o' || (i % 7),
+      'as' || i, ${ago(400 * D)}, 'CLEARED', ${ago(60 * D)}, ${ago(60 * D)}, '${r1}', '${r1}', 1, false, ${NOW}, ${NOW}
+    FROM generate_series(1, ${n}) AS i`);
+}
 
 describe("MediaAsset: límites justo antes y después de cada regla", () => {
   it("CLEARED 30 d; CLEARED+ownerMissing 14 d (el suelo prevalece sobre 7 d); activos+ownerMissing 30 d; activos 180 d", async () => {
@@ -149,14 +159,6 @@ describe("MediaReconcileRun", () => {
 });
 
 describe("lotes, DRY_RUN y lease", () => {
-  async function bulk(n: number) {
-    const r1 = await run("COMPLETED", 400 * D);
-    await t.prisma.$executeRawUnsafe(`INSERT INTO "MediaAsset" ("id", "publicId", "delivery", "kind", "ownerUserId", "assetId", "resourceCreatedAt",
-        "state", "firstCandidateAt", "lastCandidateAt", "firstCandidateRunId", "lastCandidateRunId", "sightings", "ownerMissing", "createdAt", "updatedAt")
-      SELECT gen_random_uuid()::text, 'ai-wardrobe/o' || (i % 7) || '/wardrobe/b' || lpad(i::text, 5, '0'), 'UPLOAD', 'WARDROBE', 'o' || (i % 7),
-        'as' || i, ${ago(400 * D)}, 'CLEARED', ${ago(60 * D)}, ${ago(60 * D)}, '${r1}', '${r1}', 1, false, ${NOW}, ${NOW}
-      FROM generate_series(1, ${n}) AS i`);
-  }
 
   it("lotes de 200: 450 elegibles → 3 lotes; 2100 → 10 lotes (2000) y PARTIAL", async () => {
     await bulk(450);
@@ -270,5 +272,133 @@ describe("withLease: maxWaitMs y timeoutMs (C2)", () => {
     await expect(svc.withLease(lease, async () => 1, { maxWaitMs: 200 })).rejects.toMatchObject({ code: "P2028" });
     expect(Date.now() - t0).toBeLessThan(2_000);
     release(); await holder;
+  });
+});
+
+describe("APPLY (19.8b-2) sobre PGlite: borra exactamente lo elegible", () => {
+  const publicIds = async () => (await t.prisma.mediaAsset.findMany({ select: { publicId: true } })).map((x) => x.publicId.split("/").at(-1)!).sort();
+  const release = () => t.prisma.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "holderRunId" = NULL, "leaseExpiresAt" = NULL`);
+  const fill14 = async () => { for (const s2 of ["COMPLETED", "INCOMPLETE", "FAILED", "ABANDONED"] as const) for (let i = 0; i < 14; i++) await run(s2, 1 * D); };
+
+  it("límites de cada regla (±1 min) y suelo de 14 días: solo se borran las 6 «después»", async () => {
+    const r1 = await run("COMPLETED", 400 * D); const r2 = await run("COMPLETED", 400 * D);
+    const cases: [string, "CANDIDATE" | "CONFIRMED" | "CLEARED", boolean, number][] = [
+      ["c", "CLEARED", false, 30 * D], ["com", "CLEARED", true, 14 * D], ["aom", "CANDIDATE", true, 30 * D],
+      ["fom", "CONFIRMED", true, 30 * D], ["a", "CANDIDATE", false, 180 * D], ["f", "CONFIRMED", false, 180 * D],
+    ];
+    for (const [n, state, om, cutoff] of cases) {
+      const o = state === "CONFIRMED" ? { firstRun: r1 } : {};
+      await asset(`${n}-antes`, state, om, cutoff - MIN, r2, o);
+      await asset(`${n}-despues`, state, om, cutoff + MIN, r2, o);
+    }
+    await asset("com-8d", "CLEARED", true, 8 * D, r2);
+    const res = await retain({ mode: "APPLY" });
+    expect(res).toMatchObject({ mode: "APPLY", status: "DONE", assets: { deleted: 6, eligible: 6, end: "COMPLETE",
+      deletedByRule: { CLEARED: 1, CLEARED_OWNER_MISSING: 1, ACTIVE_OWNER_MISSING: 2, ACTIVE: 2 } } });
+    expect(await publicIds()).toEqual(["a-antes", "aom-antes", "c-antes", "com-8d", "com-antes", "f-antes", "fom-antes"]);
+  });
+
+  it("suelo con el MAYOR graceHours (ejecución 72 h → 21 d; actual 96 h → 28 d)", async () => {
+    const g72 = await run("COMPLETED", 400 * D, 72); const g24 = await run("COMPLETED", 400 * D, 24);
+    await asset("r-20d", "CLEARED", true, 21 * D - MIN, g72); await asset("r-22d", "CLEARED", true, 21 * D + MIN, g72);
+    await asset("c-27d", "CLEARED", true, 28 * D - MIN, g24); await asset("c-29d", "CLEARED", true, 28 * D + MIN, g24);
+    expect((await retain({ mode: "APPLY", graceHours: 96 })).assets.deleted).toBe(1);
+    expect(await publicIds()).toEqual(["c-27d", "r-20d", "r-22d"]);
+    await release();
+    expect((await retain({ mode: "APPLY", graceHours: 24 })).assets.deleted).toBe(2); // r-22d (21 d) y c-27d (14 d)
+    expect(await publicIds()).toEqual(["r-20d"]);
+  });
+
+  it("ejecuciones: se conservan las referenciadas, las 14 más recientes por estado (por token), la RUNNING/dueña y la fila del lock", async () => {
+    const refFirst = await run("COMPLETED", 200 * D); const refLast = await run("COMPLETED", 200 * D); const free = await run("COMPLETED", 200 * D);
+    const oldFailed = await run("FAILED", 31 * D); const youngFailed = await run("FAILED", 29 * D);
+    await fill14();
+    const recent = await run("COMPLETED", 1 * D);
+    await asset("x", "CONFIRMED", false, 1 * D, recent, { firstRun: refFirst });
+    await asset("y", "CANDIDATE", false, 1 * D, refLast);
+    const svc = leaseSvc(); const lease = await acquire(svc);
+    const before = await t.prisma.mediaReconcileLock.findFirstOrThrow();
+    const total = await t.prisma.mediaReconcileRun.count();
+    const res = await retain({ svc, lease, mode: "APPLY" });
+    expect(res.runs).toMatchObject({ deleted: 2, deletedByStatus: { COMPLETED: 1, FAILED: 1 }, end: "COMPLETE" });
+    const left = new Set((await t.prisma.mediaReconcileRun.findMany({ select: { id: true } })).map((x) => x.id));
+    expect(left.has(free) || left.has(oldFailed)).toBe(false);
+    for (const id of [refFirst, refLast, youngFailed, recent, lease.runId]) expect(left.has(id)).toBe(true);
+    expect(await t.prisma.mediaReconcileRun.count()).toBe(total - 2);
+    expect(await t.prisma.mediaReconcileLock.findFirstOrThrow()).toMatchObject({ name: "media-reconcile", holderRunId: lease.runId, fencingToken: before.fencingToken });
+    expect(await t.prisma.mediaReconcileRun.findUniqueOrThrow({ where: { id: lease.runId } })).toMatchObject({ status: "RUNNING" });
+  });
+
+  it("orden MediaAsset → ejecuciones: una ejecución que solo referenciaba una fila borrada se borra en la MISMA pasada (DRY_RUN no la cuenta)", async () => {
+    const onlyRef = await run("COMPLETED", 400 * D);
+    await fill14();
+    await asset("vieja", "CLEARED", false, 60 * D, onlyRef);
+    const dry = await retain({ mode: "DRY_RUN" });
+    expect(dry).toMatchObject({ assets: { eligible: 1, deleted: 0 }, runs: { eligible: 0, deleted: 0 } }); // aún referenciada
+    await release();
+    const res = await retain({ mode: "APPLY" });
+    expect(res).toMatchObject({ assets: { deleted: 1 }, runs: { deleted: 1, deletedByStatus: { COMPLETED: 1 } } });
+    expect(await t.prisma.mediaReconcileRun.findUnique({ where: { id: onlyRef } })).toBeNull();
+  });
+
+  it("lotes de 200 sin cursor: 450 → 3 lotes; 2100 → 10 lotes (2000, MAX_BATCHES), la siguiente pasada borra 100 y la tercera 0 (idempotente)", async () => {
+    await bulk(450);
+    expect((await retain({ mode: "APPLY" })).assets).toMatchObject({ deleted: 450, batches: 3, end: "COMPLETE" });
+    expect(await t.prisma.mediaAsset.count()).toBe(0);
+    await release();
+    await bulk(2100);
+    expect(await retain({ mode: "APPLY" })).toMatchObject({ status: "PARTIAL", assets: { deleted: 2000, batches: 10, end: "MAX_BATCHES" } });
+    expect(await t.prisma.mediaAsset.count()).toBe(100);
+    await release();
+    expect((await retain({ mode: "APPLY" })).assets).toMatchObject({ deleted: 100, batches: 1, end: "COMPLETE" });
+    await release();
+    expect((await retain({ mode: "APPLY" })).assets).toMatchObject({ deleted: 0, batches: 1, end: "COMPLETE" });
+    expect(await t.prisma.mediaAsset.count()).toBe(0);
+  }, 60_000);
+
+  it("un lote que falla se deshace entero y no se contabiliza: 450 filas, error en el 2.º lote → 200 borradas y 250 intactas", async () => {
+    await bulk(450);
+    const victim = (await t.prisma.mediaAsset.findMany({ orderBy: { publicId: "asc" }, select: { publicId: true } }))[300]!.publicId;
+    await t.prisma.$executeRawUnsafe(`CREATE FUNCTION test_fail_retention() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF OLD."publicId" = '${victim}' THEN RAISE EXCEPTION 'fallo provocado'; END IF; RETURN OLD; END $$`);
+    await t.prisma.$executeRawUnsafe(`CREATE TRIGGER test_fail_retention BEFORE DELETE ON "MediaAsset" FOR EACH ROW EXECUTE FUNCTION test_fail_retention()`);
+    let res;
+    try { res = await retain({ mode: "APPLY" }); } finally {
+      await heal();
+      await t.prisma.$executeRawUnsafe(`DROP TRIGGER test_fail_retention ON "MediaAsset"`);
+      await t.prisma.$executeRawUnsafe(`DROP FUNCTION test_fail_retention()`);
+    }
+    expect(res).toMatchObject({ status: "STOPPED", assets: { deleted: 200, batches: 1, end: "STOPPED" }, runs: { deleted: 0, end: "NOT_STARTED" } });
+    expect(res!.errorCodes).toHaveLength(1);
+    expect(await t.prisma.mediaAsset.count()).toBe(250);
+    expect(await t.prisma.mediaAsset.findFirst({ where: { publicId: victim } })).not.toBeNull();
+  });
+
+  it("modo no exacto (\"apply\", \"APPLY \") u omitido → DRY_RUN: no se borra nada", async () => {
+    await bulk(30);
+    for (const mode of ["apply", "APPLY ", undefined]) {
+      expect(await retain({ mode })).toMatchObject({ mode: "DRY_RUN", assets: { eligible: 30, deleted: 0 } });
+      await release();
+    }
+    expect(await t.prisma.mediaAsset.count()).toBe(30);
+  });
+
+  it("lease ajeno (otro token) o lease perdido entre lotes → no se borra nada más", async () => {
+    await bulk(450);
+    const svc = leaseSvc(); const lease = await acquire(svc);
+    expect(await retain({ svc, lease: { ...lease, fencingToken: lease.fencingToken + 1 }, mode: "APPLY" })).toMatchObject({ status: "LEASE_LOST", assets: { deleted: 0 } });
+    expect(await t.prisma.mediaAsset.count()).toBe(450);
+    let n = 0;
+    const wrapped = { withLease: (async (...a: Parameters<typeof svc.withLease>) => {
+      const r = await svc.withLease(...a);
+      if (++n === 1) {
+        await t.prisma.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "heartbeatAt" = ${NOW} - interval '2 seconds', "leaseExpiresAt" = ${NOW} - interval '1 second'`);
+        await acquire(leaseSvc());
+      }
+      return r;
+    }) as never };
+    const res = await R.createMediaRetention({ lease: wrapped }).run(lease, { budgetMs: 1_000_000, ttlMs: 360_000, graceHours: 24, mode: "APPLY" });
+    expect(res).toMatchObject({ status: "LEASE_LOST", assets: { deleted: 200, batches: 1, end: "LEASE_LOST" } });
+    expect(await t.prisma.mediaAsset.count()).toBe(250);
   });
 });

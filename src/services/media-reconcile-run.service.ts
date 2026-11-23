@@ -192,6 +192,12 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
         } catch {
           retention = emptyRetentionResult("STOPPED", ["retention/INTERNAL"]); // nunca detiene la reconciliación
         }
+        // STOPPED (resultado o excepción): constancia única, solo agregados y códigos genéricos; la detección continúa.
+        if (retention.status === "STOPPED") {
+          const codes = normalizeErrorCodes(retention.errorCodes).join(",");
+          logError("media.reconcile.run", new Error(
+            `Retención ${retention.mode} STOPPED (assetBatches=${retention.assets.batches}, runBatches=${retention.runs.batches}): ${codes}`));
+        }
         // Lease perdido: finishWith fallaría igual; se detiene toda la ejecución protegida sin detectar.
         if (retention.status === "LEASE_LOST") {
           return close("LEASE_LOST", { status: "FAILED", inventoryComplete: false, errorCodes: ["lease/LEASE_LOST"] }, null);

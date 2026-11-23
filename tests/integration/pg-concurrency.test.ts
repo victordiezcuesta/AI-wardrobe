@@ -1057,7 +1057,7 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
     });
   });
 
-  describe("retención DRY_RUN 19.8a con conexiones reales", () => {
+  describe("retención 19.8a (DRY_RUN) y 19.8b-2 (APPLY) con conexiones reales", () => {
     const tracked = <R,>(p: Promise<R>): Promise<R> => { T.registry().ops.push(p); return p; };
     type LeaseLike = Awaited<ReturnType<typeof leaseSvc>>["a"];
     /** Ejecución terminada hace 400 días (token siguiente según la base de datos). */
@@ -1077,9 +1077,9 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
           now() - interval '400 days', 'CLEARED', now() - interval '60 days', now() - interval '60 days', '${runId}', '${runId}', 1, false, now(), now()
         FROM generate_series(1, ${n}) AS i`);
     }
-    async function retain(lease: Pick<LeaseLike, "withLease">, l: Awaited<ReturnType<typeof acquiredBy>>) {
+    async function retain(lease: Pick<LeaseLike, "withLease">, l: Awaited<ReturnType<typeof acquiredBy>>, mode?: "APPLY") {
       const { createMediaRetention } = await import("@/services/media-retention.service");
-      return tracked(createMediaRetention({ lease }).run(l, { budgetMs: 60_000, ttlMs: 360_000, graceHours: 24 }));
+      return tracked(createMediaRetention({ lease }).run(l, { budgetMs: 60_000, ttlMs: 360_000, graceHours: 24, mode }));
     }
     const snapshot = async () => ({
       assets: await monitor.mediaAsset.findMany({ orderBy: { publicId: "asc" } }),
@@ -1178,6 +1178,141 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
       const res = await retain(wrapped, l);
       expect(res).toMatchObject({ status: "LEASE_LOST", errorCodes: ["retention/LEASE_LOST"], assets: { batches: 1, eligible: 200 } });
       expect(await runStatus(l.runId)).toBe("ABANDONED");
+    });
+
+    // ── APPLY (19.8b-2): borrado real en la base de pruebas temporal de esta suite ─────────────────────────────────
+    const ownerAssets = (owner: string) => monitor.mediaAsset.count({ where: { ownerUserId: owner } });
+
+    it("APPLY + SKIP LOCKED: la fila 150 bloqueada por otra sesión no se espera ni se borra; las otras 449 sí", async () => {
+      const { a } = await leaseSvc();
+      const u = await newUser();
+      await cleared(u.id, 450, await oldRun());
+      const locked = `ai-wardrobe/${u.id}/wardrobe/c00150`;
+      const l = await acquiredBy(a);
+      const h = await hold(`SELECT 1 FROM "MediaAsset" WHERE "publicId" = '${locked}' FOR UPDATE`);
+      const t0 = Date.now();
+      const res = await retain(a, l, "APPLY");
+      const elapsed = Date.now() - t0;
+      await h.release();
+      expect(res).toMatchObject({ mode: "APPLY", status: "DONE", assets: { deleted: 449, eligible: 449, batches: 3, end: "COMPLETE" } });
+      expect(elapsed).toBeLessThan(1_500);
+      expect(await ownerAssets(u.id)).toBe(1);
+      expect(await monitor.mediaAsset.count({ where: { publicId: locked } })).toBe(1);
+    });
+
+    it("APPLY sin cursor: una fila bloqueada durante el 1.er lote se RECONSIDERA y se borra en un lote posterior (450 de 450)", async () => {
+      const { a } = await leaseSvc();
+      const u = await newUser();
+      await cleared(u.id, 450, await oldRun());
+      const locked = `ai-wardrobe/${u.id}/wardrobe/c00150`;
+      const l = await acquiredBy(a);
+      const h = await hold(`SELECT 1 FROM "MediaAsset" WHERE "publicId" = '${locked}' FOR UPDATE`);
+      let n = 0;
+      const wrapped = { withLease: (async (...args: Parameters<LeaseLike["withLease"]>) => {
+        const r = await a.withLease(...args);
+        if (++n === 1) await h.release(); // la otra sesión la suelta tras el primer lote
+        return r;
+      }) as never };
+      const res = await retain(wrapped, l, "APPLY");
+      expect(res).toMatchObject({ status: "DONE", assets: { deleted: 450, batches: 3, end: "COMPLETE" } });
+      expect(await ownerAssets(u.id)).toBe(0); // con un cursor, la fila 150 (ya «pasada») se habría quedado
+    });
+
+    it("APPLY con lease perdido entre lotes: el 1.er lote queda confirmado (200) y no se borra nada más; la ejecución queda ABANDONED", async () => {
+      const { a, b } = await leaseSvc();
+      const u = await newUser();
+      await cleared(u.id, 450, await oldRun());
+      const l = await acquiredBy(a);
+      let n = 0;
+      const wrapped = { withLease: (async (...args: Parameters<LeaseLike["withLease"]>) => {
+        const r = await a.withLease(...args);
+        if (++n === 1) { await expireNow(); await acquiredBy(b); }
+        return r;
+      }) as never };
+      const res = await retain(wrapped, l, "APPLY");
+      expect(res).toMatchObject({ status: "LEASE_LOST", assets: { deleted: 200, batches: 1, end: "LEASE_LOST" } });
+      expect(await ownerAssets(u.id)).toBe(250);
+      expect(await runStatus(l.runId)).toBe("ABANDONED");
+    });
+
+    it("APPLY: una referencia NO confirmada de otra sesión bloquea la ejecución (FOR KEY SHARE) → SKIP LOCKED la salta; nada falla", async () => {
+      const { a } = await leaseSvc();
+      const runsIds: string[] = [];
+      for (let i = 0; i < 15; i++) runsIds.push(await oldRun()); // 15 COMPLETED antiguas: la de token más bajo es la elegible
+      const target = runsIds[0]!;
+      const l = await acquiredBy(a);
+      const h = await hold(`INSERT INTO "MediaAsset" ("id", "publicId", "delivery", "kind", "ownerUserId", "assetId", "resourceCreatedAt",
+          "state", "firstCandidateAt", "lastCandidateAt", "firstCandidateRunId", "lastCandidateRunId", "sightings", "ownerMissing", "createdAt", "updatedAt")
+        VALUES ('ref-concurrente', 'ai-wardrobe/refc/wardrobe/x', 'UPLOAD', 'WARDROBE', 'refc', 'as-refc', now(), 'CANDIDATE', now(), now(),
+          '${target}', '${target}', 1, false, now(), now())`);
+      const t0 = Date.now();
+      const res = await retain(a, l, "APPLY");
+      expect(Date.now() - t0).toBeLessThan(1_500);
+      await h.release(); // la referencia se confirma: la ejecución queda protegida
+      expect(res).toMatchObject({ status: "DONE", errorCodes: [], runs: { deleted: 0, end: "COMPLETE" } });
+      expect(await monitor.mediaReconcileRun.count({ where: { id: target } })).toBe(1);
+    });
+
+    it("APPLY: una referencia que aparece en la misma sentencia hace saltar la FK (23503) → se deshace el lote entero, STOPPED y registrado", async () => {
+      const { a } = await leaseSvc();
+      for (let i = 0; i < 15; i++) await oldRun();
+      const l = await acquiredBy(a);
+      const before = await monitor.mediaReconcileRun.count();
+      // Solo en la base temporal de esta suite: un trigger inserta una referencia a la ejecución que se está borrando.
+      await app.$executeRawUnsafe(`CREATE FUNCTION test_ref_on_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+        INSERT INTO "MediaAsset" ("id", "publicId", "delivery", "kind", "ownerUserId", "assetId", "resourceCreatedAt", "state", "firstCandidateAt",
+          "lastCandidateAt", "firstCandidateRunId", "lastCandidateRunId", "sightings", "ownerMissing", "createdAt", "updatedAt")
+        VALUES ('fk-' || OLD."id", 'ai-wardrobe/fkx/wardrobe/' || OLD."id", 'UPLOAD', 'WARDROBE', 'fkx', 'as-fk', now(), 'CANDIDATE', now(), now(),
+          OLD."id", OLD."id", 1, false, now(), now());
+        RETURN OLD; END $$`);
+      await app.$executeRawUnsafe(`CREATE TRIGGER test_ref_on_delete BEFORE DELETE ON "MediaReconcileRun" FOR EACH ROW EXECUTE FUNCTION test_ref_on_delete()`);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      let res; let logged = "";
+      try { res = await retain(a, l, "APPLY"); } finally {
+        logged = (errSpy.mock.calls as unknown[][]).flat().map(String).join(" ");
+        await app.$executeRawUnsafe(`DROP TRIGGER test_ref_on_delete ON "MediaReconcileRun"`);
+        await app.$executeRawUnsafe(`DROP FUNCTION test_ref_on_delete()`);
+        errSpy.mockRestore();
+      }
+      expect(res).toMatchObject({ status: "STOPPED", errorCodes: ["retention/FK_VIOLATION"], runs: { deleted: 0, end: "STOPPED" } });
+      expect(await monitor.mediaReconcileRun.count()).toBe(before);
+      expect(await monitor.mediaAsset.count({ where: { ownerUserId: "fkx" } })).toBe(0); // también deshecho
+      expect(logged).toContain("retention/FK_VIOLATION");
+    });
+
+    it("APPLY: un lote cancelado por statement_timeout (57014 real) se deshace entero y no suma nada", async () => {
+      const { a } = await leaseSvc();
+      const u = await newUser();
+      await cleared(u.id, 50, await oldRun());
+      const l = await acquiredBy(a);
+      await app.$executeRawUnsafe(`CREATE FUNCTION test_slow_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+        IF OLD."publicId" LIKE '%/c00025' THEN PERFORM pg_sleep(6); END IF; RETURN OLD; END $$`);
+      await app.$executeRawUnsafe(`CREATE TRIGGER test_slow_delete BEFORE DELETE ON "MediaAsset" FOR EACH ROW EXECUTE FUNCTION test_slow_delete()`);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      let res; const t0 = Date.now();
+      try { res = await retain(a, l, "APPLY"); } finally {
+        await app.$executeRawUnsafe(`DROP TRIGGER test_slow_delete ON "MediaAsset"`);
+        await app.$executeRawUnsafe(`DROP FUNCTION test_slow_delete()`);
+        errSpy.mockRestore();
+      }
+      const elapsed = Date.now() - t0;
+      expect(res).toMatchObject({ status: "STOPPED", errorCodes: ["retention/QUERY_TIMEOUT"], assets: { deleted: 0, end: "STOPPED" } });
+      expect(elapsed).toBeGreaterThanOrEqual(4_500);
+      expect(elapsed).toBeLessThan(8_000);
+      expect(await ownerAssets(u.id)).toBe(50);
+    }, 20_000);
+
+    it("APPLY: tabla bloqueada por otra sesión → lock_timeout (2 s) dentro del lote → rollback, nada borrado", async () => {
+      const { a } = await leaseSvc();
+      const u = await newUser();
+      await cleared(u.id, 20, await oldRun());
+      const l = await acquiredBy(a);
+      const h = await hold(`LOCK TABLE "MediaAsset" IN ACCESS EXCLUSIVE MODE`);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      let res;
+      try { res = await retain(a, l, "APPLY"); } finally { errSpy.mockRestore(); await h.release(); }
+      expect(res).toMatchObject({ status: "STOPPED", errorCodes: ["retention/LOCK_TIMEOUT"], assets: { deleted: 0 } });
+      expect(await ownerAssets(u.id)).toBe(20);
     });
 
     it("DRY_RUN con PostgreSQL real: ninguna fila cambia; statement_timeout 5 s y lock_timeout 2 s dentro de cada lote; lease renovado", async () => {
