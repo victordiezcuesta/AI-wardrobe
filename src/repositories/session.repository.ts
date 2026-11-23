@@ -18,6 +18,10 @@ export const sessionRepository = {
   /** Idempotente: revocar una sesión ya revocada no es un error. */
   delete: (tokenHash: string) => prisma.session.deleteMany({ where: { sessionToken: tokenHash } }),
 
+  /** Todas las sesiones del usuario salvo la de `keepTokenHash`. Acepta el cliente de una transacción interactiva. */
+  deleteOthers: (userId: string, keepTokenHash: string, db: Pick<typeof prisma, "session"> = prisma) =>
+    db.session.deleteMany({ where: { userId, sessionToken: { not: keepTokenHash } } }),
+
   deleteAllForEmail: (email: string) => prisma.session.deleteMany({ where: { user: { email } } }),
 
   deleteExpiredForUser: (userId: string, now: Date) => prisma.session.deleteMany({ where: { userId, expires: { lt: now } } }),

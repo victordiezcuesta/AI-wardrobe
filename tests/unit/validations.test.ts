@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { forgotSchema, loginSchema, registerSchema, resetSchema, verifySchema } from "@/lib/validations/auth";
+import { changePasswordSchema, forgotSchema, loginSchema, registerSchema, resetSchema, verifySchema } from "@/lib/validations/auth";
 import { profileSchema } from "@/lib/validations/profile";
 
 describe("registerSchema", () => {
@@ -127,5 +127,64 @@ describe("passwordSchema: máximo 72 bytes UTF-8", () => {
     it("conserva el resto de reglas (mínimo, composición y 128 caracteres)", () => {
       for (const p of ["Aa1xxxxxx", "abcdefghij1", "ABCDEFGHIJ1", "Abcdefghij", `Aa1${"x".repeat(125)}`]) expect(parse(p).success, p).toBe(false);
     });
+  });
+});
+
+/** Fase 20.3b — cambio de contraseña: la actual solo hasta 128 caracteres (sin el tope de 72 bytes); la nueva, passwordSchema. */
+describe("changePasswordSchema", () => {
+  const ok = (currentPassword: unknown, newPassword: unknown) => changePasswordSchema.safeParse({ currentPassword, newPassword });
+  it("acepta una actual antigua de más de 72 bytes (hasta 128 caracteres) y una nueva válida", () => {
+    expect(ok("x".repeat(128), "Nueva-clave-1").success).toBe(true);
+    expect(ok("😀".repeat(100), "Nueva-clave-1").success).toBe(true); // 400 bytes, 100 puntos de código
+    expect(ok("a", "Nueva-clave-1").success).toBe(true);
+  });
+  it("rechaza la actual vacía, de más de 128 caracteres o que no sea texto", () => {
+    expect(ok("", "Nueva-clave-1").success).toBe(false);
+    expect(ok("x".repeat(129), "Nueva-clave-1").success).toBe(false);
+    expect(ok(123, "Nueva-clave-1").success).toBe(false);
+    expect(changePasswordSchema.safeParse({ newPassword: "Nueva-clave-1" }).success).toBe(false);
+  });
+  it("la nueva usa passwordSchema completo: mínimo, composición, 128 caracteres y 72 bytes UTF-8", () => {
+    for (const p of ["Corta1a", "sinmayuscula1", "SINMINUSCULA1", "SinNumeroAqui", `Aa1${"x".repeat(126)}`, `Aa1${"x".repeat(70)}`, `${"ñ".repeat(34)}Aa1xy`, `${"😀".repeat(18)}Aa1`]) {
+      expect(ok("actual", p).success, p).toBe(false);
+    }
+    for (const p of [`Aa1${"x".repeat(69)}`, `${"ñ".repeat(34)}Aa1x`, `${"😀".repeat(17)}Aa1x`]) expect(ok("actual", p).success, p).toBe(true);
+    expect(JSON.stringify(ok("actual", `Aa1${"x".repeat(70)}`).error?.issues)).toContain("72 bytes UTF-8");
+  });
+  it("no exige que la nueva difiera de la actual: eso lo comprueba el servicio tras verificar la actual", () => {
+    expect(ok("Misma-clave-1", "Misma-clave-1").success).toBe(true);
+  });
+});
+
+/** Fase 20.3c (correcciones): el máximo de 128 caracteres de passwordSchema tiene mensaje propio en español. */
+describe("passwordSchema: mensaje del máximo de 128 caracteres", () => {
+  const MSG = "La contraseña no puede superar los 128 caracteres";
+  const long = `Aa1${"x".repeat(126)}`; // 129 caracteres (y por tanto > 72 bytes)
+  const messages = (r: { success: boolean; error?: { issues: { message: string }[] } }) => r.error?.issues.map((i) => i.message) ?? [];
+
+  it("más de 128 caracteres → mensaje en español, el primero de la lista, sin texto en inglés de Zod", () => {
+    for (const r of [registerSchema.safeParse({ email: "a@b.co", password: long }), resetSchema.safeParse({ token: "t".repeat(40), password: long }), changePasswordSchema.safeParse({ currentPassword: "x", newPassword: long })]) {
+      expect(r.success).toBe(false);
+      const m = messages(r);
+      expect(m[0]).toBe(MSG);
+      expect(m.join(" ")).not.toMatch(/Too big|expected string/);
+    }
+  });
+
+  it("el límite no cambia: 128 caracteres no dispara el mensaje de 128 (solo el de 72 bytes) y 129 sí; los 72 bytes siguen aplicándose", () => {
+    const at128 = registerSchema.safeParse({ email: "a@b.co", password: `Aa1${"x".repeat(125)}` }); // 128 caracteres, 128 bytes
+    expect(messages(at128)).toEqual([expect.stringContaining("72 bytes UTF-8")]); // el de 128 caracteres NO aparece
+    expect(messages(registerSchema.safeParse({ email: "a@b.co", password: long })).some((m) => m.includes("72 bytes UTF-8"))).toBe(true); // 129 caracteres: fallan ambos límites
+    expect(registerSchema.safeParse({ email: "a@b.co", password: `Aa1${"x".repeat(69)}` }).success).toBe(true);   // 72 bytes
+    expect(registerSchema.safeParse({ email: "a@b.co", password: `Aa1${"x".repeat(70)}` }).success).toBe(false);  // 73 bytes
+  });
+
+  it("el login y la contraseña actual no cambian: 128 caracteres válidos, 129 inválidos (con el mensaje por defecto)", () => {
+    expect(loginSchema.safeParse({ email: "a@b.co", password: "x".repeat(128) }).success).toBe(true);
+    const r = loginSchema.safeParse({ email: "a@b.co", password: "x".repeat(129) });
+    expect(r.success).toBe(false);
+    expect(messages(r).join(" ")).not.toContain(MSG);
+    expect(changePasswordSchema.safeParse({ currentPassword: "x".repeat(129), newPassword: "Nueva-clave-1" }).success).toBe(false);
+    expect(changePasswordSchema.safeParse({ currentPassword: "x".repeat(128), newPassword: "Nueva-clave-1" }).success).toBe(true);
   });
 });

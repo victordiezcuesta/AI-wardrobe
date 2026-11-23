@@ -50,6 +50,15 @@ export const sessionService = {
     return true;
   },
 
+  /**
+   * Revoca todas las sesiones del usuario EXCEPTO la del `sid` dado (la que realiza el cambio de contraseña). Con `db` se
+   * ejecuta dentro de la transacción del llamador. Sin `sid` válido no hace nada: nunca revoca «todas» por un sid ausente.
+   */
+  async revokeOthers(userId: string, sid: unknown, db?: Pick<typeof prisma, "session">): Promise<number> {
+    if (typeof sid !== "string" || !sid) throw new Error("revokeOthers: sid no válido");
+    return (await sessionRepository.deleteOthers(userId, hash(sid), db)).count;
+  },
+
   /** Revoca una única sesión (la del dispositivo que cierra sesión). Idempotente. */
   async revoke(sid: unknown): Promise<void> {
     if (typeof sid !== "string" || !sid) return;

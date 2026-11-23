@@ -33,8 +33,25 @@ const SESSION_COOKIES = ["__Secure-authjs.session-token", "authjs.session-token"
  * para que el cliente no dé el logout por completado. Sin cookie o con un JWT ilegible no hay nada que revocar.
  */
 export async function revokeCurrentSession(req: Request): Promise<void> {
+  const token = await readSessionToken(req);
+  if (token) await sessionService.revoke(token.sid);
+}
+
+/** JWT descifrado de la cookie de sesión de la petición (solo servidor), o null si no hay o es ilegible. */
+async function readSessionToken(req: Request) {
   for (const cookieName of SESSION_COOKIES) {
     const token = await getToken({ req, secret: env().AUTH_SECRET, cookieName, secureCookie: cookieName.startsWith("__Secure-") });
-    if (token) { await sessionService.revoke(token.sid); return; }
+    if (token) return token;
   }
+  return null;
+}
+
+/**
+ * `sid` de la sesión de esta petición, solo para uso en el servidor (nunca se expone al navegador). Devuelve null si no hay
+ * cookie, el JWT es ilegible, no lleva `sid` o su `sub` no es `userId` (el usuario ya autenticado por `requireUserId`).
+ */
+export async function currentSessionId(req: Request, userId: string): Promise<string | null> {
+  const token = await readSessionToken(req);
+  if (!token || token.sub !== userId || typeof token.sid !== "string" || !token.sid) return null;
+  return token.sid;
 }

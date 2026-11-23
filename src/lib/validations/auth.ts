@@ -3,7 +3,7 @@ import { z } from "zod";
 export const passwordSchema = z
   .string()
   .min(10, "Mínimo 10 caracteres")
-  .max(128)
+  .max(128, "La contraseña no puede superar los 128 caracteres")
   // bcrypt solo usa los primeros 72 BYTES UTF-8: se rechaza lo que los supere en vez de truncarlo en silencio.
   // `string.length` cuenta unidades UTF-16, no bytes («ñ» son 2 bytes y «😀» 4).
   .refine((value) => new TextEncoder().encode(value).length <= 72, "La contraseña no puede superar los 72 bytes UTF-8 (los caracteres con tilde o los emojis ocupan más de 1 byte)")
@@ -31,3 +31,13 @@ export const loginSchema = z.object({
 export const forgotSchema = z.object({ email: emailSchema });
 export const resetSchema = z.object({ token: tokenSchema, password: passwordSchema });
 export const verifySchema = z.object({ token: tokenSchema });
+
+/**
+ * Cambio de contraseña desde la sesión (20.3b). La contraseña ACTUAL solo se limita a 128 caracteres, sin el tope de 72
+ * bytes: una credencial antigua válida (el login no aplica ese límite) no debe quedar bloqueada. La nueva usa passwordSchema
+ * completo (mínimo, composición, 128 caracteres y 72 bytes UTF-8).
+ */
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1).max(128),
+  newPassword: passwordSchema,
+});
