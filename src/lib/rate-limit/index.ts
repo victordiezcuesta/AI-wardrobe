@@ -47,7 +47,3 @@ export async function rateLimitStatus(key: string, limit: number, windowSec: num
     FROM "RateLimit" WHERE "key" = ${key}`;
   return rows[0]?.blocked === true;
 }
-
-export function clientIp(req: Request): string {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
-}

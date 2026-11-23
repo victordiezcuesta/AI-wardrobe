@@ -176,6 +176,7 @@ npm start
 5. **Tamaño de petición:** las funciones de Vercel admiten cuerpos de ~4,5 MB; por eso el navegador redimensiona las fotos antes de subirlas y el servidor rechaza más de 4 MB.
 6. **Cron:** `vercel.json` programa `/api/cron/catalog-sync` a diario. Define `CRON_SECRET` (≥16 caracteres): Vercel lo envía como `Authorization: Bearer …` y la ruta rechaza todo lo demás.
 7. **Términos de uso:** el plan gratuito (Hobby) de Vercel está orientado a uso personal no comercial. Revisa sus términos antes de lanzar un SaaS.
+8. **Variables de sistema (límite por IP):** en *Settings → Environment Variables* debe estar activada la opción **Enable access to System Environment Variables**. La aplicación solo se considera en Vercel (y solo confía en `x-forwarded-for`) si `VERCEL === "1"`. Con la opción desactivada, `VERCEL` no existe, el despliegue es indistinguible de uno autoalojado y los límites por IP que usan esa resolución (el login y las rutas de registro, recuperación, restablecimiento y verificación de email) **dejan de aplicarse sin ningún aviso**; en el login seguiría el límite por email. En entornos **locales y autoalojados** (donde `VERCEL` no es `1`) tampoco se aplica límite por IP con la configuración actual; eso no desactiva los demás controles (límite por email del login, comprobación de origen, validación de entradas, tokens de un solo uso y autenticación).
 
 ## Catálogo de tiendas (opcional)
 
