@@ -10,6 +10,7 @@ import { Prisma } from "@/generated/prisma/client";
 const svc = vi.hoisted(() => ({ remove: vi.fn() }));
 vi.mock("@/lib/auth/session", () => ({ requireUserId: async () => "user-cmi8k2wzz0000gh78ij90kl12" }));
 vi.mock("@/services/wardrobe.service", () => ({ wardrobeService: { remove: svc.remove } }));
+vi.mock("@/lib/rate-limit", () => ({ rateLimit: async () => undefined })); // 19.16: el límite de la ruta se prueba en mutation-rate-limits.test.ts
 
 import { AppError, handler, toResponse } from "@/lib/errors";
 
