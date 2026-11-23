@@ -284,13 +284,15 @@ describe("APPLY (19.8b-2): una sentencia por lote, sin cursor, recuentos tras el
     }
   });
 
-  it("APPLY sigue desactivado en la aplicación: constante en false y el orquestador no usa el resolutor ni pasa `mode`", async () => {
+  it("APPLY sigue desactivado en la aplicación: constante en false y el orquestador solo usa el resolutor con esa constante", async () => {
     const { readFileSync } = await import("node:fs");
     const { RETENTION_APPLY_ENABLED } = await import("@/services/media-retention-config");
     expect(RETENTION_APPLY_ENABLED).toBe(false);
     const orchestrator = readFileSync("src/services/media-reconcile-run.service.ts", "utf8");
-    expect(orchestrator).not.toMatch(/media-retention-config|resolveRetentionMode|RETENTION_APPLY_ENABLED/);
-    expect(orchestrator).not.toMatch(/mode:\s*["'`]?APPLY|\bmode\s*:/);
+    // 19.8d: el orquestador usa el resolutor, pero nunca fija "APPLY" ni cambia la constante.
+    expect(orchestrator).toMatch(/resolveRetentionMode\(env, RETENTION_APPLY_ENABLED\)/);
+    expect(orchestrator).not.toMatch(/mode:\s*["'`]APPLY|RETENTION_APPLY_ENABLED\s*=/);
+    expect(readFileSync("src/services/media-retention-config.ts", "utf8")).toMatch(/export const RETENTION_APPLY_ENABLED: boolean = false;/);
     const route = readFileSync("src/app/api/cron/media-reconcile/run/route.ts", "utf8");
     expect(route).not.toMatch(/APPLY|mode|searchParams/);
   });

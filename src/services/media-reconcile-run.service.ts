@@ -6,7 +6,8 @@ import { MediaLeaseError, mediaLeaseService, type AcquiredLease, type Finished, 
 import {
   DEFAULT_GRACE_MS, detectOrphanMediaDetailed, type DetailedDetection, type MediaReconcileReport,
 } from "@/services/media-reconcile.service";
-import { createMediaRetention, emptyRetentionResult, type MediaRetention, type RetentionResult } from "@/services/media-retention.service";
+import { RETENTION_APPLY_ENABLED, resolveRetentionMode } from "@/services/media-retention-config";
+import { createMediaRetention, emptyRetentionResult, type MediaRetention, type RetentionMode, type RetentionResult } from "@/services/media-retention.service";
 
 /**
  * Fase 19.7 — orquestador de la reconciliación de medios: lease → detección detallada → persistencia atómica → cierre.
@@ -67,7 +68,7 @@ export const LEASE_OP_MAX_MS = LEASE_TX_MAX_WAIT_MS + LEASE_TX_TIMEOUT_MS + LEAS
 export const DETECT_OVERRUN_MS = 5_000;
 export const TIME_EXHAUSTED = "budget/TIME_EXHAUSTED";
 /**
- * Retención (fase 19.8a, DRY_RUN) justo tras acquire, SOLO con el tiempo que sobra: presupuesto
+ * Retención (fase 19.8a; modo de la 19.8d: configuredRetentionMode, DRY_RUN mientras RETENTION_APPLY_ENABLED sea false) justo tras acquire, SOLO con el tiempo que sobra: presupuesto
  * R = min(20 s, HARD_DEADLINE − transcurrido − (DETECT_BUDGET + DETECT_OVERRUN) − 2 · LEASE_OP_MAX). Con acquire
  * normal, R ≈ 20 s (290 − 185 − 84 = 21) y la detección conserva sus 180 s; si acquire tardó más de ~9 s, R < 12 s (un
  * lote no cabe) y la retención se omite. Nunca consume lo reservado para la detección ni para el cierre.
@@ -101,6 +102,8 @@ export interface RunnerDeps {
   persist: typeof persistMediaCandidates;
   /** Retención DRY_RUN (opcional: sin ella no se ejecuta). */
   retention?: Pick<MediaRetention, "run">;
+  /** Modo de retención de cada ejecución (fase 19.8d). Sin él, o si lanza o devuelve otra cosa que "APPLY" exacto → DRY_RUN. */
+  retentionMode?: () => RetentionMode;
   /** Reloj LOCAL solo para el presupuesto (inyectable en pruebas). */
   clock?: () => number;
   codeVersion?: string | null;
@@ -189,8 +192,10 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
       if (deps.retention) {
         const budgetMs = Math.min(RETENTION_MAX_BUDGET_MS,
           HARD_DEADLINE_MS - (clock() - t0) - DETECT_BUDGET_MS - DETECT_OVERRUN_MS - 2 * LEASE_OP_MAX_MS);
+        let mode: RetentionMode = "DRY_RUN"; // fail-closed: solo "APPLY" exacto del proveedor de modo lo cambia
+        try { if (deps.retentionMode?.() === "APPLY") mode = "APPLY"; } catch { /* configuración ilegible → DRY_RUN */ }
         try {
-          retention = await deps.retention.run(lease, { budgetMs: Math.max(0, budgetMs), ttlMs: LEASE_TTL_MS, graceHours: GRACE_HOURS, clock });
+          retention = await deps.retention.run(lease, { budgetMs: Math.max(0, budgetMs), ttlMs: LEASE_TTL_MS, graceHours: GRACE_HOURS, clock, mode });
         } catch {
           retention = emptyRetentionResult("STOPPED", ["retention/INTERNAL"]); // nunca detiene la reconciliación
         }
@@ -261,11 +266,20 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
 
 export type MediaReconcileRunner = ReturnType<typeof createMediaReconcileRunner>;
 
+/**
+ * Modo de retención de la aplicación (fase 19.8d): el resolutor puro con la barrera RETENTION_APPLY_ENABLED (false en el
+ * código). No hay parámetro para sustituirla: mientras la constante sea false, el resultado es siempre DRY_RUN.
+ */
+export function configuredRetentionMode(env: unknown): RetentionMode {
+  return resolveRetentionMode(env, RETENTION_APPLY_ENABLED).mode;
+}
+
 /** Instancia de la aplicación (servicios reales). */
 export const mediaReconcileRunner: MediaReconcileRunner = createMediaReconcileRunner({
   lease: mediaLeaseService,
   detect: (opts) => detectOrphanMediaDetailed(opts),
   persist: persistMediaCandidates,
   retention: createMediaRetention({ lease: mediaLeaseService }),
+  retentionMode: () => configuredRetentionMode(process.env),
   codeVersion: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 64) || null,
 });

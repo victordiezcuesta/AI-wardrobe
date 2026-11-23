@@ -379,6 +379,43 @@ describe("M1: presupuesto temporal con reloj simulado (ninguna operación empiez
   });
 });
 
+describe("modo de retención (19.8d) en el orquestador", () => {
+  const withMode = (mode: unknown, extra: object = {}) => {
+    const calls: Array<Record<string, unknown>> = [];
+    const retention = { run: vi.fn(async (_l: unknown, o: Record<string, unknown>) => { calls.push(o); return RETENTION_DONE; }) };
+    const s = setup({ retention });
+    const runner = m.createMediaReconcileRunner({ ...s.deps, retention, retentionMode: typeof mode === "function" ? mode : () => mode, ...extra } as never);
+    return { runner, calls, deps: s.deps };
+  };
+
+  it("sin proveedor de modo → DRY_RUN", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const s = setup({ retention: { run: async (_l: unknown, o: Record<string, unknown>) => { calls.push(o); return RETENTION_DONE; } } });
+    await s.runner.run();
+    expect(calls[0]!.mode).toBe("DRY_RUN");
+  });
+  it("el servicio recibe el modo del proveedor ('DRY_RUN' o, solo si el proveedor lo devuelve, 'APPLY')", async () => {
+    const a = withMode("DRY_RUN"); await a.runner.run(); expect(a.calls[0]!.mode).toBe("DRY_RUN");
+    const b = withMode("APPLY"); await b.runner.run(); expect(b.calls[0]!.mode).toBe("APPLY");
+  });
+  it.each([["lanza", () => { throw new Error("ai-wardrobe/x"); }], ["minúsculas", "apply"], ["undefined", undefined], ["objeto", {}], ["null", null]])(
+    "proveedor inválido (%s) → DRY_RUN", async (_n, v) => {
+      const r = withMode(v); const res = await r.runner.run();
+      expect(r.calls[0]!.mode).toBe("DRY_RUN");
+      expect(res).toMatchObject({ outcome: "COMPLETED" });
+      expect(JSON.stringify(res)).not.toMatch(/ai-wardrobe\//);
+    });
+  const FULL = { MEDIA_RETENTION_MODE: "APPLY", MEDIA_RETENTION_APPLY_CONFIRM: "apply-media-retention-policy-v1", VERCEL_ENV: "production" };
+  it.each([
+    ["sin configuración", {}], ["solo MODE=APPLY", { MEDIA_RETENTION_MODE: "APPLY" }], ["APPLY + confirmación sin entorno", { ...FULL, VERCEL_ENV: "preview" }],
+    ["configuración COMPLETA y correcta (constante en false)", FULL], ["DRY_RUN explícito", { MEDIA_RETENTION_MODE: "DRY_RUN" }],
+    ["modo inválido", { MEDIA_RETENTION_MODE: "apply" }], ["confirmación errónea", { ...FULL, MEDIA_RETENTION_APPLY_CONFIRM: "x" }],
+    ["entorno ilegible", null],
+  ])("configuredRetentionMode: %s → DRY_RUN", (_n, env) => {
+    expect(m.configuredRetentionMode(env)).toBe("DRY_RUN");
+  });
+});
+
 describe("retención DRY_RUN (19.8a) dentro del orquestador", () => {
   const retentionOf = (result: unknown) => {
     const calls: unknown[][] = [];
