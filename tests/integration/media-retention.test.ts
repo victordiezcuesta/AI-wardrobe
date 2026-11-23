@@ -10,6 +10,16 @@ import { setTestEnv } from "../helpers/mock-prisma";
 vi.mock("@/lib/prisma", () => ({
   prisma: new Proxy({}, { get() { throw new Error("uso del cliente global de Prisma"); } }),
 }));
+/**
+ * Puerta de TEST (19.9c): la retención comprueba RETENTION_APPLY_ENABLED en el propio servicio. Para ejercitar el SQL
+ * destructivo SOLO en las pruebas, se simula el módulo de configuración con un getter; el valor real del código de
+ * producción sigue siendo false y la composición real no tiene forma de inyectar nada de esto.
+ */
+const applyGate = vi.hoisted(() => ({ enabled: false }));
+vi.mock("@/services/media-retention-config", async (orig) => ({
+  ...(await orig<typeof import("@/services/media-retention-config")>()),
+  get RETENTION_APPLY_ENABLED() { return applyGate.enabled; },
+}));
 
 type Retention = typeof import("@/services/media-retention.service");
 type LeaseMod = typeof import("@/services/media-lease.service");
@@ -276,6 +286,8 @@ describe("withLease: maxWaitMs y timeoutMs (C2)", () => {
 });
 
 describe("APPLY (19.8b-2) sobre PGlite: borra exactamente lo elegible", () => {
+  beforeAll(() => { applyGate.enabled = true; });
+  afterAll(() => { applyGate.enabled = false; });
   const publicIds = async () => (await t.prisma.mediaAsset.findMany({ select: { publicId: true } })).map((x) => x.publicId.split("/").at(-1)!).sort();
   const release = () => t.prisma.$executeRawUnsafe(`UPDATE "MediaReconcileLock" SET "holderRunId" = NULL, "leaseExpiresAt" = NULL`);
   const fill14 = async () => { for (const s2 of ["COMPLETED", "INCOMPLETE", "FAILED", "ABANDONED"] as const) for (let i = 0; i < 14; i++) await run(s2, 1 * D); };

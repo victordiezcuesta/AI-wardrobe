@@ -2,13 +2,16 @@ import { Prisma } from "@/generated/prisma/client";
 import { logError } from "@/lib/errors";
 import { isDbError } from "@/lib/errors/db";
 import { MediaLeaseError, type MediaLease, type MediaLeaseService } from "@/services/media-lease.service";
+import { RETENTION_APPLY_ENABLED } from "@/services/media-retention-config";
 
 /**
  * Fases 19.8a/19.8b-2 — retención de MediaAsset y MediaReconcileRun.
  * - DRY_RUN (por defecto; el ÚNICO que usa hoy la aplicación): ejecuta las selecciones (WHERE, orden, LIMIT y
- *   `FOR UPDATE … SKIP LOCKED`) y devuelve recuentos. Ninguna escritura sobre MediaAsset ni MediaReconcileRun.
- * - APPLY (solo si quien llama pasa `mode: "APPLY"`; el orquestador NO lo hace y la activación depende de
- *   resolveRetentionMode con RETENTION_APPLY_ENABLED = false): cada lote es UNA sentencia
+ *   `FOR UPDATE … SKIP LOCKED`) y devuelve recuentos. No elimina ni modifica filas de
+ *   MediaAsset ni de MediaReconcileRun; sí renueva el lease en cada lote (fila del lock y heartbeat de la ejecución en curso).
+ * - APPLY (solo si quien llama pasa `mode: "APPLY"` Y RETENTION_APPLY_ENABLED es true: segunda barrera, en este servicio,
+ *   con la MISMA constante que usa resolveRetentionMode; mientras sea false, `mode: "APPLY"` se degrada a DRY_RUN antes de
+ *   ejecutar ninguna sentencia, sea quien sea el llamador): cada lote es UNA sentencia
  *   `WITH v AS MATERIALIZED (<la misma selección> FOR UPDATE … SKIP LOCKED) DELETE … USING v RETURNING …`, dentro de la
  *   misma transacción withLease que comprueba y renueva el lease. Sin cursor: como las filas desaparecen, cada lote vuelve
  *   a seleccionar desde el principio, y una fila saltada por estar bloqueada se reconsidera en el lote siguiente. Orden:
@@ -20,6 +23,11 @@ import { MediaLeaseError, type MediaLease, type MediaLeaseService } from "@/serv
  * nada con un rollback. Orden de bloqueo: lock → filas (MediaAsset por (delivery, publicId); ejecuciones por token).
  * `SKIP LOCKED`: nunca espera por filas que otro tiene bloqueadas (p. ej. el borrado de una cuenta) → sin interbloqueos
  * por su parte; esas filas se cuentan en la siguiente ejecución (los recuentos son una cota inferior).
+ *
+ * Política CLEARED (19.9c, decisión I-1): la antigüedad de TODA fila de MediaAsset se mide desde `lastCandidateAt` (la última
+ * observación como candidata), también en CLEARED: no existe `clearedAt` y la transición a CLEARED no toca las fechas. Es
+ * decir, «CLEARED 30 días» = 30 días desde la última observación, no desde que se limpió (con ejecuciones irregulares una
+ * fila puede ser elegible nada más limpiarse). Aceptado: solo se borra seguimiento, nunca medios.
  *
  * Límites por lote: lock_timeout 2 s (withLease), statement_timeout 5 s (local a la transacción), maxWait 2 s y timeout
  * 8 s de Prisma → cota BATCH_MAX_MS = 2 + 8 + 2 s de holgura (COMMIT/ROLLBACK) = 12 s. Supuesto (como en M1): ninguna
@@ -260,7 +268,7 @@ export interface RetentionOptions {
   graceHours: number;
   /** Reloj LOCAL solo para el presupuesto. */
   clock?: () => number;
-  /** DRY_RUN por defecto; solo "APPLY" exacto borra. La aplicación no lo pasa todavía. */
+  /** DRY_RUN por defecto; solo "APPLY" exacto borra, y solo si RETENTION_APPLY_ENABLED es true (si no, se ejecuta DRY_RUN). */
   mode?: RetentionMode;
 }
 
@@ -280,7 +288,9 @@ export function emptyRetentionResult(status: RetentionStatus, errorCodes: string
 export function createMediaRetention(deps: { lease: Pick<MediaLeaseService, "withLease"> }) {
   return {
     async run(lease: MediaLease, opts: RetentionOptions): Promise<RetentionResult> {
-      const mode: RetentionMode = opts.mode === "APPLY" ? "APPLY" : "DRY_RUN"; // fail-closed: cualquier otro valor → DRY_RUN
+      // Fail-closed, ANTES de cualquier consulta: solo "APPLY" exacto Y la constante de activación (la del resolutor) en true.
+      // Cualquier otro valor, o la constante en false, → DRY_RUN; `mode` es el modo EFECTIVO y es el que se informa.
+      const mode: RetentionMode = opts.mode === "APPLY" && RETENTION_APPLY_ENABLED === true ? "APPLY" : "DRY_RUN";
       const clock = opts.clock ?? (() => Date.now());
       const t0 = clock();
       const result = emptyRetentionResult("DONE", [], mode);

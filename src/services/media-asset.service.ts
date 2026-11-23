@@ -289,7 +289,9 @@ export async function persistMediaCandidates(tx: Tx, input: { runId: string; sta
     if (n !== batch.length) throw new MediaAssetError("CONCURRENT_MODIFICATION");
   }
 
-  // ── 9. Ausentes de una detección completa → CLEARED (sin borrar la fila ni tocar sus fechas) ────────────────────
+  // ── 9. Ausentes de una detección completa → CLEARED (sin borrar la fila ni tocar sus fechas) ──────────────────────
+  // Sin `clearedAt`: la retención de CLEARED cuenta desde lastCandidateAt (última observación), ver media-retention.service.
+  // (Decisión 19.9c / I-1.)
   lockedActiveAbsent.sort(byKey);
   for (const batch of batches(lockedActiveAbsent)) {
     const n = await tx.$executeRaw`

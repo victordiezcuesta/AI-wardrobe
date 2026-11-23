@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { Prisma } from "@/generated/prisma/client";
 import { setTestEnv } from "../helpers/mock-prisma";
 
@@ -7,6 +7,16 @@ import { setTestEnv } from "../helpers/mock-prisma";
  * una transacción simulada). Sin base de datos: la semántica del SQL se prueba en PGlite y PostgreSQL real.
  */
 vi.mock("@/lib/prisma", () => ({ prisma: {} }));
+/**
+ * Puerta de TEST (19.9c): la retención comprueba RETENTION_APPLY_ENABLED en el propio servicio. Para ejercitar el SQL
+ * destructivo SOLO en las pruebas, se simula el módulo de configuración con un getter; el valor real del código de
+ * producción sigue siendo false y la composición real no tiene forma de inyectar nada de esto.
+ */
+const applyGate = vi.hoisted(() => ({ enabled: false }));
+vi.mock("@/services/media-retention-config", async (orig) => ({
+  ...(await orig<typeof import("@/services/media-retention-config")>()),
+  get RETENTION_APPLY_ENABLED() { return applyGate.enabled; },
+}));
 
 type Mod = typeof import("@/services/media-retention.service");
 let m: Mod; let MediaLeaseError: typeof import("@/services/media-lease.service").MediaLeaseError;
@@ -194,6 +204,8 @@ describe("servicio DRY_RUN", () => {
 });
 
 describe("APPLY (19.8b-2): una sentencia por lote, sin cursor, recuentos tras el COMMIT", () => {
+  beforeAll(() => { applyGate.enabled = true; });
+  afterAll(() => { applyGate.enabled = false; });
   const isAssetSql = (t: string) => t.includes(`FROM "MediaAsset" a JOIN`);
   const isDelete = (t: string) => /\bDELETE\b/.test(t);
 
@@ -286,8 +298,7 @@ describe("APPLY (19.8b-2): una sentencia por lote, sin cursor, recuentos tras el
 
   it("APPLY sigue desactivado en la aplicación: constante en false y el orquestador solo usa el resolutor con esa constante", async () => {
     const { readFileSync } = await import("node:fs");
-    const { RETENTION_APPLY_ENABLED } = await import("@/services/media-retention-config");
-    expect(RETENTION_APPLY_ENABLED).toBe(false);
+    // El valor REAL de la constante (false) se comprueba en el código fuente y en media-retention-apply-barrier.test.ts: aquí está simulada.
     const orchestrator = readFileSync("src/services/media-reconcile-run.service.ts", "utf8");
     // 19.8d: el orquestador usa el resolutor, pero nunca fija "APPLY" ni cambia la constante.
     expect(orchestrator).toMatch(/resolveRetentionMode\(env, RETENTION_APPLY_ENABLED\)/);

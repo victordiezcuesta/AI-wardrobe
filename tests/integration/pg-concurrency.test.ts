@@ -30,6 +30,16 @@ const cloud = vi.hoisted(() => ({
   onDelete: null as ((id: string) => Promise<void>) | null,
 }));
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
+/**
+ * Puerta de TEST (19.9c): la retención comprueba RETENTION_APPLY_ENABLED en el propio servicio. Para ejercitar el SQL
+ * destructivo SOLO en las pruebas, se simula el módulo de configuración con un getter; el valor real del código de
+ * producción sigue siendo false y la composición real no tiene forma de inyectar nada de esto.
+ */
+const applyGate = vi.hoisted(() => ({ enabled: false }));
+vi.mock("@/services/media-retention-config", async (orig) => ({
+  ...(await orig<typeof import("@/services/media-retention-config")>()),
+  get RETENTION_APPLY_ENABLED() { return applyGate.enabled; },
+}));
 vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: () => undefined }));
 vi.mock("@/lib/pollinations/client", () => ({ editImage: async () => Buffer.alloc(0) }));
 vi.mock("@/lib/cloudinary", () => {
@@ -1058,6 +1068,8 @@ describe.skipIf(!ADMIN_URL)("lease del reconciliador de medios (bloqueo real de 
   });
 
   describe("retención 19.8a (DRY_RUN) y 19.8b-2 (APPLY) con conexiones reales", () => {
+    beforeAll(() => { applyGate.enabled = true; }); // solo para esta suite de pruebas (ver applyGate)
+    afterAll(() => { applyGate.enabled = false; });
     const tracked = <R,>(p: Promise<R>): Promise<R> => { T.registry().ops.push(p); return p; };
     type LeaseLike = Awaited<ReturnType<typeof leaseSvc>>["a"];
     /** Ejecución terminada hace 400 días (token siguiente según la base de datos). */
