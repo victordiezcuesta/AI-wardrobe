@@ -3,12 +3,13 @@ import { z } from "zod";
 import { handler } from "@/lib/errors";
 import { requireUserId } from "@/lib/auth/session";
 import { rateLimit } from "@/lib/rate-limit";
+import { isoDateSchema } from "@/lib/validations/date";
 import { weatherService } from "@/services/weather.service";
 
 const query = z.object({
   lat: z.coerce.number().min(-90).max(90),
   lon: z.coerce.number().min(-180).max(180),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  date: isoDateSchema,
 });
 
 export const GET = handler("weather", async (req: Request) => {

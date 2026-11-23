@@ -219,3 +219,55 @@ describe("completa tu armario: solo productos reales del catálogo", () => {
     expect(ai.calls).toHaveLength(0);
   });
 });
+
+describe("estilista: una fecha imposible se rechaza ANTES de cuota, IA y persistencia (fase 19.11)", () => {
+  let u: string;
+  beforeAll(async () => {
+    u = (await t.prisma.user.create({ data: { email: "estilista-fechas@test.com" } })).id;
+    for (const [name, category, primaryColor] of [["Camiseta", "TSHIRT", "blanco"], ["Vaqueros", "JEANS", "azul"], ["Zapatillas", "SNEAKERS", "blanco"], ["Chaqueta", "JACKET", "negro"]] as const) {
+      await t.prisma.wardrobeItem.create({ data: { userId: u, name, category, primaryColor } });
+    }
+  });
+  const counts = async () => ({
+    usage: await t.prisma.aiUsageLog.count({ where: { userId: u } }),
+    outfits: await t.prisma.outfit.count({ where: { userId: u } }),
+    feedback: await t.prisma.outfitFeedback.count({ where: { userId: u } }),
+  });
+
+  it.each(["2026-13-45", "2026-02-30", "2026-04-31", "2026-02-29", "2026-00-10", "2026-11-00", "", "mañana"])(
+    "date %j: INVALID_DATE (422), sin reservar cuota, sin llamar a la IA y sin guardar nada", async (date) => {
+      const { stylistService } = await import("@/services/stylist.service");
+      const before = await counts();
+      await expect(stylistService.generate(u, { ...request, date })).rejects.toMatchObject({ code: "INVALID_DATE", status: 422 });
+      expect(ai.calls).toEqual([]);
+      expect(await counts()).toEqual(before);
+    });
+
+  it.each(["24:00", "12:60", "9:00", "ab:cd"])("hora %j inválida: mismo resultado, sin cuota ni IA", async (time) => {
+    const { stylistService } = await import("@/services/stylist.service");
+    const before = await counts();
+    await expect(stylistService.generate(u, { ...request, time })).rejects.toMatchObject({ code: "INVALID_DATE", status: 422 });
+    expect(ai.calls).toEqual([]);
+    expect(await counts()).toEqual(before);
+  });
+
+  it("la API (esquema) rechaza la misma fecha con 422 de validación, antes de llegar al servicio", async () => {
+    const { stylistRequestSchema } = await import("@/lib/validations/stylist");
+    expect(stylistRequestSchema.safeParse({ ...request, date: "2026-13-45" }).success).toBe(false);
+    expect(stylistRequestSchema.safeParse({ ...request, date: "2026-02-30" }).success).toBe(false);
+  });
+
+  it("una fecha válida conserva el comportamiento: reserva UNA unidad, llama a la IA y guarda con la fecha correcta", async () => {
+    const { stylistService } = await import("@/services/stylist.service");
+    const before = await counts();
+    ai.responses.push(() => { const p = ai.calls[ai.calls.length - 1]!.user; const [c, v, z] = ["Camiseta", "Vaqueros", "Zapatillas"].map((n) => aliasOf(p, n));
+      return { outfits: [outfit("Con fecha válida", [c!, v!, z!])] }; });
+    const res = await stylistService.generate(u, { ...request, date: "2028-02-29", time: "20:30" });
+    expect(ai.calls.length).toBeGreaterThanOrEqual(1); // con menos de 3 válidos hay un segundo intento (misma reserva)
+    expect(res.outfits).toHaveLength(1);
+    expect(res.outfits[0]!.forDate!.toISOString()).toBe("2028-02-29T20:30:00.000Z");
+    const after = await counts();
+    expect(after.usage).toBe(before.usage + 1);
+    expect(after.outfits).toBe(before.outfits + 1);
+  });
+});

@@ -5,6 +5,7 @@ import { AppError, logError } from "@/lib/errors";
 import { asAiError, chat, isSurelyNotBilled, parseJson } from "@/lib/openrouter/client";
 import { weatherToText } from "@/lib/weather/open-meteo";
 import { aiOutfitsSchema, type StylistRequest } from "@/lib/validations/stylist";
+import { isValidIsoDate } from "@/lib/validations/date";
 import { profileRepository } from "@/repositories/profile.repository";
 import { wardrobeRepository } from "@/repositories/wardrobe.repository";
 import { outfitRepository } from "@/repositories/outfit.repository";
@@ -45,10 +46,22 @@ function itemLine(alias: string, it: WardrobeItem) {
   return parts.join(" | ");
 }
 
+/**
+ * Fecha y hora del conjunto, construidas y validadas ANTES de cualquier consulta, reserva de cuota o llamada a la IA: una
+ * fecha imposible («2026-13-45») daba `Invalid Date` y solo fallaba al guardar, con la IA ya consumida.
+ */
+export function outfitDate(date: string, time?: string): Date {
+  if (!isValidIsoDate(date) || (time !== undefined && !/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(time))) throw new AppError("Fecha u hora no válidas", 422, "INVALID_DATE");
+  const d = new Date(`${date}T${time ?? "12:00"}:00Z`);
+  if (Number.isNaN(d.getTime())) throw new AppError("Fecha u hora no válidas", 422, "INVALID_DATE");
+  return d;
+}
+
 const shuffle = <T>(arr: T[]) => arr.map((v) => [Math.random(), v] as const).sort((a, b) => a[0] - b[0]).map(([, v]) => v);
 
 export const stylistService = {
   async generate(userId: string, req: StylistRequest) {
+    const forDate = outfitDate(req.date, req.time); // antes de leer nada, reservar cuota o llamar a la IA
     const all = await wardrobeRepository.listAvailable(userId);
     if (all.length < MIN_ITEMS) throw new AppError(`Necesitas al menos ${MIN_ITEMS} prendas disponibles en tu armario para pedir conjuntos`, 422, "WARDROBE_TOO_SMALL");
 
@@ -121,7 +134,6 @@ export const stylistService = {
     );
 
     const requestId = randomUUID();
-    const forDate = new Date(`${req.date}T${req.time ?? "12:00"}:00Z`);
     const outfits = [];
     for (const v of valid) {
       outfits.push(await outfitRepository.create({

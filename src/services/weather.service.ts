@@ -1,5 +1,6 @@
 import type { Prisma } from "@/generated/prisma/client";
 import { AppError } from "@/lib/errors";
+import { isValidIsoDate } from "@/lib/validations/date";
 import { fetchForecast, type WeatherSummary } from "@/lib/weather/open-meteo";
 import { weatherCacheRepository } from "@/repositories/weather-cache.repository";
 
@@ -14,8 +15,10 @@ function dayDiff(date: string): number {
 
 export const weatherService = {
   async getForecast(latitude: number, longitude: number, date: string): Promise<WeatherSummary> {
+    // Defensa en profundidad (los esquemas ya la exigen): una fecha imposible nunca llega al cálculo ni al proveedor.
+    if (!isValidIsoDate(date)) throw new AppError("Fecha no válida", 422, "INVALID_DATE");
     const diff = dayDiff(date);
-    if (diff < -1 || diff > MAX_DAYS_AHEAD) throw new AppError(`Solo hay previsión de hoy a ${MAX_DAYS_AHEAD} días vista`, 422, "DATE_OUT_OF_RANGE");
+    if (!Number.isFinite(diff) || diff < -1 || diff > MAX_DAYS_AHEAD) throw new AppError(`Solo hay previsión de hoy a ${MAX_DAYS_AHEAD} días vista`, 422, "DATE_OUT_OF_RANGE");
     // Coordenadas redondeadas (~1 km): ciudades vecinas comparten caché y se reducen llamadas.
     const lat = Math.round(latitude * 100) / 100;
     const lon = Math.round(longitude * 100) / 100;

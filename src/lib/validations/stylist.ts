@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isoDateSchema } from "@/lib/validations/date";
 
 export const stylistRequestSchema = z.object({
   location: z.object({
@@ -6,7 +7,7 @@ export const stylistRequestSchema = z.object({
     latitude: z.number().min(-90).max(90),
     longitude: z.number().min(-180).max(180),
   }),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  date: isoDateSchema, // fecha de calendario REAL (no solo el formato)
   time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
   occasion: z.string().trim().min(2).max(200),
   activity: z.string().trim().max(200).optional(),
