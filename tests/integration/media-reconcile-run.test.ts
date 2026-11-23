@@ -243,7 +243,7 @@ describe("ruta /api/cron/media-reconcile/run y contrato del endpoint antiguo", (
     const r = await call(`Bearer ${CRON_SECRET}`);
     expect(r.status).toBe(200);
     const body = await r.json() as Record<string, unknown>;
-    expect(Object.keys(body).sort()).toEqual(["errorCodes", "finalized", "outcome", "persisted", "report"]);
+    expect(Object.keys(body).sort()).toEqual(["errorCodes", "finalized", "outcome", "persisted", "report", "retention"]);
     expect(body).toMatchObject({ outcome: "COMPLETED", finalized: true, persisted: { created: 2 } });
     const [run] = await runs();
     const text = JSON.stringify(body);
@@ -260,10 +260,10 @@ describe("ruta /api/cron/media-reconcile/run y contrato del endpoint antiguo", (
   it("FAILED → 500 con códigos genéricos; error inesperado → respuesta genérica del handler", async () => {
     await scenario();
     const mod = await import("@/services/media-reconcile-run.service");
-    const spy = vi.spyOn(mod.mediaReconcileRunner, "run").mockResolvedValueOnce({ outcome: "FAILED", finalized: true, report: null, persisted: null, errorCodes: ["persist/STALE_RUN"] });
+    const spy = vi.spyOn(mod.mediaReconcileRunner, "run").mockResolvedValueOnce({ outcome: "FAILED", finalized: true, report: null, persisted: null, errorCodes: ["persist/STALE_RUN"], retention: null });
     const r = await call(`Bearer ${CRON_SECRET}`);
     expect(r.status).toBe(500);
-    expect(await r.json()).toEqual({ outcome: "FAILED", finalized: true, errorCodes: ["persist/STALE_RUN"], persisted: null, report: null });
+    expect(await r.json()).toEqual({ outcome: "FAILED", finalized: true, errorCodes: ["persist/STALE_RUN"], persisted: null, report: null, retention: null });
     spy.mockRejectedValueOnce(new Error("detalle interno ai-wardrobe/u/wardrobe/x"));
     const e = await call(`Bearer ${CRON_SECRET}`);
     expect(e.status).toBe(500);
@@ -305,7 +305,7 @@ describe("retención DRY_RUN (19.8a) en la orquestación real", () => {
     await scenario();
     const r = await call(`Bearer ${CRON_SECRET}`);
     expect(r.status).toBe(200);
-    expect(Object.keys(await r.json() as object).sort()).toEqual(["errorCodes", "finalized", "outcome", "persisted", "report"]);
+    expect(Object.keys(await r.json() as object).sort()).toEqual(["errorCodes", "finalized", "outcome", "persisted", "report", "retention"]);
     const s = await summaryOf("COMPLETED");
     expect(s.retention).toMatchObject({ mode: "DRY_RUN", status: "DONE", assets: { eligible: 1, byRule: { CLEARED: 1 } }, errorCodes: [] });
     expect(JSON.stringify(s.retention)).not.toMatch(/ai-wardrobe|antiguo|viejo/);

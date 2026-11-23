@@ -91,6 +91,8 @@ export type MediaReconcileRunResult =
     /** Recuentos de la persistencia (solo COMPLETED). */
     persisted: PersistSummary | null;
     errorCodes: string[];
+    /** Resultado AGREGADO de la retención (null si no se ejecutó). La ruta lo reduce con una lista blanca. */
+    retention: RetentionResult | null;
   };
 
 export interface RunnerDeps {
@@ -180,7 +182,7 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
           } catch { /* se reintenta una vez; nunca se propagan detalles */ }
         }
         logError("media.reconcile.run", new Error(`Ejecución ${kind}${finalized ? "" : " (sin cerrar)"}: ${codes.join(", ")}`));
-        return { outcome: kind, finalized, report, persisted: null, errorCodes: codes };
+        return { outcome: kind, finalized, report, persisted: null, errorCodes: codes, retention };
       };
 
       // ── 2. Retención DRY_RUN (solo el tiempo sobrante; nunca el de la detección ni el del cierre) ──────────────────
@@ -244,7 +246,7 @@ export function createMediaReconcileRunner(deps: RunnerDeps) {
           // La transacción de finishWith ya se deshizo entera (ni filas, ni cierre, ni liberación).
           return close("FAILED", { status: "FAILED", inventoryComplete: true, errorCodes: [classifyFailure(err, "persist")] }, report);
         }
-        if (finished.ok) return { outcome: "COMPLETED", finalized: true, report, persisted: finished.value, errorCodes: retentionCodes };
+        if (finished.ok) return { outcome: "COMPLETED", finalized: true, report, persisted: finished.value, errorCodes: retentionCodes, retention };
         if (finished.reason === "LEASE_LOST") {
           return close("LEASE_LOST", { status: "FAILED", inventoryComplete: true, errorCodes: ["lease/LEASE_LOST"] }, report);
         }

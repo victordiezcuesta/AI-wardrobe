@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { AppError, handler } from "@/lib/errors";
 import { isAuthorizedCron } from "@/lib/auth/cron";
+import { publicRetention } from "@/services/media-retention-public";
 import { mediaReconcileRunner, type MediaReconcileRunResult } from "@/services/media-reconcile-run.service";
 
 /** Debe coincidir con RUN_MAX_DURATION_MS (el TTL del lease la supera en ≥ 60 s; lo comprueban las pruebas). */
@@ -13,6 +14,7 @@ export const maxDuration = 300;
  * /api/cron/media-reconcile, sin cambios.
  *
  * Respuesta AGREGADA (sin runId, fencingToken, publicId, URLs, ownerUserId, assetId ni candidatas):
+ * - `retention`: resumen agregado de la retención (lista blanca; null si no se ejecutó), ver media-retention-public.
  * - 200: COMPLETED, INCOMPLETE y BUSY (lease ocupado: no se ha ejecutado nada).
  * - 500: FAILED o LEASE_LOST (con códigos genéricos). Errores inesperados: respuesta genérica del handler común.
  */
@@ -25,5 +27,5 @@ export const GET = handler("cron.media_reconcile_run", async (req: Request) => {
 /** Lista blanca explícita de campos: lo que no esté aquí nunca sale en la respuesta. */
 function publicResult(r: MediaReconcileRunResult) {
   if (r.outcome === "BUSY") return { outcome: r.outcome, reason: r.reason };
-  return { outcome: r.outcome, finalized: r.finalized, errorCodes: r.errorCodes, persisted: r.persisted, report: r.report };
+  return { outcome: r.outcome, finalized: r.finalized, errorCodes: r.errorCodes, persisted: r.persisted, report: r.report, retention: publicRetention(r.retention) };
 }

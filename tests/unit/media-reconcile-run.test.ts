@@ -135,7 +135,7 @@ describe("detección incompleta o fallida: nunca se persiste", () => {
   it("el detector lanza (mensaje con datos internos) → FAILED detect/INTERNAL, sin el mensaje", async () => {
     const { runner, deps, calls } = setup({ detectError: new Error(`fallo con ${SECRET_PUBLIC_ID} https://res.cloudinary.com/x`) });
     const r = await runner.run();
-    expect(r).toEqual({ outcome: "FAILED", finalized: true, report: null, persisted: null, errorCodes: ["detect/INTERNAL"] });
+    expect(r).toEqual({ outcome: "FAILED", finalized: true, report: null, persisted: null, errorCodes: ["detect/INTERNAL"], retention: null });
     expect(calls.release[0]![1]).toMatchObject({ status: "FAILED", inventoryComplete: false, errorCodes: ["detect/INTERNAL"] });
     expect(deps.persist).not.toHaveBeenCalled();
     expectNoSecrets(r);
