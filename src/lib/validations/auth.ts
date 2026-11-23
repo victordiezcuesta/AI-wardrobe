@@ -8,15 +8,23 @@ export const passwordSchema = z
   .regex(/[A-Z]/, "Incluye una mayúscula")
   .regex(/[0-9]/, "Incluye un número");
 
+/**
+ * Email normalizado (recortado y en minúsculas) y con un máximo de 254 caracteres (RFC 5321). El orden importa: la longitud
+ * se mide DESPUÉS de normalizar, y el rechazo ocurre en la validación (422), antes de cualquier consulta, hash o contador.
+ */
+const emailSchema = z.string().trim().toLowerCase().max(254, "El email no puede superar los 254 caracteres").email();
+/** Los tokens de verificación y restablecimiento son siempre `randomBytes(32).toString("hex")`: 64 caracteres. */
+const tokenSchema = z.string().min(20).max(64);
+
 export const registerSchema = z.object({
   name: z.string().trim().min(1).max(80).optional(),
-  email: z.string().trim().toLowerCase().email(),
+  email: emailSchema,
   password: passwordSchema,
 });
 export const loginSchema = z.object({
-  email: z.string().trim().toLowerCase().email(),
+  email: emailSchema,
   password: z.string().min(1).max(128),
 });
-export const forgotSchema = z.object({ email: z.string().trim().toLowerCase().email() });
-export const resetSchema = z.object({ token: z.string().min(20), password: passwordSchema });
-export const verifySchema = z.object({ token: z.string().min(20) });
+export const forgotSchema = z.object({ email: emailSchema });
+export const resetSchema = z.object({ token: tokenSchema, password: passwordSchema });
+export const verifySchema = z.object({ token: tokenSchema });

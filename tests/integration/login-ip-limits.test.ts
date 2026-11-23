@@ -239,6 +239,34 @@ describe("clave pseudonimizada del contador por email (19.15a)", () => {
   });
 });
 
+describe("longitud del email en el login (19.17b: máximo 254 tras normalizar)", () => {
+  const emailOfLength = (n: number) => `${"a".repeat(n - "@l.com".length)}@l.com`;
+  it("255 caracteres: se rechaza como credenciales no válidas, sin contadores, sin bcrypt y sin consultas de cuenta", async () => {
+    const lookup = vi.spyOn(authService, "verifyCredentials");
+    const r = await attempt(emailOfLength(255), PASS, xff(IP_A));
+    expect(limited(r)).toEqual(["CredentialsSignin", "credentials"]);
+    expect(r.message).toBe(LOGIN_MESSAGES.invalid);
+    expect(r.sessionCookie).toBe(false);
+    expect(await keys()).toEqual([]);          // ni contador por IP ni por email: la validación va antes
+    expect(faults.calls).toEqual([]);
+    expect(compareSpy).not.toHaveBeenCalled();
+    expect(lookup).not.toHaveBeenCalled();
+  });
+  it("254 caracteres (y con espacios y mayúsculas que se normalizan): inicia sesión con normalidad y cuenta con su clave", async () => {
+    const email = emailOfLength(254);
+    await createUser(email);
+    const r = await attempt(`  ${email.toUpperCase()}  `, PASS, xff(IP_A));
+    expect(r.sessionCookie).toBe(true);
+    expect(await count(emailKey(email))).toBe(1);
+  });
+  it("la contraseña no cambia: una de 128 caracteres sigue llegando a la comprobación (falla por credenciales, no por validación)", async () => {
+    await createUser("a@l.com");
+    const r = await attempt("a@l.com", "x".repeat(128), xff(IP_A));
+    expect(limited(r)).toEqual(["CredentialsSignin", "credentials"]);
+    expect(compareSpy).toHaveBeenCalled();
+  });
+});
+
 describe("errores de infraestructura: fail-closed (bcrypt no se ejecuta)", () => {
   beforeEach(async () => { await createUser("a@l.com"); compareSpy.mockClear(); });
   it.each([
