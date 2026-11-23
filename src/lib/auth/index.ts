@@ -8,7 +8,7 @@ import { authConfig } from "./config";
 import { loginSchema } from "@/lib/validations/auth";
 import { authService } from "@/services/auth.service";
 import { sessionService } from "@/services/session.service";
-import { rateLimit } from "@/lib/rate-limit";
+import { enforceLoginLimits, recordLoginFailure } from "./login-limits";
 
 /** Límite de intentos de login superado. Llega al cliente como `error=CredentialsSignin&code=rate_limited`. */
 export class LoginRateLimited extends CredentialsSignin {
@@ -25,19 +25,26 @@ export const authOptions = {
   providers: [
     Credentials({
       credentials: { email: {}, password: {} },
-      async authorize(raw) {
+      async authorize(raw, request) {
         const parsed = loginSchema.safeParse(raw);
         if (!parsed.success) return null;
+        const { email, password } = parsed.data;
+        let ipKey: string | null;
         try {
-          await rateLimit(`login:${parsed.data.email}`, 10, 15 * 60);
+          // Límites por IP (si hay IP fiable) y por email, ANTES de bcrypt (ver login-limits.ts). Auth.js convierte cualquier
+          // error que no sea suyo en `error=Configuration`; el límite superado debe llegar al cliente como CredentialsSignin
+          // con su propio código, igual si lo causa la IP o el email y exista o no la cuenta. Otros errores (infraestructura)
+          // siguen siendo internos: fail-closed, bcrypt no llega a ejecutarse.
+          ipKey = await enforceLoginLimits(email, request?.headers);
         } catch (e) {
-          // Auth.js convierte cualquier error que no sea suyo en `error=Configuration`; el límite superado debe llegar
-          // al cliente como CredentialsSignin con su propio código. Se comprueba por email ANTES que las credenciales,
-          // así que la respuesta es la misma exista o no la cuenta. Otros errores siguen siendo internos.
           if (e instanceof AppError && e.code === "RATE_LIMITED") throw new LoginRateLimited();
           throw e;
         }
-        return authService.verifyCredentials(parsed.data.email, parsed.data.password);
+        // verifyCredentials devuelve null SOLO para credenciales no válidas (sin usuario, contraseña incorrecta o email sin
+        // confirmar: indistinguibles a propósito) y LANZA ante errores internos, que no llegan al contador de fallos.
+        const user = await authService.verifyCredentials(email, password);
+        if (!user) await recordLoginFailure(ipKey);
+        return user;
       },
     }),
   ],
