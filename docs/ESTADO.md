@@ -10,15 +10,15 @@ Este documento dice con franqueza qué está **comprobado**, qué **depende de c
 | `npm run lint` | Sin errores ni avisos |
 | `npm test` — 81 archivos (45 unitarios y 36 de integración) | 79 archivos en verde, 2 omitidos a propósito (ver abajo); 2.483 pruebas pasan y 60 se omiten, ninguna falla en la última ejecución completa |
 | `npm run build` | Correcto (exit 0) en la fase 21.1, ejecutado en una copia temporal aislada con variables de entorno ficticias (ver «Verificación de estabilidad y build (fase 21.1)»). Verifica la **compilación**, no el funcionamiento en runtime ni la integración con servicios reales |
-| Migraciones SQL (`0001_init` y `0002_media_reconcile_persistence`) | Las aplica la suite de integración sobre PGlite. Según el SQL, `0001` crea 21 tablas y 19 claves foráneas y `0002` añade 3 tablas y 3 claves foráneas. La comprobación contra PostgreSQL 17 real se hizo sobre `0001`; `0002` no se ha verificado en esta revisión contra un PostgreSQL real. Las pruebas `pg-concurrency` y `rate-limit-purge-pg` podrían aplicarla cuando se ejecutan con un PostgreSQL local configurado mediante `TEST_PG_URL`, pero no se han ejecutado en esta revisión |
+| Migraciones SQL (`0001_init` y `0002_media_reconcile_persistence`) | Las aplica la suite de integración sobre PGlite. Además, en la fase 22.1 se aplicaron con `psql` (`ON_ERROR_STOP=1`) sobre PostgreSQL 17.12 real y local: `0001` crea 21 tablas y 19 claves foráneas y `0002` añade 3 tablas y 3 claves foráneas, hasta 24 tablas, 22 claves foráneas, 68 índices y 11 enums, sin errores SQL (ver «Verificación con PostgreSQL real (fase 22.1)»). No se ha comprobado el drift completo frente a `prisma migrate` |
 
-Estado de la verificación en la última revisión de este documento (fase 20.4, tras la 20.3): `npm run lint`, `tsc --noEmit` y `npx vitest run` sin errores (el recuento anterior corresponde a la última ejecución completa de `npx vitest run`; una ejecución previa, lanzada en la misma sesión, mostró 2 fallos puntuales que no se identificaron; ver la sección de la fase 21.1, donde el incidente queda clasificado como no reproducible). Los **2 archivos omitidos** son `tests/integration/pg-concurrency.test.ts` y `tests/integration/rate-limit-purge-pg.test.ts`: sus bloques usan `describe.skipIf(!ADMIN_URL)` y solo se ejecutan con un PostgreSQL local aislado y su URL de administración configurada (concurrencia real de conexiones, lease del reconciliador y purga con bloqueos). Sin ese entorno **no se ejecutan** y no cuentan como verificados.
+Estado de la verificación en la última revisión de este documento (fase 20.4, tras la 20.3): `npm run lint`, `tsc --noEmit` y `npx vitest run` sin errores (el recuento anterior corresponde a la última ejecución completa de `npx vitest run`; una ejecución previa, lanzada en la misma sesión, mostró 2 fallos puntuales que no se identificaron; ver la sección de la fase 21.1, donde el incidente queda clasificado como no reproducible). Los **2 archivos omitidos** son `tests/integration/pg-concurrency.test.ts` y `tests/integration/rate-limit-purge-pg.test.ts`: sus bloques usan `describe.skipIf(!ADMIN_URL)` y solo se ejecutan con un PostgreSQL local aislado y su URL de administración configurada (concurrencia real de conexiones, lease del reconciliador y purga con bloqueos). Sin ese entorno **no se ejecutan en la suite general** (aparecen como omitidos). Su verificación contra PostgreSQL 17.12 local se hizo en la fase 22.1 (ver más abajo).
 
 Los **tests de integración** usan el Prisma Client real contra PostgreSQL real (PGlite) con la migración del proyecto. Solo se simulan los proveedores externos. Durante su escritura aparecieron y se corrigieron fallos reales: columnas de lista `NOT NULL` sin valor por defecto (habrían roto todo registro), un `INSERT … unnest` que fallaba con arrays de `enum`, errores de la IA mostrados al usuario como «datos no válidos» (422) en vez de 502, y una respuesta de IA con un solo id mal formado que descartaba los conjuntos buenos.
 
 ## Verificación de estabilidad y build (fase 21.1)
 
-**Vitest.** Se hicieron 10 ejecuciones completas y secuenciales de `npx vitest run`, con PGlite en memoria, sin servicios externos y sin carga artificial. Las 10 terminaron con exit code 0 y el mismo resultado: 79 archivos correctos y 2 omitidos; 2.483 tests correctos, 60 omitidos y 0 fallidos. Los dos archivos omitidos requieren un PostgreSQL local (`pg-concurrency` y `rate-limit-purge-pg`) y siguen sin ejecutarse.
+**Vitest.** Se hicieron 10 ejecuciones completas y secuenciales de `npx vitest run`, con PGlite en memoria, sin servicios externos y sin carga artificial. Las 10 terminaron con exit code 0 y el mismo resultado: 79 archivos correctos y 2 omitidos; 2.483 tests correctos, 60 omitidos y 0 fallidos. Los dos archivos omitidos requieren un PostgreSQL local (`pg-concurrency` y `rate-limit-purge-pg`) y no se ejecutaron en esta fase (se verificaron después, en la 22.1).
 
 - **Incidente de la fase 20.4:** no se reprodujeron los 2 fallos observados en la primera ejecución. Su origen **sigue siendo desconocido** y el incidente queda clasificado como **no reproducible**. Si reaparece, conviene conservar la salida completa de esa ejecución para identificarlo.
 - No se modificaron timeouts, workers ni configuración de Vitest, porque no hubo evidencia que lo justificara.
@@ -26,6 +26,35 @@ Los **tests de integración** usan el Prisma Client real contra PostgreSQL real 
 **Build.** `npm run build` terminó correctamente (exit 0), con la compilación y la comprobación de TypeScript correctas. Se ejecutó en una copia temporal aislada, fuera del repositorio, que se eliminó después; se excluyeron `.env*`, `.git`, `.next`, `.vitest` y `tsconfig.tsbuildinfo`. Se usaron exclusivamente variables de entorno ficticias: no se usaron credenciales reales ni se conectó deliberadamente a proveedores externos ni a Neon. Esta prueba verifica la compilación; **no** verifica el funcionamiento en runtime ni la integración con servicios reales.
 
 **Otras comprobaciones.** `tsc --noEmit`, ESLint y `git diff --check` correctos. `.vitest/` se añadió a `.gitignore`, sin modificar ni eliminar su contenido.
+
+## Verificación con PostgreSQL real (fase 22.1)
+
+Se usó un contenedor temporal con PostgreSQL 17.12, accesible solo desde `127.0.0.1`, con datos en `tmpfs` y contraseña aleatoria. No se usó `.env`, Neon ni ningún proveedor externo.
+
+**Migraciones.** Se aplicó el SQL original con `psql` y `ON_ERROR_STOP=1`, una migración tras otra, sobre una base exclusiva:
+
+| Migración | Resultado | Tablas | Claves foráneas | Índices | Enums |
+|---|---|---|---|---|---|
+| `0001_init` | Correcta, sin errores | 21 | 19 | 56 | 6 |
+| `0002_media_reconcile_persistence` | Correcta, sin errores | 24 | 22 | 68 | 11 |
+
+`0002` añade 3 tablas (`MediaAsset`, `MediaReconcileLock` y `MediaReconcileRun`) y 3 claves foráneas.
+
+**Tests PostgreSQL-only.** Cada archivo se ejecutó 3 veces consecutivas con `TEST_PG_URL` apuntando a ese contenedor. Cada ejecución creó su propia base `race_*`, aplicó las migraciones del proyecto y la eliminó al terminar; al acabar no quedaba ninguna `race_*` y el contenedor se eliminó.
+
+| Archivo | Tests por ejecución | Ejecuciones | Resultado |
+|---|---|---|---|
+| `tests/integration/pg-concurrency.test.ts` | 49 | 3 | 49 pasados en cada una |
+| `tests/integration/rate-limit-purge-pg.test.ts` | 11 | 3 | 11 pasados en cada una |
+
+En total, 60 tests ejecutados y superados en las seis ejecuciones. **Siguen apareciendo como omitidos en la suite general** (`npm test`, `npm run check`) cuando no se configura `TEST_PG_URL`; `npm run check` sin esa variable repitió el resultado anterior (79 archivos correctos y 2 omitidos; 2.483 tests correctos y 60 omitidos).
+
+**Lo que esta verificación NO demuestra:**
+- El comportamiento contra **Neon**, ni el adaptador `adapter-neon` ni el pooler de Neon (los tests usan `adapter-pg` contra un PostgreSQL local).
+- La ausencia absoluta de condiciones de carrera: tres ejecuciones consecutivas son una verificación repetida, no una demostración formal.
+- La ausencia de drift entre el esquema de Prisma y las migraciones mediante `prisma migrate`: no se ejecutó.
+
+**Observación técnica menor.** Vite muestra un aviso porque `vitest.config.ts` usa sintaxis ESM y se carga como CommonJS (no hay `"type": "module"` ni extensión `.mjs`). No ha provocado fallos y no se ha modificado la configuración.
 
 ## Comprobado solo en local (PGlite y simulaciones)
 
@@ -38,7 +67,7 @@ Ninguna de estas integraciones se ha ejecutado contra el servicio real. El códi
 | Integración | Qué comprobar |
 |---|---|
 | **Neon** | La app usa `@prisma/adapter-neon`; los tests usan `@prisma/adapter-pg`. Verifica la conexión real (`DATABASE_URL` con pooler) y que registro/login funcionan. |
-| **Migración** | Generada con un script propio (no con `prisma migrate`). En una BD de desarrollo vacía ejecuta `npm run db:migrate` y confirma que Prisma no propone cambios (ver README §10). |
+| **Migración** | Generada con un script propio (no con `prisma migrate`). Aplicada sin errores a PostgreSQL 17.12 local (fase 22.1), pero sin comparar con `prisma migrate`. En una BD de desarrollo vacía ejecuta `npm run db:migrate` y confirma que Prisma no propone cambios (ver README §10). |
 | **Cloudinary** | Subida firmada, tipo `authenticated`, URLs de descarga firmadas con caducidad (`private_download_url`) y borrado por prefijo. Comprueba que las imágenes privadas se ven en `<img>` con tu cuenta. **Pendiente de verificación real:** el formato de `asset_id` en las respuestas de la Admin API. El código lo trata como identificador **opaco** (`src/services/media-reconcile.service.ts`, `parseOpaqueAssetId`) y no presupone ningún formato, pero ninguna respuesta autorizada real lo ha confirmado; además, el inventario de la reconciliación consume cuota de la Admin API. |
 | **OpenRouter** | Los modelos por defecto son orientativos. Confirma que existen, que el de visión es multimodal y que admiten salida estructurada (si no, el cliente reintenta sin `response_format`). |
 | **Pollinations** | Modelo por defecto, créditos y **calidad real del parecido**. No hay garantía de conservar identidad ni detalles de las prendas. Prueba con tus propias fotos y compara modelos. |
