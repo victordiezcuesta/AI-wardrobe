@@ -33,7 +33,9 @@ export function JobCard({ job, onUpdate }: { job: TryOnDTO; onUpdate: (j: TryOnD
 
   if (active) {
     return (
-      <div className="grid gap-6 rounded-card bg-linen p-6 sm:grid-cols-[14rem_1fr]" role="status" aria-live="polite">
+      // Sin región viva: el contador `{seconds} s` cambia cada segundo y, en un `status` (atómico), se volvería a anunciar entero cada vez. El inicio y el final
+      // de la generación los anuncia `TryOnStudio` con una región de estado persistente; aquí el tiempo y el mensaje de progreso son solo texto visible.
+      <div className="grid gap-6 rounded-card bg-linen p-6 sm:grid-cols-[14rem_1fr]">
         <Skeleton className="aspect-[3/4] w-full" />
         <div className="flex flex-col justify-center gap-3">
           <p className="flex items-center gap-2 font-display text-3xl"><Loader2 className="size-5 animate-spin" aria-hidden />{MESSAGES[Math.min(MESSAGES.length - 1, Math.floor(seconds / 12))]}</p>

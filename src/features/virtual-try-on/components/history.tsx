@@ -25,18 +25,21 @@ export function History({ images, hasMore, loadingMore, onMore, onChange, onRemo
   return (
     <>
       <ul className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-        {done.map((i) => (
+        {done.map((i, n) => {
+          const where = `${n + 1} de ${done.length}`;   // varias imágenes comparten escenario y pose: la posición las distingue
+          return (
           <li key={i.id} className="group relative">
-            <button type="button" onClick={() => setOpen(i)} className="block w-full overflow-hidden rounded-card bg-sand" aria-label={`Abrir imagen: ${label(i)}`}>
+            <button type="button" onClick={() => setOpen(i)} className="block w-full overflow-hidden rounded-card bg-sand" aria-label={`Abrir imagen ${where}: ${label(i)}`}>
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={i.imageUrl!} alt={label(i)} loading="lazy" className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-[1.03]" />
+              <img src={i.imageUrl!} alt="" loading="lazy" className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-[1.03]" />
             </button>
-            <button type="button" onClick={() => void fav(i)} aria-pressed={i.isFavorite} aria-label="Favorita" className="absolute right-2 top-2 grid size-9 place-items-center rounded-full bg-paper/90 shadow-soft">
+            <button type="button" onClick={() => void fav(i)} aria-pressed={i.isFavorite} aria-label={`Favorita: imagen ${where}`} className="absolute right-2 top-2 grid size-9 place-items-center rounded-full bg-paper/90 shadow-soft">
               <Heart className={cn("size-4", i.isFavorite && "fill-ink")} aria-hidden />
             </button>
             <p className="mt-1.5 truncate text-xs text-taupe">{label(i)}</p>
           </li>
-        ))}
+          );
+        })}
       </ul>
       {hasMore && <div className="mt-8 text-center"><Button variant="secondary" onClick={onMore} loading={loadingMore}>Cargar más</Button></div>}
 
