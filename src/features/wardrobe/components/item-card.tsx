@@ -7,9 +7,11 @@ import type { ItemDTO } from "../types";
 
 export function ItemCard({ item, onOpen, onToggleFavorite }: { item: ItemDTO; onOpen: () => void; onToggleFavorite: () => void }) {
   const swatch = COLOR_SWATCH[item.primaryColor ?? "otro"];
+  // El `aria-label` sustituye al contenido del botón: se incluyen en él el estado y «Revisar», que antes solo se veían.
+  const openLabel = [`Abrir ${item.name}`, item.status !== "AVAILABLE" ? STATUS_LABELS[item.status] : null, item.needsReview ? "Revisar" : null].filter(Boolean).join(", ");
   return (
     <div className="group relative">
-      <button type="button" onClick={onOpen} className="block w-full text-left" aria-label={`Abrir ${item.name}`}>
+      <button type="button" onClick={onOpen} className="block w-full text-left" aria-label={openLabel}>
         <div className={cn("relative aspect-[4/5] overflow-hidden rounded-card bg-sand", item.status !== "AVAILABLE" && "opacity-60")}>
           {item.thumbUrl ? (
             <Image src={item.thumbUrl} alt={item.name} fill unoptimized sizes="(min-width:1024px) 25vw, 50vw" className="object-cover transition-transform duration-500 group-hover:scale-[1.03]" />
@@ -33,7 +35,7 @@ export function ItemCard({ item, onOpen, onToggleFavorite }: { item: ItemDTO; on
         type="button"
         onClick={onToggleFavorite}
         aria-pressed={item.isFavorite}
-        aria-label={item.isFavorite ? "Quitar de favoritas" : "Marcar como favorita"}
+        aria-label={`Favorita: ${item.name}`}
         className="absolute right-3 top-3 grid size-9 place-items-center rounded-full bg-paper/90 shadow-soft transition-transform hover:scale-105"
       >
         <Heart className={cn("size-4", item.isFavorite && "fill-ink")} aria-hidden />

@@ -1,7 +1,7 @@
 "use client";
 import { useRef, useState } from "react";
 import { Camera, Check, ImagePlus, Loader2, RotateCcw, X } from "lucide-react";
-import { Button, Input, Modal, Select, useToast } from "@/components/ui";
+import { Button, Input, Modal, Select, Tabs, useToast } from "@/components/ui";
 import { api, ApiError } from "@/utils/api";
 import { prepareImage } from "@/utils/image";
 import { CATEGORIES, CATEGORY_LABELS, COLORS } from "../constants";
@@ -13,6 +13,7 @@ interface Job { id: number; file: File; state: "queued" | "working" | "done" | "
 interface Props { open: boolean; onClose: () => void; onAdded: (items: ItemDTO[]) => void }
 
 let nextId = 1;
+const ADD_TABS = [{ key: "photos", label: "Con fotos" }, { key: "manual", label: "Manualmente" }] as const;
 
 export function AddItems({ open, onClose, onAdded }: Props) {
   const toast = useToast();
@@ -58,58 +59,61 @@ export function AddItems({ open, onClose, onAdded }: Props) {
     await Promise.all([0, 1].map(async () => { for (let j = queue.shift(); j; j = queue.shift()) await runJob(j, mode); }));
   }
 
+  const photosPanel = (
+    <div className="space-y-5">
+      <fieldset className="grid gap-2 sm:grid-cols-2">
+        <legend className="sr-only">Tipo de foto</legend>
+        {([["single", "Una prenda por foto"], ["multi", "Varias prendas en una foto"]] as const).map(([k, label]) => (
+          <label key={k} className={cn("relative cursor-pointer rounded-field border px-4 py-3 text-sm has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-ink", mode === k ? "border-ink bg-linen" : "border-control")}>
+            <input type="radio" name="mode" className="sr-only" checked={mode === k} onChange={() => setMode(k)} />{label}
+          </label>
+        ))}
+      </fieldset>
+      {mode === "multi" && <p className="text-sm text-taupe">La IA localiza cada prenda y la recorta. Si no puede hacerlo con precisión, la prenda se guarda marcada para que la revises.</p>}
+
+      <div className="flex flex-wrap gap-3">
+        <Button onClick={() => fileInput.current?.click()}><ImagePlus className="size-4" aria-hidden />Elegir fotos</Button>
+        <Button variant="secondary" onClick={() => camInput.current?.click()}><Camera className="size-4" aria-hidden />Hacer foto</Button>
+      </div>
+      <input ref={fileInput} type="file" multiple accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(e) => { void addFiles(e.target.files); e.target.value = ""; }} />
+      <input ref={camInput} type="file" accept="image/jpeg,image/png,image/webp" capture="environment" className="hidden" onChange={(e) => { void addFiles(e.target.files); e.target.value = ""; }} />
+
+      {jobs.length > 0 && (
+        <ul className="space-y-2">
+          {jobs.map((j) => (
+            <li key={j.id} className="flex items-center gap-3 rounded-field bg-linen px-4 py-2.5 text-sm">
+              <span className="shrink-0">
+                {j.state === "working" || j.state === "queued" ? <Loader2 className="size-4 animate-spin" aria-label="Procesando" /> : j.state === "done" ? <Check className="size-4" aria-label="Hecho" /> : <X className="size-4 text-danger" aria-label="Error" />}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate">{j.file.name}</span>
+                <span className={cn("block text-xs", j.state === "error" ? "text-danger" : "text-taupe")}>
+                  {j.state === "queued" ? "En cola" : j.state === "working" ? "Subiendo y analizando…" : j.message}
+                </span>
+              </span>
+              {j.state === "error" && (
+                <button type="button" onClick={() => void runJob(j, mode)} aria-label="Reintentar" className="rounded-full p-1.5 hover:bg-sand"><RotateCcw className="size-4" /></button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {jobs.length > 0 && !running && <div className="flex justify-end"><Button variant="ghost" onClick={() => { setJobs([]); onClose(); }}>Listo</Button></div>}
+    </div>
+  );
+
   return (
     <Modal open={open} onClose={onClose} title="Añadir prendas">
-      <div className="mb-5 flex gap-2" role="tablist">
-        {([["photos", "Con fotos"], ["manual", "Manualmente"]] as const).map(([k, label]) => (
-          <button key={k} role="tab" aria-selected={tab === k} onClick={() => setTab(k)} className={cn("rounded-full px-4 py-1.5 text-sm", tab === k ? "bg-ink text-paper" : "bg-linen")}>{label}</button>
-        ))}
-      </div>
-
-      {tab === "photos" ? (
-        <div className="space-y-5">
-          <fieldset className="grid gap-2 sm:grid-cols-2">
-            <legend className="sr-only">Tipo de foto</legend>
-            {([["single", "Una prenda por foto"], ["multi", "Varias prendas en una foto"]] as const).map(([k, label]) => (
-              <label key={k} className={cn("cursor-pointer rounded-field border px-4 py-3 text-sm", mode === k ? "border-ink bg-linen" : "border-stone/70")}>
-                <input type="radio" name="mode" className="sr-only" checked={mode === k} onChange={() => setMode(k)} />{label}
-              </label>
-            ))}
-          </fieldset>
-          {mode === "multi" && <p className="text-sm text-taupe">La IA localiza cada prenda y la recorta. Si no puede hacerlo con precisión, la prenda se guarda marcada para que la revises.</p>}
-
-          <div className="flex flex-wrap gap-3">
-            <Button onClick={() => fileInput.current?.click()}><ImagePlus className="size-4" aria-hidden />Elegir fotos</Button>
-            <Button variant="secondary" onClick={() => camInput.current?.click()}><Camera className="size-4" aria-hidden />Hacer foto</Button>
-          </div>
-          <input ref={fileInput} type="file" multiple accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(e) => { void addFiles(e.target.files); e.target.value = ""; }} />
-          <input ref={camInput} type="file" accept="image/jpeg,image/png,image/webp" capture="environment" className="hidden" onChange={(e) => { void addFiles(e.target.files); e.target.value = ""; }} />
-
-          {jobs.length > 0 && (
-            <ul className="space-y-2">
-              {jobs.map((j) => (
-                <li key={j.id} className="flex items-center gap-3 rounded-field bg-linen px-4 py-2.5 text-sm">
-                  <span className="shrink-0">
-                    {j.state === "working" || j.state === "queued" ? <Loader2 className="size-4 animate-spin" aria-label="Procesando" /> : j.state === "done" ? <Check className="size-4" aria-label="Hecho" /> : <X className="size-4 text-danger" aria-label="Error" />}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate">{j.file.name}</span>
-                    <span className={cn("block text-xs", j.state === "error" ? "text-danger" : "text-taupe")}>
-                      {j.state === "queued" ? "En cola" : j.state === "working" ? "Subiendo y analizando…" : j.message}
-                    </span>
-                  </span>
-                  {j.state === "error" && (
-                    <button type="button" onClick={() => void runJob(j, mode)} aria-label="Reintentar" className="rounded-full p-1.5 hover:bg-sand"><RotateCcw className="size-4" /></button>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-          {jobs.length > 0 && !running && <div className="flex justify-end"><Button variant="ghost" onClick={() => { setJobs([]); onClose(); }}>Listo</Button></div>}
-        </div>
-      ) : (
-        <ManualForm onCreated={(i) => { onAdded([i]); toast.success("Prenda añadida"); onClose(); }} />
-      )}
+      {/* Los paneles permanecen montados (los inactivos, ocultos): lo escrito en el formulario manual no se pierde al cambiar de pestaña, con el
+          ratón ni con las flechas. El estado vive lo que vive el diálogo: al cerrarlo, `Modal` desmonta su contenido y el formulario empieza vacío. */}
+      <Tabs
+        label="Forma de añadir prendas"
+        tabs={ADD_TABS}
+        value={tab}
+        onChange={setTab}
+        keepMounted
+        panels={{ photos: photosPanel, manual: <ManualForm onCreated={(i) => { onAdded([i]); toast.success("Prenda añadida"); onClose(); }} /> }}
+      />
     </Modal>
   );
 }

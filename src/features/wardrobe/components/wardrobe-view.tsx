@@ -33,6 +33,7 @@ export function WardrobeView() {
   const [editing, setEditing] = useState<ItemDTO | null>(null);
   const [adding, setAdding] = useState(false);
   const reqId = useRef(0);
+  const [touched, setTouched] = useState(false);   // el recuento se anuncia solo tras una acción del usuario sobre la búsqueda o los filtros
 
   const load = useCallback(async (f: Filters) => {
     const id = ++reqId.current;
@@ -75,7 +76,7 @@ export function WardrobeView() {
     }
   }
 
-  const set = <K extends keyof Filters>(k: K, v: Filters[K]) => setFilters((s) => ({ ...s, [k]: v }));
+  const set = <K extends keyof Filters>(k: K, v: Filters[K]) => { setTouched(true); setFilters((s) => ({ ...s, [k]: v })); };
   const active = JSON.stringify(filters) !== JSON.stringify(EMPTY);
 
   return (
@@ -89,12 +90,12 @@ export function WardrobeView() {
         <div className="relative max-w-md">
           <Search className="pointer-events-none absolute left-4 top-1/2 size-4 -translate-y-1/2 text-taupe" aria-hidden />
           <input type="search" aria-label="Buscar por nombre" placeholder="Buscar por nombre" value={filters.q} onChange={(e) => set("q", e.target.value)}
-            className="h-11 w-full rounded-full border border-stone/70 bg-paper pl-11 pr-4 text-[0.95rem] focus:border-ink focus:outline-none" />
+            className="h-11 w-full rounded-full border border-control bg-paper pl-11 pr-4 text-[0.95rem] placeholder:text-taupe focus:border-ink focus:outline-none" />
         </div>
         <div className="flex flex-wrap gap-2" role="group" aria-label="Categorías">
           {[["", "Todo"], ...CATEGORIES.map((c) => [c, CATEGORY_LABELS[c]] as const)].map(([v, label]) => (
             <button key={v} type="button" aria-pressed={filters.category === v} onClick={() => set("category", v)}
-              className={cn("rounded-full border px-4 py-1.5 text-sm transition-colors", filters.category === v ? "border-ink bg-ink text-paper" : "border-stone/70 hover:bg-linen")}>{label}</button>
+              className={cn("rounded-full border px-4 py-1.5 text-sm transition-colors", filters.category === v ? "border-ink bg-ink text-paper" : "border-control hover:bg-linen")}>{label}</button>
           ))}
         </div>
         <div className="grid gap-3 sm:grid-cols-3 lg:max-w-2xl">
@@ -103,12 +104,15 @@ export function WardrobeView() {
           <Select label="Disponibilidad" value={filters.status} onChange={(e) => set("status", e.target.value)}><option value="">Todas</option>{STATUSES.map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}</Select>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <button type="button" aria-pressed={filters.favorite} onClick={() => set("favorite", !filters.favorite)} className={cn("rounded-full border px-4 py-1.5 text-sm", filters.favorite ? "border-ink bg-ink text-paper" : "border-stone/70 hover:bg-linen")}>Favoritas</button>
-          <button type="button" aria-pressed={filters.needsReview} onClick={() => set("needsReview", !filters.needsReview)} className={cn("rounded-full border px-4 py-1.5 text-sm", filters.needsReview ? "border-ink bg-ink text-paper" : "border-stone/70 hover:bg-linen")}>Por revisar</button>
-          {active && <Button variant="ghost" size="sm" onClick={() => setFilters(EMPTY)}>Quitar filtros</Button>}
+          <button type="button" aria-pressed={filters.favorite} onClick={() => set("favorite", !filters.favorite)} className={cn("rounded-full border px-4 py-1.5 text-sm", filters.favorite ? "border-ink bg-ink text-paper" : "border-control hover:bg-linen")}>Favoritas</button>
+          <button type="button" aria-pressed={filters.needsReview} onClick={() => set("needsReview", !filters.needsReview)} className={cn("rounded-full border px-4 py-1.5 text-sm", filters.needsReview ? "border-ink bg-ink text-paper" : "border-control hover:bg-linen")}>Por revisar</button>
+          {active && <Button variant="ghost" size="sm" onClick={() => { setTouched(true); setFilters(EMPTY); }}>Quitar filtros</Button>}
         </div>
       </div>
 
+      {/* Resultado de la búsqueda y los filtros para lectores de pantalla. Región siempre montada (las regiones que aparecen ya con texto no se
+          anuncian de forma fiable) y vacía mientras carga, así no se anuncia nada en cada pulsación: solo el resultado ya asentado. */}
+      <p role="status" className="sr-only">{!touched || loading ? "" : items.length === 0 ? (active ? "Ninguna prenda con estos filtros" : "Tu armario está vacío") : `${items.length} ${items.length === 1 ? "prenda" : "prendas"}${cursor ? ", hay más por cargar" : ""}`}</p>
       <div className="mt-10">
         {loading ? (
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">{Array.from({ length: 8 }, (_, i) => <Skeleton key={i} className="aspect-[4/5]" />)}</div>
@@ -120,9 +124,9 @@ export function WardrobeView() {
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-x-4 gap-y-6 sm:grid-cols-3 lg:grid-cols-4">
-              {items.map((it) => <ItemCard key={it.id} item={it} onOpen={() => setEditing(it)} onToggleFavorite={() => void toggleFavorite(it)} />)}
-            </div>
+            <ul className="grid grid-cols-2 gap-x-4 gap-y-6 sm:grid-cols-3 lg:grid-cols-4">
+              {items.map((it) => <li key={it.id}><ItemCard item={it} onOpen={() => setEditing(it)} onToggleFavorite={() => void toggleFavorite(it)} /></li>)}
+            </ul>
             {cursor && <div className="mt-10 text-center"><Button variant="secondary" onClick={() => void loadMore()} loading={loadingMore}>Cargar más</Button></div>}
           </>
         )}
