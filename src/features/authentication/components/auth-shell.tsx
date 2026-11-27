@@ -1,13 +1,14 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { MAIN_CONTENT_ID } from "@/components/layout/main-content";
 
 export function AuthShell({ title, subtitle, children, footer }: { title: string; subtitle?: string; children: ReactNode; footer?: ReactNode }) {
   return (
-    <main className="grid min-h-dvh lg:grid-cols-[1.1fr_1fr]">
+    <main id={MAIN_CONTENT_ID} tabIndex={-1} className="grid min-h-dvh focus:outline-none lg:grid-cols-[1.1fr_1fr]">
       <section className="relative hidden bg-sand lg:flex lg:flex-col lg:justify-between lg:p-14">
         <Link href="/" className="font-display text-3xl">AI Wardrobe</Link>
         <p className="max-w-md font-display text-6xl leading-[1.02]">Tu armario, mirado por alguien con criterio.</p>
-        <p className="max-w-sm text-taupe">Fotografía tus prendas, dinos adónde vas y te proponemos qué ponerte con lo que ya tienes.</p>
+        <p className="max-w-sm text-ink/80">Fotografía tus prendas, dinos adónde vas y te proponemos qué ponerte con lo que ya tienes.</p>
       </section>
       <section className="flex items-center justify-center px-6 py-12">
         <div className="w-full max-w-sm">

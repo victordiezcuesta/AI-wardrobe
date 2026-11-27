@@ -3,6 +3,7 @@ import { currentSession } from "@/lib/auth/session";
 import { userRepository } from "@/repositories/user.repository";
 import { ProfileForm } from "@/features/profile/components/profile-form";
 import { toFormValues } from "@/features/profile/to-form-values";
+import { MAIN_CONTENT_ID } from "@/components/layout/main-content";
 
 export const metadata = { title: "Cuéntanos cómo vistes" };
 
@@ -13,7 +14,7 @@ export default async function OnboardingPage() {
   if (!user) redirect("/login");
   if (user.profile?.onboardingDone) redirect("/dashboard");
   return (
-    <main className="mx-auto max-w-3xl px-6 py-14">
+    <main id={MAIN_CONTENT_ID} tabIndex={-1} className="mx-auto max-w-3xl px-6 py-14 focus:outline-none">
       <h1 className="font-display text-6xl leading-none">Cuéntanos cómo vistes</h1>
       <p className="mt-4 max-w-xl text-taupe">Todo es opcional y podrás cambiarlo desde tu perfil. Cuanto más sepamos, mejores serán los conjuntos.</p>
       <div className="mt-12"><ProfileForm mode="onboarding" initial={toFormValues(user.name, user.profile)} /></div>

@@ -8,6 +8,9 @@
   --color-linen: #efe9e0;
   --color-sand: #e3d9ca;
   --color-stone: #b8ad9e;
+  /* H.7: borde de los controles (campos, selects, buscadores, chips y pastillas de filtro). Mismo matiz (35°) y saturación que `stone`, más oscuro:
+     ≥3:1 sobre paper (3,61) y linen (3,31), WCAG 1.4.11. `stone` se conserva para fondos y adornos que no necesitan ese contraste. */
+  --color-control: #8d7d67;
   --color-taupe: #6d655b;
   --color-ink: #161514;
   --color-danger: #9b3a2e;
@@ -24,7 +27,33 @@ body { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; min-h
 :focus-visible { outline: 2px solid var(--color-ink); outline-offset: 2px; }
 ::selection { background: var(--color-sand); }
 
+/* Enlace «Saltar al contenido» (H.2). Fuera de pantalla hasta recibir el foco; sin display:none para seguir en el orden de Tab y en el árbol de
+   accesibilidad. z-index por encima de todo lo fijo (barra móvil z-30, menús z-40, modales z-50, avisos z-60) para que nunca quede tapado. */
+.skip-link {
+  position: fixed; left: 1rem; top: 1rem; z-index: 100;
+  padding: 0.75rem 1.25rem; border-radius: 9999px;
+  background: var(--color-ink); color: var(--color-paper);
+  font-size: 0.875rem; font-weight: 500; box-shadow: var(--shadow-soft);
+  transform: translateY(-300%);
+}
+.skip-link:focus { transform: translateY(0); }
+
+/* H.6.2 — Elementos enfocados bajo lo fijo. La barra de navegación móvil es fija (`fixed bottom-0`, solo por debajo de `lg`, 64rem) y mide 3,5rem
+   (`pt-2` + `min-h-12`) más la zona segura; la región de avisos (`toast.tsx`) también es fija y su altura varía. `scroll-padding-bottom` reserva ese espacio
+   al desplazar un elemento enfocado a la vista (WCAG 2.4.11). La parte de los avisos NO es una altura fija: `ToastProvider` publica en `--toast-inset` la
+   altura efectiva de su región mientras haya avisos (incluida su distancia al borde, o sea la barra móvil). Con `lg` la barra no existe.
+   Se usa `max-width: 63.99rem` y no la sintaxis de rango `(width < 64rem)` (solo navegadores de 2022 en adelante). */
+html { scroll-padding-bottom: var(--toast-inset, 0px); }
+@media (max-width: 63.99rem) {
+  html { scroll-padding-bottom: max(var(--toast-inset, 0px), calc(4.5rem + env(safe-area-inset-bottom, 0px))); }
+}
+
 @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+/* H.6.3 — Movimiento reducido. Antes solo se acortaba la duración (0,01 ms) y las animaciones infinitas seguían en bucle. Ahora toda animación se
+   ejecuta UNA vez y al instante: el shimmer del esqueleto queda como degradado estático, las transiciones son inmediatas y los spinners (`animate-spin`)
+   quedan quietos. Un spinner quieto sigue indicando «cargando» por su glifo (arco abierto) y, en todos los usos, por texto o estado: «Procesando» /
+   «Subiendo y analizando…» (añadir prendas), el texto de `job-card` y el botón con `loading` (deshabilitado, con el texto de la acción). */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  .animate-spin { animation: none !important; }
 }
