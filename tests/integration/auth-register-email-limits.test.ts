@@ -11,6 +11,10 @@ import { prismaProxy, setTestEnv } from "../helpers/mock-prisma";
 const holder = vi.hoisted(() => ({ prisma: null as PrismaClient | null }));
 const faults = vi.hoisted(() => ({ failKey: null as ((key: string) => boolean) | null, calls: [] as string[] }));
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
+// F.3: la ruta de registro hace su trabajo en `after()` (ver auth-forgot-password-email-limits.test.ts): se simula y se espera tras responder.
+const bg = vi.hoisted(() => ({ jobs: [] as Promise<unknown>[] }));
+vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: (fn: () => Promise<unknown>) => { bg.jobs.push(fn()); } }));
+const flushAfter = () => Promise.all(bg.jobs.splice(0));
 vi.mock("@/lib/rate-limit", async (orig) => {
   const real = await orig<typeof import("@/lib/rate-limit")>();
   return {
@@ -41,7 +45,8 @@ let ipCounter = 0;
 beforeAll(async () => {
   setTestEnv(); t = await startTestDb(); holder.prisma = t.prisma;
   ({ authService } = await import("@/services/auth.service"));
-  ({ POST } = (await import("@/app/api/auth/register/route")) as { POST: (req: Request) => Promise<Response> });
+  const rawPost = ((await import("@/app/api/auth/register/route")) as { POST: (req: Request) => Promise<Response> }).POST;
+  POST = async (req) => { const res = await rawPost(req); await flushAfter(); return res; };
 }, 60_000);
 afterAll(async () => { await t?.stop(); });
 beforeEach(async () => {
@@ -250,9 +255,14 @@ describe("privacidad y errores de almacenamiento", () => {
     expect(p.req.bodyUsed).toBe(false);
     expect(registerSpy).not.toHaveBeenCalled();
   });
-  it("un error del servicio de registro no consume nada más que el contador ya contado", async () => {
+  it("un error del servicio de registro (ya en `after()`, F.3) no cambia la respuesta pública, se registra y no consume nada más que el contador ya contado", async () => {
+    // Antes el servicio corría antes de responder y su fallo daba un 500 (oráculo de existencia de cuenta cuando fallaba solo para
+    // algunas). Ahora la respuesta es la misma que en el éxito; el fallo queda en el log, sin datos de la consulta.
     registerSpy.mockRejectedValueOnce(new Error("fallo interno"));
-    expect(await status(send({ ip: IP_A }))).toBe(500);
+    const res = await send({ ip: IP_A }).res;
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual(OK_JSON);
+    expect(JSON.stringify(errSpy.mock.calls)).toContain("auth.register.deferred");
     const [k] = await emailKeys();
     expect(await count(k!)).toBe(1);
   });

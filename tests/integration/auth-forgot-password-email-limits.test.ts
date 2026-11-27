@@ -12,6 +12,12 @@ import { prismaProxy, setTestEnv } from "../helpers/mock-prisma";
 const holder = vi.hoisted(() => ({ prisma: null as PrismaClient | null }));
 const faults = vi.hoisted(() => ({ failKey: null as ((key: string) => boolean) | null, calls: [] as string[] }));
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
+// F.2: la ruta de recuperación hace su trabajo en `after()`. Fuera de una petición real `after` no existe, así que se simula: ejecuta el
+// callback y guarda su promesa; `flushAfter()` la espera. Los envoltorios de la ruta lo llaman tras la respuesta, de modo que estas
+// pruebas siguen comprobando el efecto del servicio sin cambiar sus expectativas.
+const bg = vi.hoisted(() => ({ jobs: [] as Promise<unknown>[] }));
+vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: (fn: () => Promise<unknown>) => { bg.jobs.push(fn()); } }));
+const flushAfter = () => Promise.all(bg.jobs.splice(0));
 vi.mock("@/lib/rate-limit", async (orig) => {
   const real = await orig<typeof import("@/lib/rate-limit")>();
   return {
@@ -41,7 +47,8 @@ let ipCounter = 0;
 beforeAll(async () => {
   setTestEnv(); t = await startTestDb(); holder.prisma = t.prisma;
   ({ authService } = await import("@/services/auth.service"));
-  ({ POST } = (await import("@/app/api/auth/forgot-password/route")) as { POST: (req: Request) => Promise<Response> });
+  const rawPost = ((await import("@/app/api/auth/forgot-password/route")) as { POST: (req: Request) => Promise<Response> }).POST;
+  POST = async (req) => { const res = await rawPost(req); await flushAfter(); return res; };
 }, 60_000);
 afterAll(async () => { await t?.stop(); });
 beforeEach(async () => {
@@ -291,9 +298,14 @@ describe("privacidad y errores de almacenamiento", () => {
     expect(p.req.bodyUsed).toBe(false);
     expect(resetSpy).not.toHaveBeenCalled();
   });
-  it("un error del servicio de recuperación no devuelve el contador consumido", async () => {
+  it("un error del servicio de recuperación (ya en `after()`, F.2) no cambia la respuesta pública, se registra y no devuelve el contador consumido", async () => {
+    // Antes el servicio corría antes de responder y su fallo daba un 500 (un oráculo de existencia de cuenta cuando fallaba solo
+    // para cuentas existentes). Ahora la respuesta es la misma que en el éxito; el fallo queda en el log, sin datos de la consulta.
     resetSpy.mockRejectedValueOnce(new Error("fallo interno"));
-    expect(await status(send({ ip: IP_A }))).toBe(500);
+    const res = await send({ ip: IP_A }).res;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(OK_JSON);
+    expect(JSON.stringify(errSpy.mock.calls)).toContain("auth.forgot.deferred");
     const [k] = await emailKeys();
     expect(await count(k!)).toBe(1);
   });

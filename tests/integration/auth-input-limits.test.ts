@@ -14,6 +14,10 @@ import { prismaProxy, setTestEnv } from "../helpers/mock-prisma";
 const holder = vi.hoisted(() => ({ prisma: null as PrismaClient | null }));
 const mail = vi.hoisted(() => ({ sent: [] as { to: string; text: string }[] }));
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
+// F.2: la ruta de recuperación hace su trabajo en `after()` (ver auth-forgot-password-email-limits.test.ts): se simula y se espera tras responder.
+const bg = vi.hoisted(() => ({ jobs: [] as Promise<unknown>[] }));
+vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: (fn: () => Promise<unknown>) => { bg.jobs.push(fn()); } }));
+const flushAfter = () => Promise.all(bg.jobs.splice(0));
 vi.mock("@/lib/mail", () => ({ sendMail: async (to: string, _subject: string, text: string) => { mail.sent.push({ to, text }); } }));
 
 const PASS = "Abcdefghi1";
@@ -30,7 +34,7 @@ let compareSpy: ReturnType<typeof vi.spyOn>;
 let errSpy: ReturnType<typeof vi.spyOn>;
 beforeAll(async () => {
   setTestEnv(); t = await startTestDb(); holder.prisma = t.prisma;
-  const load = async (m: string) => ((await import(m)) as { POST: (req: Request) => Promise<Response> }).POST;
+  const load = async (m: string) => { const raw = ((await import(m)) as { POST: (req: Request) => Promise<Response> }).POST; return async (req: Request) => { const res = await raw(req); await flushAfter(); return res; }; };
   routes = {
     register: await load("@/app/api/auth/register/route"), forgot: await load("@/app/api/auth/forgot-password/route"),
     reset: await load("@/app/api/auth/reset-password/route"), verify: await load("@/app/api/auth/verify-email/route"),

@@ -12,6 +12,12 @@ import { prismaProxy, setTestEnv } from "../helpers/mock-prisma";
 const holder = vi.hoisted(() => ({ prisma: null as PrismaClient | null }));
 const faults = vi.hoisted(() => ({ fail: false, calls: [] as string[] }));
 vi.mock("@/lib/prisma", () => ({ prisma: prismaProxy(holder) }));
+// F.2: la ruta de recuperación hace su trabajo en `after()`. Fuera de una petición real `after` no existe, así que se simula: ejecuta el
+// callback y guarda su promesa; `flushAfter()` la espera. Los envoltorios de la ruta lo llaman tras la respuesta, de modo que estas
+// pruebas siguen comprobando el efecto del servicio sin cambiar sus expectativas.
+const bg = vi.hoisted(() => ({ jobs: [] as Promise<unknown>[] }));
+vi.mock("next/server", async (orig) => ({ ...(await orig<typeof import("next/server")>()), after: (fn: () => Promise<unknown>) => { bg.jobs.push(fn()); } }));
+const flushAfter = () => Promise.all(bg.jobs.splice(0));
 vi.mock("@/lib/rate-limit", async (orig) => {
   const real = await orig<typeof import("@/lib/rate-limit")>();
   return {
@@ -52,7 +58,10 @@ let errSpy: ReturnType<typeof vi.spyOn>;
 beforeAll(async () => {
   setTestEnv(); t = await startTestDb(); holder.prisma = t.prisma;
   ({ authService } = await import("@/services/auth.service"));
-  for (const r of ROUTES) handlers.set(r.name, ((await import(r.module)) as { POST: (req: Request) => Promise<Response> }).POST);
+  for (const r of ROUTES) {
+    const raw = ((await import(r.module)) as { POST: (req: Request) => Promise<Response> }).POST;
+    handlers.set(r.name, async (req) => { const res = await raw(req); await flushAfter(); return res; });
+  }
 }, 60_000);
 afterAll(async () => { await t?.stop(); });
 beforeEach(async () => {
