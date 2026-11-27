@@ -41,7 +41,7 @@ export function LocationPicker({ value, onChange }: { value: PlaceDTO | null; on
     return (
       <div className="space-y-1.5">
         <span className="block text-sm font-medium">Lugar</span>
-        <div className="flex h-11 items-center justify-between rounded-field border border-stone/70 bg-paper px-4">
+        <div className="flex h-11 items-center justify-between rounded-field border border-control bg-paper px-4">
           <span className="flex items-center gap-2 text-[0.95rem]"><MapPin className="size-4" aria-hidden />{value.name}</span>
           <button type="button" aria-label="Cambiar lugar" onClick={() => { onChange(null); setQ(""); }} className="rounded-full p-1 hover:bg-linen"><X className="size-4" /></button>
         </div>
@@ -53,10 +53,12 @@ export function LocationPicker({ value, onChange }: { value: PlaceDTO | null; on
     <div className="space-y-2">
       <Input label="Lugar" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Busca una ciudad" autoComplete="off" hint={searching ? "Buscando…" : undefined} />
       {shown.length > 0 && (
-        <ul className="overflow-hidden rounded-field border border-stone/70 bg-paper">
+        /* `overflow-hidden` (esquinas redondeadas) recortaría el contorno global de foco (`outline-offset: 2px`, fuera de la caja): en estos botones, que llenan la lista,
+            se dibuja hacia DENTRO (`-outline-offset-2`). Lleva `!` porque `:focus-visible` de `globals.css` no está en ninguna capa y gana a las utilidades. */
+        <ul className="overflow-hidden rounded-field border border-control bg-paper">
           {shown.map((c) => (
             <li key={`${c.latitude},${c.longitude}`}>
-              <button type="button" className="w-full px-4 py-2.5 text-left text-sm hover:bg-linen" onClick={() => { onChange({ name: label(c), latitude: c.latitude, longitude: c.longitude }); setResults([]); }}>{label(c)}</button>
+              <button type="button" className="w-full px-4 py-2.5 text-left text-sm hover:bg-linen focus-visible:-outline-offset-2!" onClick={() => { onChange({ name: label(c), latitude: c.latitude, longitude: c.longitude }); setResults([]); }}>{label(c)}</button>
             </li>
           ))}
         </ul>

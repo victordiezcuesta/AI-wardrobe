@@ -13,6 +13,9 @@ interface Batch { batchId: string; createdAt: string; fromCache: boolean; gaps: 
 interface Status { configured: boolean; products: number; stores: { store: string; count: number }[]; lastSyncAt: string | null }
 
 const eur = (c: number, cur = "EUR") => new Intl.NumberFormat("es-ES", { style: "currency", currency: cur }).format(c / 100);
+/** Espera tras la última pulsación del precio antes de anunciar el recuento (mismo patrón que la búsqueda del armario: temporizador en un efecto con limpieza). */
+export const ANNOUNCE_DELAY_MS = 600;
+
 const when = (iso: string) => new Date(iso).toLocaleDateString("es-ES", { day: "numeric", month: "long" });
 
 function Badge({ kind }: { kind: "ai" | "found" | "unavailable" }) {
@@ -29,6 +32,17 @@ export function ShoppingView() {
   const [store, setStore] = useState("");
   const [brand, setBrand] = useState("");
   const [maxPrice, setMaxPrice] = useState("");
+  // Anuncio del recuento: el filtrado VISUAL usa siempre los valores actuales; el ANUNCIO usa los «asentados» (`settled*`) y solo existe tras una acción del
+  // usuario. Tienda y marca se asientan al instante (y arrastran el precio tecleado, para no anunciar una combinación obsoleta); el precio, al dejar de teclear
+  // `ANNOUNCE_DELAY_MS` o al salir del campo: así escribir «100» no anuncia «1» y «10» por el camino.
+  const [settledPrice, setSettledPrice] = useState("");
+  const [filtered, setFiltered] = useState(false);
+  const settle = (price: string) => { setSettledPrice(price); setFiltered(true); };
+  useEffect(() => {
+    if (maxPrice === settledPrice) return;
+    const t = setTimeout(() => { setSettledPrice(maxPrice); setFiltered(true); }, ANNOUNCE_DELAY_MS);
+    return () => clearTimeout(t);
+  }, [maxPrice, settledPrice]);
 
   useEffect(() => {
     let cancelled = false;
@@ -49,8 +63,11 @@ export function ShoppingView() {
   const all = useMemo(() => batch?.gaps.flatMap((g) => g.products) ?? [], [batch]);
   const stores = useMemo(() => [...new Set(all.map((p) => p.store))].sort(), [all]);
   const brands = useMemo(() => [...new Set(all.map((p) => p.brand).filter((b): b is string => !!b))].sort(), [all]);
-  const max = maxPrice ? Math.round(Number(maxPrice) * 100) : null;
-  const visible = (g: Gap) => g.products.filter((p) => (!store || p.store === store) && (!brand || p.brand === brand) && (max == null || p.priceCents <= max));
+  const cents = (price: string) => (price ? Math.round(Number(price) * 100) : null);
+  const visibleFor = (g: Gap, s: string, b: string, price: string) => { const max = cents(price); return g.products.filter((p) => (!s || p.store === s) && (!b || p.brand === b) && (max == null || p.priceCents <= max)); };
+  const visible = (g: Gap) => visibleFor(g, store, brand, maxPrice);
+
+  const shownTotal = (batch?.gaps ?? []).reduce((n, g) => n + visibleFor(g, store, brand, settledPrice).length, 0);   // el recuento anunciado usa el precio asentado
 
   if (loading) return <div className="space-y-6"><Skeleton className="h-16 w-80" /><Skeleton className="h-72" /></div>;
   const noCatalog = !status || status.products === 0;
@@ -85,14 +102,16 @@ export function ShoppingView() {
         <>
           {all.length > 0 && (
             <section aria-label="Filtros" className="grid max-w-3xl gap-4 sm:grid-cols-3">
-              <Select label="Tienda" value={store} onChange={(e) => setStore(e.target.value)}><option value="">Todas</option>{stores.map((s) => <option key={s}>{s}</option>)}</Select>
-              <Select label="Marca" value={brand} onChange={(e) => setBrand(e.target.value)}><option value="">Todas</option>{brands.map((b) => <option key={b}>{b}</option>)}</Select>
+              <Select label="Tienda" value={store} onChange={(e) => { setStore(e.target.value); settle(maxPrice); }}><option value="">Todas</option>{stores.map((s) => <option key={s}>{s}</option>)}</Select>
+              <Select label="Marca" value={brand} onChange={(e) => { setBrand(e.target.value); settle(maxPrice); }}><option value="">Todas</option>{brands.map((b) => <option key={b}>{b}</option>)}</Select>
               <div className="space-y-1.5">
                 <label htmlFor="maxp" className="block text-sm font-medium">Precio máximo (€)</label>
-                <input id="maxp" type="number" inputMode="numeric" min={0} value={maxPrice} onChange={(e) => setMaxPrice(e.target.value)} className="h-11 w-full rounded-field border border-stone/70 bg-paper px-4 text-[0.95rem] focus:border-ink focus:outline-none" />
+                <input id="maxp" type="number" inputMode="numeric" min={0} value={maxPrice} onChange={(e) => setMaxPrice(e.target.value)} onBlur={() => { if (maxPrice !== settledPrice) settle(maxPrice); }} className="h-11 w-full rounded-field border border-control bg-paper px-4 text-[0.95rem] focus:border-ink focus:outline-none" />
               </div>
             </section>
           )}
+          {/* Resultado de los filtros para lectores de pantalla: región siempre montada y vacía hasta que el usuario filtra. */}
+          <p role="status" className="sr-only">{filtered ? `${shownTotal} ${shownTotal === 1 ? "producto" : "productos"}` : ""}</p>
 
           <div className="space-y-12">
             {batch.gaps.map((g) => {
@@ -123,20 +142,22 @@ export function ShoppingView() {
                   ) : (
                     <ul className="grid grid-cols-2 gap-x-4 gap-y-8 sm:grid-cols-3 lg:grid-cols-4">
                       {shown.map((p) => (
-                        <li key={p.id} className="flex flex-col">
-                          <a href={p.url} target="_blank" rel="noopener noreferrer sponsored" className="group block">
+                        <li key={p.id} className="relative flex flex-col">
+                          {/* El enlace de la imagen y el título es redundante con «Ver en tienda» (mismo destino): se oculta a la tecnología de apoyo y al orden de Tab, y el enlace de texto conserva el nombre del producto. */}
+                          <a href={p.url} target="_blank" rel="noopener noreferrer sponsored" className="group block" aria-hidden="true" tabIndex={-1}>
                             <div className="relative aspect-[4/5] overflow-hidden rounded-card bg-sand">
                               {/* eslint-disable-next-line @next/next/no-img-element */}
-                              {p.imageUrl && <img src={p.imageUrl} alt={p.name} loading="lazy" referrerPolicy="no-referrer" className="size-full object-cover transition-transform duration-500 group-hover:scale-[1.03]" />}
-                              <span className="absolute left-3 top-3"><Badge kind="found" /></span>
+                              {p.imageUrl && <img src={p.imageUrl} alt="" loading="lazy" referrerPolicy="no-referrer" className="size-full object-cover transition-transform duration-500 group-hover:scale-[1.03]" />}
                             </div>
                             <p className="mt-2 line-clamp-2 text-sm font-medium">{p.name}</p>
                           </a>
+                          {/* El estado NO va dentro del enlace oculto a la tecnología de apoyo: se superpone a la imagen (mismo lugar) sin capturar el puntero. */}
+                          <span className="pointer-events-none absolute left-3 top-3"><Badge kind="found" /></span>
                           <p className="text-sm text-taupe">{p.brand ? `${p.brand} · ` : ""}{p.store}{p.color ? ` · ${p.color}` : ""}</p>
                           <p className="mt-0.5 font-medium">{eur(p.priceCents, p.currency)}</p>
                           {p.matchReason && <p className="mt-1.5 text-xs text-taupe">{p.matchReason}</p>}
                           {p.combinesWith.length > 0 && <p className="mt-1 text-xs text-taupe">Combina con: {p.combinesWith.map((m) => m.name).join(", ")}</p>}
-                          <a href={p.url} target="_blank" rel="noopener noreferrer sponsored" className="mt-2 inline-flex items-center gap-1.5 text-sm underline">Ver en {p.store}<ExternalLink className="size-3.5" aria-hidden /></a>
+                          <a href={p.url} target="_blank" rel="noopener noreferrer sponsored" className="mt-2 inline-flex items-center gap-1.5 text-sm underline">Ver en {p.store}<span className="sr-only">: {p.name} (se abre en una pestaña nueva)</span><ExternalLink className="size-3.5" aria-hidden /></a>
                         </li>
                       ))}
                     </ul>

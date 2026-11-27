@@ -10,6 +10,8 @@ import { WeatherCard } from "./weather-card";
 import { OutfitCard } from "./outfit-card";
 
 type Scope = "recent" | "favorites";
+/** Anuncio de INICIO de la generación. Es constante: los pasos de `LOADING_STEPS` son solo presentación visual y cambian cada 2,5 s sin parar, así que anunciarlos repetiría el mensaje. */
+export const GENERATING_ANNOUNCEMENT = "Generando tus conjuntos. Puede tardar unos segundos.";
 const LOADING_STEPS = ["Revisando tu armario…", "Consultando el clima…", "Combinando colores y estilos…", "Afinando los conjuntos…"];
 
 export function StylistView() {
@@ -19,6 +21,10 @@ export function StylistView() {
   const [weatherState, setWeatherState] = useState<{ key: string; data: WeatherDTO } | null>(null);
   const [generating, setGenerating] = useState(false);
   const [step, setStep] = useState(0);
+  const [genDone, setGenDone] = useState("");   // anuncio del resultado de la última generación
+  // El resultado del HISTORIAL se anuncia solo tras una acción del usuario sobre él (cambiar de filtro o descartar un conjunto): ni en la carga inicial ni en la
+  // recarga que sigue a una generación (esa ya la anuncia «N conjuntos listos»). Mismo criterio que el recuento del armario.
+  const [announceHistory, setAnnounceHistory] = useState(false);
   const [results, setResults] = useState<OutfitDTO[]>([]);
   const [warning, setWarning] = useState<string | null>(null);
   const [alts, setAlts] = useState<AlternativeItems>({});
@@ -48,7 +54,7 @@ export function StylistView() {
       .catch(() => { if (!cancelled) { setHistory([]); setHistoryLoading(false); } });
     return () => { cancelled = true; };
   }, [scope, refreshTick]);
-  const changeScope = (s: Scope) => { setHistoryLoading(true); setScope(s); };
+  const changeScope = (s: Scope) => { setHistoryLoading(true); setAnnounceHistory(true); setScope(s); };
 
   useEffect(() => {
     if (!generating) return;
@@ -57,10 +63,11 @@ export function StylistView() {
   }, [generating]);
 
   async function generate(v: StylistFormValues) {
-    setGenerating(true); setStep(0); setWarning(null); setNeedsItems(false);
+    setGenerating(true); setStep(0); setWarning(null); setNeedsItems(false); setGenDone(""); setAnnounceHistory(false);
     try {
       const r = await api<{ outfits: OutfitDTO[]; alternativeItems: AlternativeItems; warning: string | null }>("/api/stylist/generate", { method: "POST", json: v });
       setResults(r.outfits); setAlts((a) => ({ ...a, ...r.alternativeItems })); setWarning(r.warning);
+      setGenDone(r.outfits.length === 1 ? "1 conjunto listo" : `${r.outfits.length} conjuntos listos`);
       setRefreshTick((n) => n + 1);
       requestAnimationFrame(() => document.getElementById("resultados")?.scrollIntoView({ behavior: "smooth" }));
     } catch (e) {
@@ -70,14 +77,22 @@ export function StylistView() {
     } finally { setGenerating(false); }
   }
 
+  // Conjuntos con el MISMO nombre (distinto `id`) entre los dos listados visibles: sus nombres accesibles serían idénticos. Solo a esos se les añade, para tecnología de apoyo,
+  // su posición en SU lista; los de nombre único no cambian. El mismo conjunto en ambas listas (mismo `id`) no cuenta como duplicado por sí solo.
+  const nameKey = (o: OutfitDTO) => o.name.trim().toLocaleLowerCase("es");
+  const idsByName = new Map<string, Set<string>>();
+  for (const o of [...results, ...history]) idsByName.set(nameKey(o), (idsByName.get(nameKey(o)) ?? new Set<string>()).add(o.id));
+  const ambiguous = (o: OutfitDTO) => (idsByName.get(nameKey(o))?.size ?? 0) > 1;
+
   const patch = (setter: React.Dispatch<React.SetStateAction<OutfitDTO[]>>) => (o: OutfitDTO, a: AlternativeItems) => {
     setter((s) => s.map((x) => (x.id === o.id ? o : x)));
     setAlts((prev) => ({ ...prev, ...a }));
     // Mantener sincronizadas las dos listas si el mismo conjunto aparece en ambas.
     setResults((s) => s.map((x) => (x.id === o.id ? o : x)));
+    if (scope === "favorites" && !o.isFavorite) setAnnounceHistory(true);   // quitar un favorito desde «Favoritos» retira el conjunto del historial: acción del usuario que cambia el resultado
     setHistory((s) => (scope === "favorites" && !o.isFavorite ? s.filter((x) => x.id !== o.id) : s.map((x) => (x.id === o.id ? o : x))));
   };
-  const discard = (id: string) => { setResults((s) => s.filter((x) => x.id !== id)); setHistory((s) => s.filter((x) => x.id !== id)); };
+  const discard = (id: string) => { setAnnounceHistory(true); setResults((s) => s.filter((x) => x.id !== id)); setHistory((s) => s.filter((x) => x.id !== id)); };
 
   return (
     <div className="space-y-14">
@@ -89,8 +104,11 @@ export function StylistView() {
         {needsItems && <p className="mt-6 rounded-card bg-linen p-5">Aún no hay suficientes prendas. <Link href="/wardrobe" className="underline">Añade algunas a tu armario</Link> y vuelve.</p>}
       </section>
 
+      {/* Región siempre montada: anuncia UNA vez el inicio (texto constante) y al terminar el resultado. Los pasos que cambian cada 2,5 s se ven en pantalla pero no
+          se anuncian. (Antes la región solo existía mientras generaba, así que el final nunca se anunciaba.) */}
+      <p role="status" className="sr-only">{generating ? GENERATING_ANNOUNCEMENT : genDone}</p>
       {generating && (
-        <section aria-live="polite" className="space-y-4">
+        <section className="space-y-4">
           <p className="font-display text-3xl">{LOADING_STEPS[step]}</p>
           <div className="grid gap-4 lg:grid-cols-2"><Skeleton className="h-72" /><Skeleton className="h-72" /></div>
         </section>
@@ -100,9 +118,9 @@ export function StylistView() {
         <section id="resultados" className="scroll-mt-6 space-y-6">
           <h2 className="font-display text-5xl leading-none">Tus conjuntos</h2>
           {warning && <p className="rounded-card bg-linen p-4 text-sm">{warning}</p>}
-          <div className="grid gap-6 xl:grid-cols-2">
-            {results.map((o) => <OutfitCard key={o.id} outfit={o} alternatives={alts} onChange={patch(setResults)} onDiscard={discard} />)}
-          </div>
+          <ul className="grid gap-6 xl:grid-cols-2">
+            {results.map((o, i) => <li key={o.id}><OutfitCard outfit={o} alternatives={alts} onChange={patch(setResults)} onDiscard={discard} distinguish={ambiguous(o) ? `conjunto nuevo ${i + 1} de ${results.length}` : undefined} /></li>)}
+          </ul>
         </section>
       )}
 
@@ -111,16 +129,17 @@ export function StylistView() {
           <h2 className="font-display text-5xl leading-none">Tus conjuntos anteriores</h2>
           <div className="flex gap-2" role="group" aria-label="Filtrar historial">
             {([["recent", "Recientes"], ["favorites", "Favoritos"]] as const).map(([k, label]) => (
-              <button key={k} type="button" aria-pressed={scope === k} onClick={() => changeScope(k)} className={cn("rounded-full border px-4 py-1.5 text-sm", scope === k ? "border-ink bg-ink text-paper" : "border-stone/70 hover:bg-linen")}>{label}</button>
+              <button key={k} type="button" aria-pressed={scope === k} onClick={() => changeScope(k)} className={cn("rounded-full border px-4 py-1.5 text-sm", scope === k ? "border-ink bg-ink text-paper" : "border-control hover:bg-linen")}>{label}</button>
             ))}
           </div>
         </div>
+        <p role="status" className="sr-only">{!announceHistory || historyLoading ? "" : history.length === 0 ? (scope === "favorites" ? "Ningún conjunto favorito" : "Ningún conjunto reciente") : `${history.length} ${history.length === 1 ? "conjunto" : "conjuntos"}`}</p>
         {historyLoading ? <Skeleton className="h-48" /> : history.length === 0 ? (
           <p className="text-taupe">{scope === "favorites" ? "Aún no has guardado ningún conjunto." : "Todavía no has pedido conjuntos."}</p>
         ) : (
-          <div className="grid gap-6 xl:grid-cols-2">
-            {history.map((o) => <OutfitCard key={o.id} outfit={o} alternatives={alts} onChange={patch(setHistory)} onDiscard={discard} />)}
-          </div>
+          <ul className="grid gap-6 xl:grid-cols-2">
+            {history.map((o, i) => <li key={o.id}><OutfitCard outfit={o} alternatives={alts} onChange={patch(setHistory)} onDiscard={discard} distinguish={ambiguous(o) ? `del historial ${i + 1} de ${history.length}` : undefined} /></li>)}
+          </ul>
         )}
       </section>
     </div>

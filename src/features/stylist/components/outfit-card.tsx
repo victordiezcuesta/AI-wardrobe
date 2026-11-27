@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useId, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { Check, Heart, ThumbsDown, ThumbsUp } from "lucide-react";
@@ -20,11 +20,20 @@ function Thumb({ url, name, color, className }: { url: string | null; name: stri
   );
 }
 
-interface Props { outfit: OutfitDTO; alternatives: AlternativeItems; onChange: (o: OutfitDTO, alt: AlternativeItems) => void; onDiscard: (id: string) => void }
+interface Props {
+  outfit: OutfitDTO; alternatives: AlternativeItems; onChange: (o: OutfitDTO, alt: AlternativeItems) => void; onDiscard: (id: string) => void;
+  /** Solo si el nombre del conjunto NO es único entre los que se muestran (p. ej. «conjunto nuevo 2 de 3», «del historial 1 de 5»): se añade, SOLO para tecnología de apoyo, al nombre del artículo, al
+   *  encabezado y a las acciones, para distinguir conjuntos que se llaman igual. No cambia ningún texto visible. */
+  distinguish?: string;
+}
 
-export function OutfitCard({ outfit, alternatives, onChange, onDiscard }: Props) {
+export function OutfitCard({ outfit, alternatives, onChange, onDiscard, distinguish }: Props) {
   const toast = useToast();
   const [busy, setBusy] = useState<string | null>(null);
+  const titleId = useId();
+  // Las acciones se repiten en cada conjunto con el mismo texto visible: se les añade el nombre del conjunto SOLO para tecnología de apoyo («Me gusta: Look casual»),
+  // sin sustituir el texto visible (el nombre accesible empieza por él).
+  const forOutfit = <span className="sr-only">: {outfit.name}{distinguish ? ` (${distinguish})` : ""}</span>;
 
   async function send(type: FeedbackType) {
     setBusy(type);
@@ -51,14 +60,14 @@ export function OutfitCard({ outfit, alternatives, onChange, onDiscard }: Props)
   const alts = outfit.items.flatMap((oi) => oi.alternatives.map((id) => ({ replaces: oi.item.name, item: alternatives[id] }))).filter((a) => a.item);
 
   return (
-    <article className="rounded-card bg-linen p-5 shadow-soft sm:p-7">
+    <article aria-labelledby={titleId} className="rounded-card bg-linen p-5 shadow-soft sm:p-7">
       <header className="flex items-start justify-between gap-4">
         <div>
-          <h3 className="font-display text-4xl leading-tight">{outfit.name}</h3>
+          <h3 id={titleId} className="font-display text-4xl leading-tight">{outfit.name}{distinguish && <>{" "}<span className="sr-only">({distinguish})</span></>}</h3>
           {outfit.occasion && <p className="mt-1 text-sm text-taupe">{outfit.occasion}</p>}
         </div>
         <Tooltip text={outfit.isFavorite ? "Quitar de favoritos" : "Guardar en favoritos"}>
-          <button type="button" onClick={toggleFavorite} disabled={busy === "FAV"} aria-pressed={outfit.isFavorite} aria-label="Favorito" className="grid size-10 place-items-center rounded-full bg-paper shadow-soft">
+          <button type="button" onClick={toggleFavorite} disabled={busy === "FAV"} aria-pressed={outfit.isFavorite} aria-label={`Favorito: ${outfit.name}${distinguish ? ` (${distinguish})` : ""}`} className="grid size-10 place-items-center rounded-full bg-paper shadow-soft">
             <Heart className={cn("size-5", outfit.isFavorite && "fill-ink")} aria-hidden />
           </button>
         </Tooltip>
@@ -95,11 +104,11 @@ export function OutfitCard({ outfit, alternatives, onChange, onDiscard }: Props)
       )}
 
       <footer className="mt-6 flex flex-wrap gap-2">
-        <Button size="sm" onClick={() => void send("WORN")} loading={busy === "WORN"}><Check className="size-4" aria-hidden />Me lo pongo</Button>
-        <Button size="sm" variant="secondary" onClick={() => void send("LIKE")} loading={busy === "LIKE"}><ThumbsUp className="size-4" aria-hidden />Me gusta</Button>
-        <Button size="sm" variant="ghost" onClick={() => void send("DISLIKE")} loading={busy === "DISLIKE"}><ThumbsDown className="size-4" aria-hidden />No me convence</Button>
-        <Link href={`/try-on?outfit=${outfit.id}`} className="inline-flex h-9 items-center rounded-full bg-sand px-4 text-sm font-medium transition-colors hover:bg-stone/60">Ver cómo me queda</Link>
-        <Button size="sm" variant="ghost" onClick={() => void send("DISCARDED")} loading={busy === "DISCARDED"}>Descartar</Button>
+        <Button size="sm" onClick={() => void send("WORN")} loading={busy === "WORN"}><Check className="size-4" aria-hidden />Me lo pongo{forOutfit}</Button>
+        <Button size="sm" variant="secondary" onClick={() => void send("LIKE")} loading={busy === "LIKE"}><ThumbsUp className="size-4" aria-hidden />Me gusta{forOutfit}</Button>
+        <Button size="sm" variant="ghost" onClick={() => void send("DISLIKE")} loading={busy === "DISLIKE"}><ThumbsDown className="size-4" aria-hidden />No me convence{forOutfit}</Button>
+        <Link href={`/try-on?outfit=${outfit.id}`} className="inline-flex h-9 items-center rounded-full bg-sand px-4 text-sm font-medium transition-colors hover:bg-stone/60">Ver cómo me queda{forOutfit}</Link>
+        <Button size="sm" variant="ghost" onClick={() => void send("DISCARDED")} loading={busy === "DISCARDED"}>Descartar{forOutfit}</Button>
       </footer>
     </article>
   );

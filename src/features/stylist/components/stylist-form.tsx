@@ -48,7 +48,7 @@ export function StylistForm({ place, onPlace, date, onDate, loading, onSubmit }:
         <Input label="¿Qué ocasión es?" value={occasion} onChange={(e) => setOccasion(e.target.value)} placeholder="Describe el plan con tus palabras" required minLength={2} />
         <div className="flex flex-wrap gap-2" aria-label="Ejemplos de ocasión">
           {OCCASION_EXAMPLES.map((o) => (
-            <button key={o} type="button" onClick={() => setOccasion(o)} className={cn("rounded-full border px-3 py-1 text-xs transition-colors", occasion === o ? "border-ink bg-ink text-paper" : "border-stone/70 hover:bg-linen")}>{o}</button>
+            <button key={o} type="button" onClick={() => setOccasion(o)} className={cn("rounded-full border px-3 py-1 text-xs transition-colors", occasion === o ? "border-ink bg-ink text-paper" : "border-control hover:bg-linen")}>{o}</button>
           ))}
         </div>
       </div>
