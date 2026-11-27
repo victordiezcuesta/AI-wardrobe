@@ -2,51 +2,44 @@
 import { useEffect, useId, useRef, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { X } from "lucide-react";
+import { registerModal } from "@/utils/modal-stack";
 
 interface ModalProps { open: boolean; onClose: () => void; title: string; children: ReactNode }
 
-const FOCUSABLE = 'a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])';
-
-/** Modal propio: cierra con Escape/fondo, atrapa el foco y lo devuelve al cerrar. */
+/**
+ * Modal propio. Cierra con Escape o con el fondo; la gestión de foco, Escape/Tab, bloqueo de scroll y aislamiento del fondo
+ * (`inert`) es COMPARTIDA y vive en `utils/modal-stack.ts`: solo el diálogo superior de la pila responde, el foco vuelve a quien lo
+ * abrió y el scroll sigue bloqueado mientras quede alguno abierto. Este componente solo se registra al abrirse y se da de baja al
+ * cerrarse o desmontarse.
+ */
 export function Modal({ open, onClose, title, children }: ModalProps) {
   const titleId = useId();
+  const root = useRef<HTMLDivElement>(null);
   const panel = useRef<HTMLDivElement>(null);
+  // `onClose` suele ser una función en línea que cambia en cada render del padre: se guarda en un ref para que el registro (y con él
+  // el foco) dependa solo de `open` y no se reinicie por un cambio de identidad irrelevante.
+  const closeRef = useRef(onClose);
+  useEffect(() => { closeRef.current = onClose; });
 
   useEffect(() => {
-    if (!open) return;
-    const previous = document.activeElement as HTMLElement | null;
-    const node = panel.current;
-    node?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
-    document.body.style.overflow = "hidden";
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") return onClose();
-      if (e.key !== "Tab" || !node) return;
-      const items = [...node.querySelectorAll<HTMLElement>(FOCUSABLE)];
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (!first || !last) return;
-      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = "";
-      previous?.focus();
-    };
-  }, [open, onClose]);
+    const r = root.current;
+    const p = panel.current;
+    if (!open || !r || !p) return;
+    return registerModal({ root: r, panel: p, close: () => closeRef.current() });
+  }, [open]);
 
   return (
     <AnimatePresence>
       {open && (
-        <motion.div className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-6" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+        <motion.div ref={root} className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-6" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
           <div className="absolute inset-0 bg-ink/40" onClick={onClose} aria-hidden />
           <motion.div
             ref={panel}
             role="dialog"
             aria-modal="true"
             aria-labelledby={titleId}
-            className="relative max-h-[90dvh] w-full max-w-lg overflow-y-auto rounded-t-3xl bg-paper p-6 shadow-soft sm:rounded-3xl"
+            tabIndex={-1}
+            className="relative max-h-[90dvh] w-full max-w-lg overflow-y-auto rounded-t-3xl bg-paper p-6 shadow-soft focus:outline-none sm:rounded-3xl"
             initial={{ y: 24, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             exit={{ y: 24, opacity: 0 }}

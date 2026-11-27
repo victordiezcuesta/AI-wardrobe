@@ -7,5 +7,6 @@ export * from "./tooltip";
 export * from "./modal";
 export * from "./confirm-dialog";
 export * from "./dropdown";
+export * from "./tabs";
 export * from "./toast";
 export * from "./gallery";
