@@ -1,4 +1,5 @@
 import { z } from "zod";
+import "./messages"; // mensajes de validación en español (efecto secundario; ver messages.ts)
 import { CATEGORIES, COLORS } from "@/features/wardrobe/constants";
 
 const STORABLE = CATEGORIES.filter((c) => c !== "OTHER") as [Exclude<(typeof CATEGORIES)[number], "OTHER">, ...Exclude<(typeof CATEGORIES)[number], "OTHER">[]];

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import "./messages"; // mensajes de validación en español (efecto secundario; ver messages.ts)
 import { POSE_KEYS, SCENARIO_KEYS } from "@/features/virtual-try-on/constants";
 
 export const createTryOnSchema = z.object({

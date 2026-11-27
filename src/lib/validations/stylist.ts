@@ -1,4 +1,5 @@
 import { z } from "zod";
+import "./messages"; // mensajes de validación en español (efecto secundario; ver messages.ts)
 import { isoDateSchema } from "@/lib/validations/date";
 
 export const stylistRequestSchema = z.object({

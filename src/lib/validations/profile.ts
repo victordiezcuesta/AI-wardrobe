@@ -1,4 +1,5 @@
 import { z } from "zod";
+import "./messages"; // mensajes de validación en español (efecto secundario; ver messages.ts)
 
 /**
  * Lista opcional SIN valor por defecto: en un PUT parcial, una lista omitida queda `undefined` y Prisma no la toca;

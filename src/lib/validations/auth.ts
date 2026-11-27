@@ -1,4 +1,5 @@
 import { z } from "zod";
+import "./messages"; // mensajes de validación en español (efecto secundario; ver messages.ts)
 
 export const passwordSchema = z
   .string()

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import "./messages"; // mensajes de validación en español (efecto secundario; ver messages.ts)
 
 /**
  * Fecha de calendario `YYYY-MM-DD` REAL (fase 19.11). Una regex de formato no basta («2026-13-45» la pasa) y `Date.parse`

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
+import "@/lib/validations/messages"; // mensajes de validación en español en la instancia de Zod que cargan las rutas (todas usan handler)
 import { safeDbError } from "./db";
 
 export class AppError extends Error {
