@@ -25,7 +25,7 @@ export function ChipGroup<T extends string>({ label, options, value, onChange }:
               onClick={() => toggle(o.value)}
               className={cn(
                 "rounded-full border px-4 py-1.5 text-sm transition-colors",
-                on ? "border-ink bg-ink text-paper" : "border-stone/70 bg-paper hover:bg-linen",
+                on ? "border-ink bg-ink text-paper" : "border-control bg-paper hover:bg-linen",
               )}
             >
               {o.label}

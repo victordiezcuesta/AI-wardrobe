@@ -7,6 +7,9 @@ export class ApiError extends Error {
 /** Mensaje para un 401: la sesión no existe, caducó o se cerró (p. ej. desde otro dispositivo). */
 export const SESSION_EXPIRED_MESSAGE = "Tu sesión ha caducado o se ha cerrado. Vuelve a iniciar sesión.";
 
+/** Mensaje para un fallo de red (el `fetch` rechaza): el texto del navegador («Failed to fetch») es técnico y está en inglés. */
+export const NETWORK_ERROR_MESSAGE = "No se ha podido conectar con el servidor. Revisa tu conexión e inténtalo de nuevo.";
+
 const NOT_JSON = Symbol("not-json");
 
 export async function api<T>(url: string, init?: RequestInit & { json?: unknown }): Promise<T> {

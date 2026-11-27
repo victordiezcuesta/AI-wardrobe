@@ -20,7 +20,7 @@ export const HIDDEN: Visibility = { currentPassword: false, newPassword: false, 
 
 export interface PasswordPanelViewProps {
   values: PasswordValues;
-  errors: FieldErrors;
+  errors: Partial<Record<PasswordField, string | readonly string[]>>;
   formError?: string;
   success?: boolean;
   loading: boolean;
@@ -101,7 +101,7 @@ export function PasswordPanel() {
     } else if (result.status === "invalid") {
       focusInvalid.current = true; setErrors(result.errors);
     } else if (result.field) {
-      focusInvalid.current = true; setErrors({ [result.field]: result.message });
+      focusInvalid.current = true; setErrors(result.errors ?? { [result.field]: [result.message] });
     } else {
       setFormError(result.message);
     }

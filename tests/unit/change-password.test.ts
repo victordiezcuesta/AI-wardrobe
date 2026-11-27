@@ -17,17 +17,17 @@ describe("validatePasswordChange", () => {
 
   it("campos vacíos → error en actual, nueva y (si difiere) confirmación", () => {
     const e = validatePasswordChange({ currentPassword: "", newPassword: "", confirmPassword: "" });
-    expect(e.currentPassword).toBe(PASSWORD_MESSAGES.currentRequired);
+    expect(e.currentPassword).toEqual([PASSWORD_MESSAGES.currentRequired]);
     expect(e.newPassword).toBeTruthy();
     expect(e.confirmPassword).toBeUndefined(); // vacía = vacía; el error útil es el de la nueva
-    expect(validatePasswordChange(v({ confirmPassword: "" })).confirmPassword).toBe(PASSWORD_MESSAGES.mismatch);
+    expect(validatePasswordChange(v({ confirmPassword: "" })).confirmPassword).toEqual([PASSWORD_MESSAGES.mismatch]);
   });
 
   it("la actual admite hasta 128 caracteres y NO tiene el tope de 72 bytes", () => {
     expect(validatePasswordChange(v({ currentPassword: "x".repeat(128) })).currentPassword).toBeUndefined();
     expect(validatePasswordChange(v({ currentPassword: "😀".repeat(128) })).currentPassword).toBeUndefined(); // 512 bytes, 128 puntos de código
-    expect(validatePasswordChange(v({ currentPassword: "x".repeat(129) })).currentPassword).toBe(PASSWORD_MESSAGES.currentTooLong);
-    expect(validatePasswordChange(v({ currentPassword: "😀".repeat(129) })).currentPassword).toBe(PASSWORD_MESSAGES.currentTooLong);
+    expect(validatePasswordChange(v({ currentPassword: "x".repeat(129) })).currentPassword).toEqual([PASSWORD_MESSAGES.currentTooLong]);
+    expect(validatePasswordChange(v({ currentPassword: "😀".repeat(129) })).currentPassword).toEqual([PASSWORD_MESSAGES.currentTooLong]);
   });
 
   it.each([
@@ -53,15 +53,15 @@ describe("validatePasswordChange", () => {
   });
 
   it("más de 128 caracteres en la nueva → mensaje en español del esquema (no el texto en inglés de Zod)", () => {
-    expect(validatePasswordChange(withNew(`Aa1${"x".repeat(126)}`)).newPassword).toBe("La contraseña no puede superar los 128 caracteres");
+    expect(validatePasswordChange(withNew(`Aa1${"x".repeat(126)}`)).newPassword).toContain("La contraseña no puede superar los 128 caracteres");
   });
 
   it("el mensaje del límite de bytes es el del esquema del servidor", () => {
-    expect(validatePasswordChange(withNew(`Aa1${"x".repeat(70)}`)).newPassword).toContain("72 bytes UTF-8");
+    expect(validatePasswordChange(withNew(`Aa1${"x".repeat(70)}`)).newPassword!.join(" ")).toContain("72 bytes UTF-8");
   });
 
   it("confirmación distinta → error solo en la confirmación", () => {
-    expect(validatePasswordChange(v({ confirmPassword: "Nueva-clave-2" }))).toEqual({ confirmPassword: PASSWORD_MESSAGES.mismatch });
+    expect(validatePasswordChange(v({ confirmPassword: "Nueva-clave-2" }))).toEqual({ confirmPassword: [PASSWORD_MESSAGES.mismatch] });
   });
 
   it("no exige que la nueva difiera de la actual (lo decide el servidor)", () => {
@@ -79,8 +79,8 @@ describe("passwordChangeError", () => {
     [api(409, "CONFLICT"), { message: PASSWORD_MESSAGES.conflict }],
     [api(422, "SAME_PASSWORD"), { field: "newPassword", message: PASSWORD_MESSAGES.samePassword }],
     [api(422, "VALIDATION"), { message: PASSWORD_MESSAGES.validation }],
-    [api(422, "VALIDATION", [{ path: "newPassword", message: "Mínimo 10 caracteres" }]), { field: "newPassword", message: "Mínimo 10 caracteres" }],
-    [api(422, "VALIDATION", [{ path: "currentPassword", message: "Required" }]), { field: "currentPassword", message: "Required" }],
+    [api(422, "VALIDATION", [{ path: "newPassword", message: "Mínimo 10 caracteres" }]), { field: "newPassword", message: "Mínimo 10 caracteres", errors: { newPassword: ["Mínimo 10 caracteres"] } }],
+    [api(422, "VALIDATION", [{ path: "currentPassword", message: "Required" }]), { field: "currentPassword", message: "Required", errors: { currentPassword: ["Required"] } }],
     [api(429, "RATE_LIMITED"), { message: PASSWORD_MESSAGES.rateLimited }],
   ])("%#: código y estado → mensaje", (err, expected) => {
     expect(passwordChangeError(err)).toEqual(expected);
@@ -117,7 +117,7 @@ describe("createPasswordChangeSubmitter", () => {
   it("datos inválidos → no se envía nada", async () => {
     const post = vi.fn(async () => ({}));
     const r = await createPasswordChangeSubmitter(post)(v({ confirmPassword: "otra" }));
-    expect(r).toEqual({ status: "invalid", errors: { confirmPassword: PASSWORD_MESSAGES.mismatch } });
+    expect(r).toEqual({ status: "invalid", errors: { confirmPassword: [PASSWORD_MESSAGES.mismatch] } });
     expect(post).not.toHaveBeenCalled();
   });
 
@@ -170,7 +170,7 @@ describe("postPasswordChange + api() con fetch simulado (sin red)", () => {
     [409, error("NO_LOCAL_PASSWORD"), { status: "error", message: PASSWORD_MESSAGES.noLocalPassword }],
     [409, error("CONFLICT"), { status: "error", message: PASSWORD_MESSAGES.conflict }],
     [422, error("SAME_PASSWORD"), { status: "error", field: "newPassword", message: PASSWORD_MESSAGES.samePassword }],
-    [422, error("VALIDATION", "Datos no válidos", [{ path: "newPassword", message: "Incluye un número" }]), { status: "error", field: "newPassword", message: "Incluye un número" }],
+    [422, error("VALIDATION", "Datos no válidos", [{ path: "newPassword", message: "Incluye un número" }]), { status: "error", field: "newPassword", message: "Incluye un número", errors: { newPassword: ["Incluye un número"] } }],
     [429, error("RATE_LIMITED"), { status: "error", message: PASSWORD_MESSAGES.rateLimited }],
     [500, error("INTERNAL", "Error interno"), { status: "error", message: PASSWORD_MESSAGES.generic }],
   ])("HTTP %i %#: respuesta real de api() → resultado del formulario", async (status, body, expected) => {

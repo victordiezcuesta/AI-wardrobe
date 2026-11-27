@@ -1,5 +1,6 @@
 import { passwordSchema } from "@/lib/validations/auth";
 import { api, ApiError } from "@/utils/api";
+import { groupIssues } from "@/utils/issues";
 
 /**
  * Lógica del formulario «Cambiar contraseña» (20.3c), sin React: validación en cliente, envío sin duplicados y traducción de
@@ -7,7 +8,9 @@ import { api, ApiError } from "@/utils/api";
  */
 export interface PasswordValues { currentPassword: string; newPassword: string; confirmPassword: string }
 export type PasswordField = keyof PasswordValues;
-export type FieldErrors = Partial<Record<PasswordField, string>>;
+/** Todos los mensajes de cada campo (varias reglas de contraseña a la vez), en orden de llegada y sin repetidos. */
+export type FieldErrors = Partial<Record<PasswordField, string[]>>;
+const PASSWORD_FIELDS: readonly PasswordField[] = ["currentPassword", "newPassword", "confirmPassword"];
 
 export const EMPTY_VALUES: PasswordValues = { currentPassword: "", newPassword: "", confirmPassword: "" };
 
@@ -32,15 +35,20 @@ const length = (s: string) => [...s].length;
 /** Reglas del cliente. La nueva contraseña usa `passwordSchema` (mínimo, composición, 128 caracteres y 72 bytes UTF-8). */
 export function validatePasswordChange(v: PasswordValues): FieldErrors {
   const errors: FieldErrors = {};
-  if (v.currentPassword.length === 0) errors.currentPassword = PASSWORD_MESSAGES.currentRequired;
-  else if (length(v.currentPassword) > 128) errors.currentPassword = PASSWORD_MESSAGES.currentTooLong;
+  if (v.currentPassword.length === 0) errors.currentPassword = [PASSWORD_MESSAGES.currentRequired];
+  else if (length(v.currentPassword) > 128) errors.currentPassword = [PASSWORD_MESSAGES.currentTooLong];
   const parsed = passwordSchema.safeParse(v.newPassword);
-  if (!parsed.success) errors.newPassword = parsed.error.issues[0]?.message ?? PASSWORD_MESSAGES.validation;
-  if (v.confirmPassword !== v.newPassword) errors.confirmPassword = PASSWORD_MESSAGES.mismatch;
+  if (!parsed.success) {
+    // Todas las reglas incumplidas, no solo la primera (mínimo, mayúscula, minúscula, número…).
+    const all = groupIssues(parsed.error.issues.map((i) => ({ path: "newPassword", message: i.message }))).fields.newPassword;
+    errors.newPassword = all?.length ? all : [PASSWORD_MESSAGES.validation];
+  }
+  if (v.confirmPassword !== v.newPassword) errors.confirmPassword = [PASSWORD_MESSAGES.mismatch];
   return errors;
 }
 
-export interface PasswordError { field?: PasswordField; message: string }
+/** `errors` = todos los mensajes de campo cuando el servidor rechazó la validación; `field`/`message` = el primero (compatibilidad). */
+export interface PasswordError { field?: PasswordField; message: string; errors?: FieldErrors }
 
 /** Mensaje (y campo, si procede) para un fallo del envío. Nunca muestra detalles internos de errores 5xx o de red. */
 export function passwordChangeError(err: unknown): PasswordError {
@@ -54,9 +62,13 @@ export function passwordChangeError(err: unknown): PasswordError {
       return { message: PASSWORD_MESSAGES.generic };
     case 422: {
       if (err.code === "SAME_PASSWORD") return { field: "newPassword", message: PASSWORD_MESSAGES.samePassword };
-      const issue = err.issues?.find((i) => i.path === "newPassword" || i.path === "currentPassword");
-      if (issue) return { field: issue.path as PasswordField, message: issue.message };
-      return { message: PASSWORD_MESSAGES.validation };
+      // Solo los campos que el formulario envía; los demás `path` (o los vacíos) no se atribuyen a ningún campo.
+      const { fields } = groupIssues(err.issues, { fields: ["currentPassword", "newPassword"] });
+      const first = (["currentPassword", "newPassword"] as const).find((f) => fields[f]?.length);
+      if (!first) return { message: PASSWORD_MESSAGES.validation };
+      const errors: FieldErrors = {};
+      for (const f of PASSWORD_FIELDS) if (fields[f]?.length) errors[f] = fields[f];
+      return { field: first, message: fields[first]![0]!, errors };
     }
     case 429: return { message: PASSWORD_MESSAGES.rateLimited };
     default: return { message: PASSWORD_MESSAGES.generic };
@@ -66,7 +78,7 @@ export function passwordChangeError(err: unknown): PasswordError {
 export type SubmitResult =
   | { status: "success" }
   | { status: "invalid"; errors: FieldErrors }
-  | { status: "error"; field?: PasswordField; message: string };
+  | { status: "error"; field?: PasswordField; message: string; errors?: FieldErrors };
 
 export type PostPasswordChange = (body: { currentPassword: string; newPassword: string }) => Promise<unknown>;
 
