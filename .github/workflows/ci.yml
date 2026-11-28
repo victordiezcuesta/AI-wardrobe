@@ -22,17 +22,23 @@ jobs:
     name: Lint, tipos, pruebas (PostgreSQL 18.7) y build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # `bash -eo pipefail` explícito: un fallo dentro de una tubería también hace fallar el paso.
+    defaults:
+      run:
+        shell: bash
 
     services:
       postgres:
         # Misma versión mayor y menor que las verificaciones de la Fase I (PostgreSQL 18.7).
-        image: postgres:18.7-alpine
+        # Fijada por digest (el del índice multi-arquitectura de 18.7-alpine en Docker Hub).
+        image: postgres:18.7-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
         env:
           # Credenciales de un contenedor desechable que solo existe durante este job; no son un secreto.
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ci-throwaway-password
           POSTGRES_DB: postgres
-        # rate-limit-purge-pg.test.ts exige exactamente 127.0.0.1:55433.
+        # rate-limit-purge-pg.test.ts exige exactamente 127.0.0.1:55433. Se publica en todas las interfaces del runner (una
+        # VM efímera sin entrada desde fuera) porque el proxy de Neon, desde su contenedor, lo alcanza por la pasarela del host.
         ports:
           - 55433:5432
         # Datos en tmpfs: PostgreSQL desechable y sin E/S de disco (como en las verificaciones de la Fase I).
@@ -57,12 +63,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm

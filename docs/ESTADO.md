@@ -18,22 +18,26 @@ Este documento dice con franqueza qué está **comprobado**, qué **depende de c
 
 ## Fase 1: integración continua (GitHub Actions)
 
-**Estado: workflow creado y reproducido localmente; SIN validar en GitHub.** No hay ninguna ejecución real en GitHub Actions: hasta que exista una satisfactoria, la CI no debe darse por validada.
+**Estado: workflow creado, endurecido (Fase 1.1) y reproducido localmente; SIN validar en GitHub.** No hay ninguna ejecución real en GitHub Actions: hasta que exista una satisfactoria, la CI no debe darse por validada.
 
 **Archivos.** `.github/workflows/ci.yml` y `scripts/ci/assert-no-skipped.mjs` (comprueba los informes JSON de Vitest). Se añade `vitest-*.json` a `.gitignore`. No cambia ninguna funcionalidad, prueba, esquema Prisma ni migración.
 
 **Activación.** `push` y `pull_request` sobre `main`. Permisos: solo `contents: read`. Concurrencia por rama: un push nuevo cancela la ejecución anterior de un PR, pero nunca la de `main`. Sin secretos, sin despliegues, sin tokens y sin conexión a Neon ni a ningún proveedor: las variables del build son ficticias (`DATABASE_URL` apunta a un puerto cerrado a propósito).
 
-**Entorno.** `ubuntu-latest`, Node.js 22 (`engines`: ≥ 20.9), PostgreSQL **18.7** (`postgres:18.7-alpine`, contenedor de servicio con datos en tmpfs, publicado en `127.0.0.1:55433`, que es lo que exige `rate-limit-purge-pg`) y el proxy WebSocket oficial de Neon (`ghcr.io/neondatabase/wsproxy`, fijado por digest, `ALLOW_ADDR_REGEX` limitado a ese PostgreSQL) para la suite de `PrismaNeon`. La contraseña de PostgreSQL es una credencial desechable del propio contenedor y va por `PGPASSWORD`: `repo-hygiene` no admite cadenas de conexión con contraseña en el repositorio.
+**Entorno.** `ubuntu-latest`, Node.js 22 (`engines`: ≥ 20.9), PostgreSQL **18.7** (`postgres:18.7-alpine` fijado por digest, contenedor de servicio con datos en tmpfs, publicado en `127.0.0.1:55433`, que es lo que exige `rate-limit-purge-pg`) y el proxy WebSocket oficial de Neon (`ghcr.io/neondatabase/wsproxy`, fijado por digest, `ALLOW_ADDR_REGEX` limitado a ese PostgreSQL) para la suite de `PrismaNeon`. La contraseña de PostgreSQL es una credencial desechable del propio contenedor y va por `PGPASSWORD`: `repo-hygiene` no admite cadenas de conexión con contraseña en el repositorio.
+
+**Endurecimiento (Fase 1.1).** Acciones fijadas por SHA de commit, verificados contra los repositorios oficiales (`git ls-remote` y la API de releases de `actions/*`; ambas releases estables, no prerelease): `actions/checkout@11d5960a326750d5838078e36cf38b85af677262` (v4.4.0) y `actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020` (v4.4.0); en ambos casos el SHA coincide con la etiqueta móvil `v4`, así que no cambia la versión mayor ni el comportamiento. La imagen de PostgreSQL se fija por el digest de su índice (`sha256:0115267a…`, comprobado con `docker buildx imagetools inspect`). `defaults.run.shell: bash` (con `-eo pipefail`). `assert-no-skipped.mjs` comprueba además que entre los informes están **todos** los archivos `tests/**/*.test.ts(x)`, cada uno una sola vez. Auditoría de aislamiento: ver «Limitaciones».
 
 **Comprobaciones, por orden.** `npm ci` (su `postinstall` ejecuta `prisma generate`), `npm run typecheck`, `npm run lint`, arranque del proxy, Vitest, comprobación de que no hay pruebas omitidas ni fallidas y `npm run build`. Vitest se ejecuta en **dos pasos que juntos cubren toda la suite, sin excluir ninguna prueba**: (1) todo salvo las suites de PostgreSQL real, en paralelo; (2) las suites que leen `TEST_PG_URL` (siete archivos), una detrás de otra con `--no-file-parallelism`. Motivo: en paralelo con el resto fallaban de forma intermitente por timeouts de 5 s (en una prueba local, 6 fallos en una ejecución y 0 en la siguiente, con el mismo código); es la misma fragilidad ya documentada (E2). Serializarlas cambia cómo se ejecutan, no qué se ejecuta. `assert-no-skipped.mjs` hace fallar la CI si queda **cualquier** prueba omitida, pendiente o fallida (un archivo opt-in sin su variable de entorno ya no puede dar un verde engañoso). Las migraciones no se aplican en un paso aparte: cada suite crea su propia base temporal (`race_*`, `neonad_*`), aplica las migraciones del proyecto y la elimina al terminar.
 
 **Resultado de la reproducción local** (copia aislada del repositorio, sin `.env`, entorno vacío, PostgreSQL 18.7 y proxy en Docker): `typecheck` y `lint` sin errores; paso 1: 122 archivos y 3.047 pruebas correctas; paso 2: 7 archivos y 169 pruebas correctas; **total 129 archivos y 3.216/3.216 pruebas, 0 omitidas ni fallidas**; `npm run build` con variables ficticias, exit 0. La guarda se comprobó en negativo (sin `TEST_PG_URL`, 49 pruebas omitidas → exit 1).
 
+**Reproducción local tras el endurecimiento (Fase 1.1):** mismo resultado (129 archivos y 3.216/3.216 pruebas, 0 omitidas; `typecheck`, `lint` y `build` en verde), con la imagen de PostgreSQL por digest. La guarda se probó con informes alterados: falla ante pruebas fallidas, omitidas, pendientes (todo), `success: false`, archivos ausentes o repetidos, informe inexistente y falta de argumentos.
+
 **Reproducir localmente.** Con Docker (puertos 55433 y 5488 libres; sustituye `172.17.0.1` por la pasarela de `docker network inspect bridge`):
 
 ```bash
-docker run -d --name aiw-ci-pg -e POSTGRES_PASSWORD=ci-throwaway-password -p 127.0.0.1:55433:5432 -p 172.17.0.1:55433:5432 --tmpfs /var/lib/postgresql postgres:18.7-alpine
+docker run -d --name aiw-ci-pg -e POSTGRES_PASSWORD=ci-throwaway-password -p 127.0.0.1:55433:5432 -p 172.17.0.1:55433:5432 --tmpfs /var/lib/postgresql postgres:18.7-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
 docker run -d --name neon-wsproxy --add-host host.docker.internal:host-gateway -p 127.0.0.1:5488:80 \
   -e 'ALLOW_ADDR_REGEX=^host\.docker\.internal:55433$' ghcr.io/neondatabase/wsproxy@sha256:7f2e2149aa6a57ba382a140102fba44f5053f3e44389ccc18adcecf896054efb
 export TEST_PG_URL=postgresql://postgres@127.0.0.1:55433/postgres PGPASSWORD=ci-throwaway-password \
@@ -48,7 +52,8 @@ docker rm -f aiw-ci-pg neon-wsproxy
 **Limitaciones conocidas (pendientes de validar en GitHub).**
 - Ninguna ejecución real: no se ha comprobado que `ubuntu-latest` resuelva `host.docker.internal` con `host-gateway`, que `--tmpfs /var/lib/postgresql` funcione en el contenedor de servicio, que el tiempo total (≈ 5 min en local) quepa holgado en los 30 min del job ni que las pruebas de tiempos ajustados pasen en un runner más pequeño (2 vCPU en repositorios privados).
 - `npm ci` no se pudo reproducir sin red (la caché local está incompleta): en la copia aislada se usó una copia de `node_modules` y `prisma generate`. La consistencia entre `package-lock.json` y `package.json` la comprobará GitHub.
-- `actions/checkout` y `actions/setup-node` van por etiqueta mayor (`@v4`), no por SHA (no se pudo verificar sin red). Conviene fijarlas por SHA.
+- Las acciones están fijadas por SHA (v4.4.0), pero no hay actualización automática (p. ej. Dependabot): hay que revisarlas a mano.
+- El servicio PostgreSQL se publica en todas las interfaces del runner (VM efímera) porque el proxy de Neon, desde su contenedor, lo alcanza por la pasarela del host; el proxy solo se publica en `127.0.0.1:5488` y su `ALLOW_ADDR_REGEX` solo admite `host.docker.internal:55433`. Ninguna variable del workflow apunta a un destino externo y las suites rechazan hosts no locales.
 - Las suites se descubren con `grep TEST_PG_URL`: incluye dos archivos (`auth-token-atomicity`, `media-lease`) que solo lo mencionan en comentarios; se ejecutan en el paso serie sin inconveniente.
 - El proxy de Neon usa una imagen `latest` fijada por digest; hay que actualizar el digest a mano.
 - No se han tocado las reglas de protección de la rama: la CI no bloquea ningún merge. Sigue sin probarse nada contra Neon real (la CI no lo intenta).
