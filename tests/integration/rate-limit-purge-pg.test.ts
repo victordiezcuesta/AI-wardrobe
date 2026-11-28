@@ -137,7 +137,7 @@ describe.skipIf(!ADMIN_URL)("purga de RateLimit con PostgreSQL real (127.0.0.1:5
     expect([u.hostname, u.port, u.pathname.slice(1)]).toEqual(["127.0.0.1", "55433", dbName]);
     const [row] = await q<{ db: string; v: string }>(`SELECT current_database() AS db, current_setting('server_version') AS v`);
     expect(row!.db).toBe(dbName);
-    expect(row!.v.startsWith("17")).toBe(true);
+    expect(/^(17|18)\./.test(row!.v)).toBe(true); // 17 (desarrollo) o 18 (versión de producción en Neon); cualquier otra no está validada
   });
 
   // ── A ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -293,7 +293,9 @@ describe.skipIf(!ADMIN_URL)("purga de RateLimit con PostgreSQL real (127.0.0.1:5
     await installHook();
     await seed("e", 5_999, 30);                                      // las más antiguas: entran en el 1.er lote (5000) y en el 2.º (999)
     await q(`INSERT INTO "RateLimit" ("key", "count", "windowStart") VALUES ('boom', 1, NOW() - INTERVAL '25 hours')`); // la más reciente: cae en el 2.º lote
-    await expect(svc.purgeExpiredRateLimits()).rejects.toThrow();
+    // Debe fallar POR EL GANCHO (2.º lote), no por otra causa: un statement_timeout (57014) en el 1.er lote bajo carga también rechaza, y antes se
+    // confundía con el fallo inyectado (el recuento fallaba después con 6000). Ahora el error dice cuál fue.
+    await expect(svc.purgeExpiredRateLimits()).rejects.toThrow(/fallo controlado del lote/);
     expect(await total()).toBe(1_000);                               // 5000 borradas y confirmadas; el 2.º lote (999 + boom) se revirtió entero
     expect(await keys()).toContain("boom");
     await q(`DROP TRIGGER purge_test_hook ON "RateLimit"`);          // el gancho fallaría también al limpiar a mano
