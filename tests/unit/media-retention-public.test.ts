@@ -67,6 +67,12 @@ describe("publicRetentionErrorCodes (lista blanca estricta)", () => {
     ];
     for (const c of produced) expect(pub.PUBLIC_RETENTION_ERROR_CODES.has(c)).toBe(true);
   });
+  it("una violación de FK es FK_VIOLATION con ambos SQLSTATE: 23503 (NO ACTION; PostgreSQL 17 también para RESTRICT) y 23001 (RESTRICT desde PostgreSQL 18)", () => {
+    const pg = (c: string) => ({ meta: { driverAdapterError: { cause: { originalCode: c } } } });
+    expect(ret.classifyRetentionError(pg("23503"))).toBe("retention/FK_VIOLATION");
+    expect(ret.classifyRetentionError(pg("23001"))).toBe("retention/FK_VIOLATION");
+    expect(ret.classifyRetentionError(pg("23505"))).not.toBe("retention/FK_VIOLATION"); // otra violación de integridad: no se confunde
+  });
   it.each([
     ["desconocido", "retention/NOPE"], ["URL https", "https://res.cloudinary.com/demo/image/upload/x.jpg"], ["URL http", "http://evil.test/x"],
     ["publicId", "ai-wardrobe/owner-secreto/wardrobe/foto"], ["ruta Cloudinary", "image/upload/v1/ai-wardrobe/u/x"],

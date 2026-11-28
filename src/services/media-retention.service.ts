@@ -34,7 +34,7 @@ import { RETENTION_APPLY_ENABLED } from "@/services/media-retention-config";
  * sentencia supera el timeout de la transacción salvo por esperas, que acotan lock_timeout y statement_timeout.
  * Un lote solo empieza si cabe entero en el presupuesto recibido. Máximo 10 lotes de 200 filas por fase.
  *
- * Cualquier error de un lote (40P01, 55P03, 57014, 23503, P2028 u otro) detiene la retención SIN reintentar; el lote se
+ * Cualquier error de un lote (40P01, 55P03, 57014, 23503/23001, P2028 u otro) detiene la retención SIN reintentar; el lote se
  * deshace entero (también su renovación). LEASE_LOST la detiene y se informa a quien llama (que detiene la ejecución).
  * Límite de DRY_RUN: las ejecuciones que quedarían libres al borrar MediaAsset no se cuentan (no se borra nada).
  */
@@ -253,7 +253,9 @@ export function classifyRetentionError(e: unknown): string {
   if (state === "40P01") return "retention/DEADLOCK";
   if (state === "55P03") return "retention/LOCK_TIMEOUT";
   if (state === "57014") return "retention/QUERY_TIMEOUT";
-  if (state === "23503") return "retention/FK_VIOLATION";
+  // 23503 = foreign_key_violation (NO ACTION; en PostgreSQL 17 también RESTRICT). Desde PostgreSQL 18 una violación de ON DELETE RESTRICT
+  // (el tipo de las FK de MediaAsset → MediaReconcileRun) es 23001 = restrict_violation; sin él, en producción (18.7) saldría DB_ERROR.
+  if (state === "23503" || state === "23001") return "retention/FK_VIOLATION";
   if ((e as { code?: unknown } | null)?.code === "P2028") return "retention/TX_TIMEOUT";
   if (isDbError(e)) return "retention/DB_ERROR";
   return "retention/INTERNAL";
