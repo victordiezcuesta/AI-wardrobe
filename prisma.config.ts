@@ -1,11 +1,12 @@
 import "dotenv/config";
 import { defineConfig } from "prisma/config";
+import { migrationUrl } from "./src/lib/prisma/migration-url";
 
 export default defineConfig({
   schema: "prisma/schema.prisma",
   migrations: { path: "prisma/migrations" },
   datasource: {
-    // DIRECT_URL (conexión sin pooler) para migraciones; DATABASE_URL como alternativa.
-    url: process.env.DIRECT_URL ?? process.env.DATABASE_URL ?? "postgresql://localhost:5432/placeholder",
+    // Conexión DIRECTA (sin pooler) para migraciones: DIRECT_URL, o DATABASE_URL solo si no es del pooler.
+    url: migrationUrl(),
   },
 });
