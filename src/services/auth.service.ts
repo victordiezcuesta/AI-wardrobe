@@ -95,7 +95,9 @@ export const authService = {
 
   async verifyEmail(rawToken: string) {
     const email = await consumeToken(rawToken, "VERIFY_EMAIL");
-    await userRepository.markVerified(email);
+    // El token ya está consumido. Si la cuenta se borró justo entre el consumo y esta escritura no hay nada que verificar: mismo error que un
+    // enlace muerto (antes: P2025 → 500). No hay efectos que deshacer.
+    if ((await userRepository.markVerified(email)).count === 0) throw new AppError("Enlace no válido o caducado", 400, "INVALID_TOKEN");
   },
 
   async requestReset(email: string) {
@@ -130,11 +132,13 @@ export const authService = {
     const email = await consumeToken(rawToken, "RESET_PASSWORD");
     const passwordHash = await bcrypt.hash(password, 12);
     // Una sola transacción: si la contraseña cambia, ninguna sesión anterior (de quien la conociera) sigue activa.
-    await prisma.$transaction([
+    const [written] = await prisma.$transaction([
       userRepository.setPassword(email, passwordHash),
       userRepository.markVerified(email), // recibir el enlace demuestra control del email
       sessionRepository.deleteAllForEmail(email),
     ]);
+    // Cuenta borrada tras consumir el token: no se escribió nada (las otras dos operaciones también eran no-ops); error controlado, no P2025.
+    if (written.count === 0) throw new AppError("Enlace no válido o caducado", 400, "INVALID_TOKEN");
   },
 
   async verifyCredentials(email: string, password: string) {

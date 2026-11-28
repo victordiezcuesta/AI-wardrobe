@@ -30,7 +30,9 @@ describe("borrado de cuentas: un único camino y con limpieza de MediaAsset", ()
     expect(tx).not.toBeNull();
     const body = tx![1]!;
     expect(body).toMatch(/prisma\.mediaAsset\.deleteMany\(\{ where: \{ ownerUserId: userId \} \}\)/);
-    expect(body).toMatch(/prisma\.user\.delete\(\{ where: \{ id: userId \} \}\)/);
+    // deleteMany (idempotente ante dos borrados simultáneos), nunca delete (P2025 en el segundo).
+    expect(body).toMatch(/prisma\.user\.deleteMany\(\{ where: \{ id: userId \} \}\)/);
+    expect(body).not.toMatch(/prisma\.user\.delete\(/);
     // Fase 19.6.3: la PRIMERA sentencia bloquea la fila del usuario (orden User → MediaAsset, igual que la persistencia
     // de la reconciliación). Cualquier sentencia antes del bloqueo, o quitarlo, reabre el interbloqueo.
     const statements = body.replace(/^\s*\/\/.*$/gm, "").trim();

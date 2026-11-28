@@ -76,7 +76,9 @@ export const accountService = {
       // reconciliador la necesite), así que no hay cascada. Sus imágenes ya se borraron arriba en Cloudinary: se eliminan
       // aquí, en la MISMA transacción que la cuenta (o todo o nada). Las ejecuciones y el lock no son del usuario.
       prisma.mediaAsset.deleteMany({ where: { ownerUserId: userId } }),
-      prisma.user.delete({ where: { id: userId } }), // cascada: perfil, armario, conjuntos, imágenes, compras, preferencias, registros de IA…
+      // deleteMany (no delete): idempotente. Con dos borrados simultáneos de la misma cuenta, el segundo no encuentra la fila (la
+      // primera ya la eliminó) y `delete` lanzaría P2025 (500); así termina sin error y la cuenta queda borrada igualmente.
+      prisma.user.deleteMany({ where: { id: userId } }), // cascada: perfil, armario, conjuntos, imágenes, compras, preferencias, registros de IA…
     ]);
   },
 };
