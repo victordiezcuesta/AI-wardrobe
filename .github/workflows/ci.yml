@@ -1,0 +1,129 @@
+name: CI
+
+# Verificaciones del proyecto con un PostgreSQL TEMPORAL dentro del propio job (contenedor de servicio que se destruye al
+# terminar). No hay secretos, ni conexión a Neon, Cloudinary, OpenRouter u otros proveedores, ni despliegues.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Mínimo imprescindible: solo lectura del código.
+permissions:
+  contents: read
+
+# Una ejecución por rama/PR: en un PR, un push nuevo cancela la anterior; en `main` nunca se cancela una ejecución.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Lint, tipos, pruebas (PostgreSQL 18.7) y build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        # Misma versión mayor y menor que las verificaciones de la Fase I (PostgreSQL 18.7).
+        image: postgres:18.7-alpine
+        env:
+          # Credenciales de un contenedor desechable que solo existe durante este job; no son un secreto.
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-throwaway-password
+          POSTGRES_DB: postgres
+        # rate-limit-purge-pg.test.ts exige exactamente 127.0.0.1:55433.
+        ports:
+          - 55433:5432
+        # Datos en tmpfs: PostgreSQL desechable y sin E/S de disco (como en las verificaciones de la Fase I).
+        options: >-
+          --tmpfs /var/lib/postgresql
+          --health-cmd "pg_isready -U postgres -h 127.0.0.1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      CI: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+      # Solo el PostgreSQL de servicio de este job. Cada suite crea su propia base temporal (race_*, neonad_*) y la elimina.
+      # Sin contraseña en la URL (el repositorio no admite cadenas de conexión con contraseña): la aporta PGPASSWORD.
+      TEST_PG_URL: postgresql://postgres@127.0.0.1:55433/postgres
+      PGPASSWORD: ci-throwaway-password
+      # Proxy WebSocket de Neon (local, ver el paso siguiente) y dirección del PostgreSQL tal y como la ve el proxy
+      # (desde su contenedor, el PostgreSQL del job se alcanza por la pasarela del host).
+      TEST_NEON_WSPROXY: 127.0.0.1:5488
+      TEST_NEON_PG_ADDR: host.docker.internal:55433
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # `postinstall` ejecuta `prisma generate` (no necesita base de datos ni .env): genera src/generated/prisma.
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: TypeScript
+        run: npm run typecheck
+
+      - name: ESLint
+        run: npm run lint
+
+      # Proxy WebSocket oficial de Neon, LOCAL, para la suite del adaptador PrismaNeon. Imagen fijada por digest y
+      # `ALLOW_ADDR_REGEX` limitado al PostgreSQL de este job: no puede conectar a ningún otro destino. El proxy escucha en
+      # el puerto 80 del contenedor y se publica solo en 127.0.0.1:5488.
+      - name: Proxy WebSocket de Neon (local)
+        run: |
+          docker run -d --name neon-wsproxy \
+            --add-host host.docker.internal:host-gateway \
+            -p 127.0.0.1:5488:80 \
+            -e 'ALLOW_ADDR_REGEX=^host\.docker\.internal:55433$' \
+            ghcr.io/neondatabase/wsproxy@sha256:7f2e2149aa6a57ba382a140102fba44f5053f3e44389ccc18adcecf896054efb
+          for i in $(seq 1 30); do
+            if docker logs neon-wsproxy 2>&1 | grep -q "Starting server"; then echo "wsproxy listo"; exit 0; fi
+            sleep 1
+          done
+          echo "wsproxy no arrancó" >&2
+          docker logs neon-wsproxy >&2 || true
+          exit 1
+
+      # Suite completa de Vitest en DOS pasos que, juntos, ejecutan TODAS las pruebas (ninguna se excluye):
+      #  1) todo salvo las suites de PostgreSQL real, en paralelo como siempre;
+      #  2) las suites de PostgreSQL real (las que leen TEST_PG_URL), una detrás de otra. Son de concurrencia real y tienen
+      #     tiempos de espera ajustados (5 s): en paralelo con el resto de la suite fallaban de forma intermitente por falta
+      #     de CPU/E-S (ver ESTADO.md). Serializarlas cambia cómo se ejecutan, no qué se ejecuta.
+      # Las migraciones las aplica cada suite a su propia base temporal (race_*, neonad_*), que elimina al terminar.
+      - name: Pruebas (Vitest, sin las suites de PostgreSQL real)
+        run: |
+          PG_FILES=$(grep -rl 'TEST_PG_URL' tests --include='*.test.ts' | sort)
+          [ -n "$PG_FILES" ] || { echo "No se encontraron suites de PostgreSQL" >&2; exit 1; }
+          EXCLUDES=(); for f in $PG_FILES; do EXCLUDES+=(--exclude "$f"); done
+          npm test -- "${EXCLUDES[@]}" --reporter=default --reporter=json --outputFile.json=vitest-main.json
+
+      - name: Pruebas (Vitest, suites de PostgreSQL real en serie)
+        run: |
+          PG_FILES=$(grep -rl 'TEST_PG_URL' tests --include='*.test.ts' | sort)
+          npm test -- --no-file-parallelism $PG_FILES --reporter=default --reporter=json --outputFile.json=vitest-pg.json
+
+      - name: Comprobar que no hay pruebas omitidas ni fallidas
+        run: node scripts/ci/assert-no-skipped.mjs vitest-main.json vitest-pg.json
+
+      # Variables ficticias: `env()` se valida de forma perezosa y el build no se conecta a nada. DATABASE_URL apunta a un
+      # puerto cerrado a propósito, de modo que cualquier conexión accidental falle en vez de llegar a una base real.
+      - name: Build de producción
+        env:
+          DATABASE_URL: postgresql://ci@127.0.0.1:1/ci
+          AUTH_SECRET: ci-build-only-not-a-secret-0123456789
+          AUTH_URL: http://localhost:3000
+          CLOUDINARY_CLOUD_NAME: ci
+          CLOUDINARY_API_KEY: ci
+          CLOUDINARY_API_SECRET: ci
+        run: npm run build
