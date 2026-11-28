@@ -24,7 +24,7 @@ Este documento dice con franqueza qué está **comprobado**, qué **depende de c
 
 **Activación.** `push` y `pull_request` sobre `main`. Permisos: solo `contents: read`. Concurrencia por rama: un push nuevo cancela la ejecución anterior de un PR, pero nunca la de `main`. Sin secretos, sin despliegues, sin tokens y sin conexión a Neon ni a ningún proveedor: las variables del build son ficticias (`DATABASE_URL` apunta a un puerto cerrado a propósito).
 
-**Entorno.** `ubuntu-latest`, Node.js 22 (`engines`: ≥ 20.9), PostgreSQL **18.7** (`postgres:18.7-alpine` fijado por digest, contenedor de servicio con datos en tmpfs, publicado en `127.0.0.1:55433`, que es lo que exige `rate-limit-purge-pg`) y el proxy WebSocket oficial de Neon (`ghcr.io/neondatabase/wsproxy`, fijado por digest, `ALLOW_ADDR_REGEX` limitado a ese PostgreSQL) para la suite de `PrismaNeon`. La contraseña de PostgreSQL es una credencial desechable del propio contenedor y va por `PGPASSWORD`: `repo-hygiene` no admite cadenas de conexión con contraseña en el repositorio.
+**Entorno.** `ubuntu-latest`, Node.js 22 (`engines`: ≥ 20.9), PostgreSQL **18.7** (`postgres:18.7-alpine` fijado por digest, contenedor de servicio con datos en tmpfs, publicado SOLO en `127.0.0.1:55433`, que es lo que exige `rate-limit-purge-pg`) y el proxy WebSocket oficial de Neon (`ghcr.io/neondatabase/wsproxy`, fijado por digest, unido a la red del servicio con `--network ${{ job.services.postgres.network }}`, `ALLOW_ADDR_REGEX=^postgres:5432$`, publicado solo en `127.0.0.1:5488`) para la suite de `PrismaNeon`. La contraseña de PostgreSQL es una credencial desechable del propio contenedor y va por `PGPASSWORD`: `repo-hygiene` no admite cadenas de conexión con contraseña en el repositorio.
 
 **Endurecimiento (Fase 1.1).** Acciones fijadas por SHA de commit, verificados contra los repositorios oficiales (`git ls-remote` y la API de releases de `actions/*`; ambas releases estables, no prerelease): `actions/checkout@11d5960a326750d5838078e36cf38b85af677262` (v4.4.0) y `actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020` (v4.4.0); en ambos casos el SHA coincide con la etiqueta móvil `v4`, así que no cambia la versión mayor ni el comportamiento. La imagen de PostgreSQL se fija por el digest de su índice (`sha256:0115267a…`, comprobado con `docker buildx imagetools inspect`). `defaults.run.shell: bash` (con `-eo pipefail`). `assert-no-skipped.mjs` comprueba además que entre los informes están **todos** los archivos `tests/**/*.test.ts(x)`, cada uno una sola vez. Auditoría de aislamiento: ver «Limitaciones».
 
@@ -34,26 +34,28 @@ Este documento dice con franqueza qué está **comprobado**, qué **depende de c
 
 **Reproducción local tras el endurecimiento (Fase 1.1):** mismo resultado (129 archivos y 3.216/3.216 pruebas, 0 omitidas; `typecheck`, `lint` y `build` en verde), con la imagen de PostgreSQL por digest. La guarda se probó con informes alterados: falla ante pruebas fallidas, omitidas, pendientes (todo), `success: false`, archivos ausentes o repetidos, informe inexistente y falta de argumentos.
 
-**Reproducir localmente.** Con Docker (puertos 55433 y 5488 libres; sustituye `172.17.0.1` por la pasarela de `docker network inspect bridge`):
+**Reproducir localmente.** Con Docker (puertos 55433 y 5488 libres; la red `aiw-ci-net` emula la red del servicio de GitHub):
 
 ```bash
-docker run -d --name aiw-ci-pg -e POSTGRES_PASSWORD=ci-throwaway-password -p 127.0.0.1:55433:5432 -p 172.17.0.1:55433:5432 --tmpfs /var/lib/postgresql postgres:18.7-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
-docker run -d --name neon-wsproxy --add-host host.docker.internal:host-gateway -p 127.0.0.1:5488:80 \
-  -e 'ALLOW_ADDR_REGEX=^host\.docker\.internal:55433$' ghcr.io/neondatabase/wsproxy@sha256:7f2e2149aa6a57ba382a140102fba44f5053f3e44389ccc18adcecf896054efb
+docker network create aiw-ci-net
+docker run -d --name aiw-ci-pg --network aiw-ci-net --network-alias postgres -e POSTGRES_PASSWORD=ci-throwaway-password \
+  -p 127.0.0.1:55433:5432 --tmpfs /var/lib/postgresql postgres:18.7-alpine@sha256:0115267ab5a509022df9319c77be365cef335adb71556c75f60f5360ee247e71
+docker run -d --name neon-wsproxy --network aiw-ci-net -p 127.0.0.1:5488:80 -e 'ALLOW_ADDR_REGEX=^postgres:5432$' \
+  ghcr.io/neondatabase/wsproxy@sha256:7f2e2149aa6a57ba382a140102fba44f5053f3e44389ccc18adcecf896054efb
 export TEST_PG_URL=postgresql://postgres@127.0.0.1:55433/postgres PGPASSWORD=ci-throwaway-password \
-       TEST_NEON_WSPROXY=127.0.0.1:5488 TEST_NEON_PG_ADDR=host.docker.internal:55433
+       TEST_NEON_WSPROXY=127.0.0.1:5488 TEST_NEON_PG_ADDR=postgres:5432
 PG=$(grep -rl TEST_PG_URL tests --include='*.test.ts' | sort); EX=(); for f in $PG; do EX+=(--exclude "$f"); done
 npm test -- "${EX[@]}" --reporter=default --reporter=json --outputFile.json=vitest-main.json
 npm test -- --no-file-parallelism $PG --reporter=default --reporter=json --outputFile.json=vitest-pg.json
 node scripts/ci/assert-no-skipped.mjs vitest-main.json vitest-pg.json
-docker rm -f aiw-ci-pg neon-wsproxy
+docker rm -f aiw-ci-pg neon-wsproxy && docker network rm aiw-ci-net
 ```
 
 **Limitaciones conocidas (pendientes de validar en GitHub).**
-- Ninguna ejecución real: no se ha comprobado que `ubuntu-latest` resuelva `host.docker.internal` con `host-gateway`, que `--tmpfs /var/lib/postgresql` funcione en el contenedor de servicio, que el tiempo total (≈ 5 min en local) quepa holgado en los 30 min del job ni que las pruebas de tiempos ajustados pasen en un runner más pequeño (2 vCPU en repositorios privados).
+- Ninguna ejecución real: no se ha comprobado que `job.services.postgres.network` sea utilizable como `--network` del proxy ni que el servicio sea alcanzable como `postgres` (la documentación y el código del runner lo indican; en local se emuló con una red Docker), que `--tmpfs /var/lib/postgresql` funcione en el contenedor de servicio, que el tiempo total (≈ 5 min en local) quepa holgado en los 30 min del job ni que las pruebas de tiempos ajustados pasen en un runner más pequeño (2 vCPU en repositorios privados).
 - `npm ci` no se pudo reproducir sin red (la caché local está incompleta): en la copia aislada se usó una copia de `node_modules` y `prisma generate`. La consistencia entre `package-lock.json` y `package.json` la comprobará GitHub.
 - Las acciones están fijadas por SHA (v4.4.0), pero no hay actualización automática (p. ej. Dependabot): hay que revisarlas a mano.
-- El servicio PostgreSQL se publica en todas las interfaces del runner (VM efímera) porque el proxy de Neon, desde su contenedor, lo alcanza por la pasarela del host; el proxy solo se publica en `127.0.0.1:5488` y su `ALLOW_ADDR_REGEX` solo admite `host.docker.internal:55433`. Ninguna variable del workflow apunta a un destino externo y las suites rechazan hosts no locales.
+- Aislamiento de red (reproducido en local, no en GitHub): PostgreSQL se publica solo en `127.0.0.1:55433` (comprobado: la pasarela `docker0` rechaza la conexión); el proxy de Neon no pasa por el host, se une a la red del servicio y su `ALLOW_ADDR_REGEX` solo admite `postgres:5432`. Ninguna variable del workflow apunta a un destino externo y las suites rechazan hosts no locales.
 - Las suites se descubren con `grep TEST_PG_URL`: incluye dos archivos (`auth-token-atomicity`, `media-lease`) que solo lo mencionan en comentarios; se ejecutan en el paso serie sin inconveniente.
 - El proxy de Neon usa una imagen `latest` fijada por digest; hay que actualizar el digest a mano.
 - No se han tocado las reglas de protección de la rama: la CI no bloquea ningún merge. Sigue sin probarse nada contra Neon real (la CI no lo intenta).

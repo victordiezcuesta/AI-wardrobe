@@ -37,10 +37,10 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ci-throwaway-password
           POSTGRES_DB: postgres
-        # rate-limit-purge-pg.test.ts exige exactamente 127.0.0.1:55433. Se publica en todas las interfaces del runner (una
-        # VM efímera sin entrada desde fuera) porque el proxy de Neon, desde su contenedor, lo alcanza por la pasarela del host.
+        # rate-limit-purge-pg.test.ts exige exactamente 127.0.0.1:55433. Se publica SOLO en el loopback del runner. El proxy
+        # de Neon no pasa por el host: se une a la red del servicio y lo alcanza como `postgres:5432` (ver su paso).
         ports:
-          - 55433:5432
+          - 127.0.0.1:55433:5432
         # Datos en tmpfs: PostgreSQL desechable y sin E/S de disco (como en las verificaciones de la Fase I).
         options: >-
           --tmpfs /var/lib/postgresql
@@ -57,9 +57,9 @@ jobs:
       TEST_PG_URL: postgresql://postgres@127.0.0.1:55433/postgres
       PGPASSWORD: ci-throwaway-password
       # Proxy WebSocket de Neon (local, ver el paso siguiente) y dirección del PostgreSQL tal y como la ve el proxy
-      # (desde su contenedor, el PostgreSQL del job se alcanza por la pasarela del host).
+      # (dentro de la red del servicio, por el nombre del servicio).
       TEST_NEON_WSPROXY: 127.0.0.1:5488
-      TEST_NEON_PG_ADDR: host.docker.internal:55433
+      TEST_NEON_PG_ADDR: postgres:5432
 
     steps:
       - name: Checkout
@@ -84,14 +84,15 @@ jobs:
         run: npm run lint
 
       # Proxy WebSocket oficial de Neon, LOCAL, para la suite del adaptador PrismaNeon. Imagen fijada por digest y
-      # `ALLOW_ADDR_REGEX` limitado al PostgreSQL de este job: no puede conectar a ningún otro destino. El proxy escucha en
-      # el puerto 80 del contenedor y se publica solo en 127.0.0.1:5488.
+      # `ALLOW_ADDR_REGEX` limitado al PostgreSQL de este job: no puede conectar a ningún otro destino. El proxy se une a la
+      # red del contenedor de servicio (`job.services.postgres.network`) y escucha en el puerto 80 del contenedor, que se
+      # publica solo en 127.0.0.1:5488.
       - name: Proxy WebSocket de Neon (local)
         run: |
           docker run -d --name neon-wsproxy \
-            --add-host host.docker.internal:host-gateway \
+            --network ${{ job.services.postgres.network }} \
             -p 127.0.0.1:5488:80 \
-            -e 'ALLOW_ADDR_REGEX=^host\.docker\.internal:55433$' \
+            -e 'ALLOW_ADDR_REGEX=^postgres:5432$' \
             ghcr.io/neondatabase/wsproxy@sha256:7f2e2149aa6a57ba382a140102fba44f5053f3e44389ccc18adcecf896054efb
           for i in $(seq 1 30); do
             if docker logs neon-wsproxy 2>&1 | grep -q "Starting server"; then echo "wsproxy listo"; exit 0; fi
