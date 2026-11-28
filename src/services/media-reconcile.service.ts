@@ -239,6 +239,9 @@ async function inventory(type: DeliveryType, listPage: ListPage, opts: { maxPage
   const anomalies = new Set<string>();
   const fail = (code: string) => { report.errors.push({ stage: "inventory", scope: type, code }); return { entries, complete: false }; };
   let cursor: string | undefined;
+  // El plazo agotado es DEFINITIVO: un setTimeout puede disparar ~1 ms antes de `deadline` según Date.now(), y entonces el tipo siguiente
+  // veía `remaining` = 1 y seguía leyendo tras haberse declarado el TIME_BUDGET.
+  if (report.errors.some((e) => e.stage === "inventory" && e.code === "TIME_BUDGET")) return fail("TIME_BUDGET");
   for (;;) {
     if (report.pages[type] >= opts.maxPages) return fail("PAGE_LIMIT");
     const remaining = opts.deadline - Date.now();

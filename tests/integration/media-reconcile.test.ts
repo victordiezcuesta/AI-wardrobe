@@ -1131,6 +1131,24 @@ describe("19.6.2 detectOrphanMediaDetailed: candidatas detalladas, solo internas
     expect(candidates).toEqual([]);
   });
 
+  it("presupuesto agotado con el temporizador adelantado 1 ms (Date.now): el inventario privado sigue sin leerse (el plazo es definitivo)", async () => {
+    // Un setTimeout(ms) puede disparar hasta ~1 ms ANTES de `deadline` según Date.now() (≈1,5 % de las veces en Node). Tras el TIME_BUDGET del
+    // inventario `upload`, `remaining` valía entonces 1 y el inventario `authenticated` se leía igualmente (retenidas 2 en vez de 1).
+    const u = await user();
+    admin.pages.upload = [{ resources: [res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload")], next_cursor: "upload-c1" }, HANG];
+    paginate("authenticated", [res(`ai-wardrobe/${u.id}/try-on/t`, "authenticated")]);
+    const realNow = Date.now.bind(Date);
+    const start = realNow();
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => (admin.aborted > 0 ? start + 199 : realNow())); // t0 ≥ start ⇒ deadline ≥ start + 200
+    try {
+      const { report, candidates } = await detailed({ budgetMs: 200 });
+      expect(report.complete).toBe(false);
+      expect(report.candidatesWithheld).toBe(1);
+      expect(report.pages.authenticated).toBe(0);
+      expect(candidates).toEqual([]);
+    } finally { spy.mockRestore(); }
+  });
+
   it("una consulta de PostgreSQL fallida (propietarios) → INCOMPLETE y ninguna candidata", async () => {
     const u = await user();
     paginate("upload", [res(`ai-wardrobe/${u.id}/wardrobe/o`, "upload")]);
